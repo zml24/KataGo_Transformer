@@ -76,9 +76,10 @@ class ONNXExportWrapper(torch.nn.Module):
         return pruned_outputs
 
 
-def export_to_onnx(model: Model, export_path: str, pos_len: int = 19, 
+def export_to_onnx(model: Model, save_name: str ,export_path: str, pos_len: int = 19, 
                    batch_size: int = 1, opset_version: int = 20, disable_mask: bool = False,
-                   verbose: bool = False) -> None:
+                   verbose: bool = False, extra_meta_data: Dict[str, str] = None,
+                   auto_fp16: bool = False) -> None:
     """
     Export PyTorch model to ONNX format.
     
@@ -89,6 +90,7 @@ def export_to_onnx(model: Model, export_path: str, pos_len: int = 19,
         batch_size: Batch size for the model
         opset_version: ONNX opset version
         verbose: Whether to enable verbose logging
+        auto_fp16: Whether to automatically convert to mixed precision (FP16)
     """
     
     # Set model to evaluation mode
@@ -99,9 +101,11 @@ def export_to_onnx(model: Model, export_path: str, pos_len: int = 19,
     wrapper.eval()
     
     # Create dummy inputs
-    input_spatial = torch.randn(batch_size, 22, pos_len, pos_len, dtype=torch.float32)
+    num_spatial_inputs = modelconfigs.get_num_bin_input_features(model.config)
+    input_spatial = torch.randn(batch_size, num_spatial_inputs, pos_len, pos_len, dtype=torch.float32)
     input_spatial[:,0,:,:]=1.0
-    input_global = torch.randn(batch_size, 19, dtype=torch.float32)
+    num_global_inputs = modelconfigs.get_num_global_input_features(model.config)
+    input_global = torch.randn(batch_size, num_global_inputs, dtype=torch.float32)
     
     # Prepare inputs and input names
     inputs = [input_spatial, input_global]
@@ -160,6 +164,69 @@ def export_to_onnx(model: Model, export_path: str, pos_len: int = 19,
     
     logging.info("ONNX export completed successfully!")
 
+    # Auto convert to FP16 if requested
+    if auto_fp16:
+        assert False,"Currently has trouble converting RMSNorm to fp16. Do not use -auto-fp16"
+        
+        import onnx
+        from onnxconverter_common import auto_convert_mixed_precision,float16
+
+        logging.info("Converting model to auto mixed precision (FP16)...")
+        
+        onnx_model = onnx.load(export_path)
+        # Create feed_dict with dummy inputs converted to numpy
+        feed_dict = {name: tensor.detach().cpu().numpy() for name, tensor in zip(input_names, inputs)}
+        onnx_model_fp16 = auto_convert_mixed_precision(onnx_model, feed_dict, rtol=0.01, keep_io_types=True)
+        #onnx_model_fp16 = float16.convert_float_to_float16(onnx_model)
+        onnx.save(onnx_model_fp16, export_path)
+        logging.info("Converted to FP16 successfully.")
+            
+
+    # Add metadata to the ONNX model
+    try:
+        import onnx
+        from onnx import helper
+        
+        onnx_model = onnx.load(export_path)
+        
+        # Add metadata_props
+        meta = {
+            "name": save_name,
+            "modelVersion": str(model.config["version"]),
+            # Add other useful info if available
+            "exported_at": datetime.datetime.now().isoformat(),
+            "auto_fp16_already": "true" if auto_fp16 else "false",
+            "opset_version": str(opset_version),
+            "exported_with_dynamo": "true" if dynamo else "false",
+            "num_spatial_inputs": str(num_spatial_inputs),
+            "num_global_inputs": str(num_global_inputs),
+            "pos_len": str(pos_len),
+            "pos_len_x": str(pos_len),
+            "pos_len_y": str(pos_len),
+            "has_mask": "true" if not disable_mask else "false",
+            "model_config": str(model.config)
+        }
+        if extra_meta_data is not None:
+            meta.update(extra_meta_data)
+        
+        # Clear existing metadata if any to avoid duplicates
+        if hasattr(onnx_model, "metadata_props"):
+            del onnx_model.metadata_props[:]
+            
+        for key, value in meta.items():
+            meta_entry = onnx_model.metadata_props.add()
+            meta_entry.key = key
+            meta_entry.value = value
+            
+        # Save the model with metadata
+        onnx.save(onnx_model, export_path)
+        logging.info(f"Added metadata to ONNX model: {meta}")
+        
+    except ImportError:
+        logging.warning("onnx package not installed, skipping metadata addition")
+    except Exception as e:
+        logging.error(f"Failed to add metadata: {e}")
+
 
 def verify_onnx_model(onnx_path: str, original_model: Model, pos_len: int = 19, 
                       batch_size: int = 1, ignore_intermediate_head: bool = True) -> bool:
@@ -187,9 +254,11 @@ def verify_onnx_model(onnx_path: str, original_model: Model, pos_len: int = 19,
     ort_session = ort.InferenceSession(onnx_path)
     
     # Create test inputs
-    input_spatial = torch.randn(batch_size, 22, pos_len, pos_len, dtype=torch.float32)
+    num_spatial_inputs = modelconfigs.get_num_bin_input_features(model.config)
+    input_spatial = torch.randn(batch_size, num_spatial_inputs, pos_len, pos_len, dtype=torch.float32)
     input_spatial[:,0,:,:]=1.0
-    input_global = torch.randn(batch_size, 19, dtype=torch.float32)
+    num_global_inputs = modelconfigs.get_num_global_input_features(model.config)
+    input_global = torch.randn(batch_size, num_global_inputs, dtype=torch.float32)
     
     # Get PyTorch outputs
     original_model.eval()
@@ -245,11 +314,14 @@ if __name__ == "__main__":
         parser.add_argument('-model-name', help='Name for the exported model', required=True)
         parser.add_argument('-use-swa', help='Use SWA model if available', action='store_true', required=False)
         parser.add_argument('-pos-len', help='Spatial edge length (e.g. 19 for 19x19 Go)', type=int, default=19, required=False)
-        parser.add_argument('-batch-size', help='Batch size for ONNX export', type=int, default=1, required=False)
+        parser.add_argument('-batch-size', help='Batch size for ONNX export', type=int, default=4, required=False)
         parser.add_argument('-opset-version', help='ONNX opset version', type=int, default=20, required=False)
         parser.add_argument('-simplify', help='Simplify ONNX model using onnx-simplifier', action='store_true', required=False)
         parser.add_argument('-disable-mask', help='Disable masks in CNN and attention', action='store_true', required=False)
+        parser.add_argument('-auto-fp16', help='Convert to half precision (FP16) automatically', action='store_true', required=False)
         parser.add_argument('-verbose', help='Verbose output', action='store_true', required=False)
+        parser.add_argument('-author', help='Author name for metadata', required=False,default="unknown")
+        parser.add_argument('-comment', help='Comment for metadata', required=False,default="")
         
         args = parser.parse_args()
 
@@ -264,7 +336,15 @@ if __name__ == "__main__":
         opset_version = args.opset_version
         simplify = args.simplify
         disable_mask = args.disable_mask
+        auto_fp16 = args.auto_fp16
         verbose = args.verbose
+        author = args.author
+        comment = args.comment
+        extra_meta_data = {}
+        if author is not None:
+            extra_meta_data["author"] = author
+        if comment is not None:
+            extra_meta_data["comment"] = comment
     else:
         checkpoint_file = "../data/train/go_b24c128tf1b_muon1_fd1/checkpoint.ckpt"
         export_dir = "../onnx_exports"
@@ -274,6 +354,7 @@ if __name__ == "__main__":
         batch_size = 128
         opset_version = 20
         simplify = False
+        auto_fp16 = False
         verbose = False
     
     # Create export directory
@@ -307,17 +388,28 @@ if __name__ == "__main__":
     logging.info(f"Model config: {export_model.config}")
     
     # Export to ONNX
-    onnx_filename = f"{model_name}.onnx"
+    save_name = f"{model_name}"
+    # Add training state info if available
+    if "train_state" in other_state_dict:
+        train_state = other_state_dict["train_state"]
+        if "global_step_samples" in train_state:
+            save_name += f"-s{train_state['global_step_samples']}"
+        if "total_num_data_rows" in train_state:
+            save_name += f"-d{train_state['total_num_data_rows']}"
+    onnx_filename = f"{save_name}.onnx"
     onnx_path = os.path.join(export_dir, onnx_filename)
     
     export_to_onnx(
         export_model, 
+        save_name,
         onnx_path, 
         pos_len=pos_len, 
         batch_size=batch_size, 
         opset_version=opset_version,
         disable_mask=disable_mask,
-        verbose=verbose
+        verbose=verbose,
+        extra_meta_data=extra_meta_data,
+        auto_fp16=auto_fp16
     )
     
     # Verify the exported model

@@ -613,7 +613,7 @@ class Metrics:
         assert target_weight_longoptimistic_policy.shape[0] == n
         target_weight_longoptimistic_policy_sum = (global_weight * target_weight_longoptimistic_policy).sum()
 
-        if raw_model.config["version"] <= 11 or (raw_model.config["version"] >= 101 and raw_model.config["version"] <= 199)::
+        if raw_model.config["version"] <= 11 or (raw_model.config["version"] >= 101 and raw_model.config["version"] <= 199):
             target_weight_shortoptimistic_policy = torch.zeros_like(global_weight)
             loss_shortoptimistic_policy = torch.zeros_like(loss_policy_player)
         elif disable_optimistic_policy:

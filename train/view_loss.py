@@ -1,8 +1,8 @@
 baseDir="../data/train/"
-lossItems={"p0loss":(1.7,2.5),"vloss":(0.6,0.7),"loss":(50.5,52),"pacc1":(0.35,0.45),"gnorm_batch":(0,40000),"exgnorm":(0,0),"norm_normal_batch":(0,0),"norm_normal_attn_batch":(0,0),"norm_output_batch":(0,0),"norm_noreg_batch":(0,0),"norm_output_noreg_batch":(0,0),"pslr_batch":(1e-7,1e-2)}#name,ylim,  0 means default
+lossItems={"p0loss":(1.7,2.2),"vloss":(0.6,0.7),"loss":(50.5,52),"pacc1":(0.40,0.5),"gnorm_batch":(0,40000),"exgnorm":(0,0),"norm_normal_batch":(0,0),"norm_normal_attn_batch":(0,0),"norm_output_batch":(0,0),"norm_noreg_batch":(0,0),"norm_output_noreg_batch":(0,0),"pslr_batch":(1e-7,1e-2)}#name,ylim,  0 means default
 
 
-trainDirs=["ref_b30c128h4tfrs","b14c192h6tfrs_1","b14c192h6tfrs_1_old"]
+trainDirs=["ref_b30c128h4tfrs","b14c192h6tfrs_1_old","b14c192h6tfrs_1_fd1","b14c192h6tfrs_1_fd2","b14c192h6tfrs_1",]
 
 autoBias=False
 biases=None
@@ -16,7 +16,7 @@ lossTypes=["train","val_swa0"]
 outputFile="../losstf.png"
 
 logPlot=True
-logPlotXmin=1e6
+logPlotXmin=1e8
 logPlotXmax=1e10
 #logPlotXmax=None
 #smooth_window=100

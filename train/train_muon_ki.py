@@ -357,18 +357,18 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             return lr0 * 2 ** (-1.5)
         if t < 2.0**4:
             return lr0 * 2 ** (-2.0)
-        if t < 2.0**5:
+        if t < 24:
             return lr0 * 2 ** (-2.5)
         # final drop
-        if t < 36:
+        if t < 25:
             return lr0 * 2 ** (-3.0)
-        if t < 40:
+        if t < 26:
             return lr0 * 2 ** (-3.5)
-        if t < 42:
+        if t < 28:
             return lr0 * 2 ** (-4.0)
-        if t < 44:
+        if t < 30:
             return lr0 * 2 ** (-5.0)
-        if t < 45:
+        if t < 32:
             return lr0 * 2 ** (-6.0)
         return lr0 * 2 ** (-7.0)
     
