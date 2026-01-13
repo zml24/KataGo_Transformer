@@ -8,6 +8,10 @@ import datetime
 import numpy as np
 import torch
 import torch.onnx
+try:
+    import torch.export
+except ImportError:
+    torch_export = None
 import torch.ao.quantization
 from typing import Dict, List, Optional, Tuple
 
@@ -16,6 +20,7 @@ from model_pytorch import Model
 #from load_model import load_model
 import data_processing_pytorch
 
+from qat_helper import get_tensorrt_qat_qconfig, is_qat_checkpoint, disable_qat_for_unsupported_modules, UNSUPPORTED_QUANTIZATION_MODULES
 
 try:
     from onnxruntime.quantization import QuantType, quantize_static, CalibrationDataReader, CalibrationMethod, QuantFormat, quant_pre_process
@@ -61,68 +66,9 @@ Export PyTorch neural net weights to ONNX format for inference.
 # Command line arguments will be parsed in the main block
 
 
-# QAT related functions -----------------------------------------------------------
 
-def get_tensorrt_qat_qconfig():
-    """
-    QAT configuration optimized for TensorRT (compatible with PyTorch 2.x+)
-    """
-    from torch.ao.quantization import (
-        FakeQuantize, 
-        MovingAverageMinMaxObserver, 
-        PerChannelMinMaxObserver, 
-        QConfig
-    )
-    # 1. Weights: Per-Channel Symmetric
-    weight_qconfig = FakeQuantize.with_args(
-        observer=PerChannelMinMaxObserver,
-        quant_min=-128, 
-        quant_max=127,
-        dtype=torch.qint8,
-        qscheme=torch.per_channel_symmetric,
-        ch_axis=0
-    )
-    
-    # 2. Activations: Per-Tensor Symmetric
-    act_qconfig = FakeQuantize.with_args(
-        observer=MovingAverageMinMaxObserver,
-        quant_min=-128, 
-        quant_max=127,
-        dtype=torch.qint8,
-        qscheme=torch.per_tensor_symmetric,
-        reduce_range=False
-    )
-    
-    return QConfig(activation=act_qconfig, weight=weight_qconfig)
 
-def disable_qat_for_unsupported_modules(model):
-    # Disable QAT for input layers and heads/final trunk layers
-    modules_to_disable = [
-        "conv_spatial", "linear_global", "metadata_encoder",
-        "norm_trunkfinal", "act_trunkfinal", "policy_head", "value_head",
-        "norm_intermediate_trunkfinal", "act_intermediate_trunkfinal",
-        "intermediate_policy_head", "intermediate_value_head"
-    ]
-    for module_name in modules_to_disable:
-        module = getattr(model, module_name, None)
-        if module is not None:
-            module.qconfig = None
-
-def is_qat_checkpoint(state_dict):
-    # Check for the existence of common QAT-specific keys
-    qat_keys = [k for k in state_dict.keys() if "activation_post_process" in k or "fake_quant" in k]
-    if not qat_keys:
-        # Check inside 'model' key if it exists
-        if "model" in state_dict:
-            qat_keys = [k for k in state_dict["model"].keys() if "activation_post_process" in k or "fake_quant" in k]
-    
-    if not qat_keys:
-        return False
-    has_scale = any("scale" in k for k in qat_keys)
-    has_zp = any("zero_point" in k for k in qat_keys)
-    return has_scale and has_zp
-
-def load_model_for_export(checkpoint_file, use_swa, device, pos_len=19, verbose=False):
+def load_model_for_export(checkpoint_file, use_swa, device, pos_len=19, verbose=False, convert_qat_to_float=False):
     checkpoint = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
     
     if "config" in checkpoint:
@@ -133,11 +79,15 @@ def load_model_for_export(checkpoint_file, use_swa, device, pos_len=19, verbose=
 
     logging.info(f"Model config: {model_config}")
     
+    is_qat = is_qat_checkpoint(checkpoint)
+    if is_qat and convert_qat_to_float:
+        logging.info("QAT checkpoint detected and -convert-qat-to-float is enabled. Converting to regular float model...")
+        is_qat = False # Pretend it's not QAT from now on
+    
     def create_and_load_model(state_dict_key, is_swa=False):
         m = Model(model_config, pos_len)
         m.initialize()
         
-        is_qat = is_qat_checkpoint(checkpoint)
         if is_qat:
             logging.info(f"Applying QAT configuration to {'SWA ' if is_swa else ''}model...")
             m.qconfig = get_tensorrt_qat_qconfig()
@@ -164,7 +114,8 @@ def load_model_for_export(checkpoint_file, use_swa, device, pos_len=19, verbose=
             else:
                 logging.debug(f"Skipping key {name} as it does not exist in the model")
         
-        m.load_state_dict(new_state_dict, strict=True)
+        # Use strict=False if we are converting from QAT to float to ignore fake_quant/observer keys
+        m.load_state_dict(new_state_dict, strict=not convert_qat_to_float)
         
         if is_qat:
             # For TensorRT QAT export, we keep the FakeQuantize nodes and DO NOT call convert.
@@ -209,16 +160,12 @@ class ONNXExportWrapper(torch.nn.Module):
         self.has_metadata_encoder = model.get_has_metadata_encoder()    
         self.disable_mask = disable_mask
     
-    def forward(self, *args) -> Tuple[torch.Tensor, ...]:
+    def forward(self, input_spatial: torch.Tensor, input_global: torch.Tensor, input_meta: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, ...]:
         """
         Forward pass that returns a flattened tuple of outputs for ONNX compatibility.
         """
-        input_spatial = args[0]
-        input_global = args[1]
-        
         # Call the original model
         if self.has_metadata_encoder:
-            input_meta = args[2]
             outputs = self.model(input_spatial, input_global, input_meta, disable_mask=self.disable_mask)
         else:
             outputs = self.model(input_spatial, input_global, disable_mask=self.disable_mask)
@@ -295,7 +242,8 @@ class ONNXCalibrationDataReader(CalibrationDataReader):
 def quantize_onnx(model_path: str, output_path: str, calib_data_dir: str, 
                   model: Model, pos_len: int, batch_size: int, 
                   disable_mask: bool,
-                  num_samples: int = 128, method: str = "Entropy") -> None:
+                  num_samples: int = 128, method: str = "Entropy",
+                  verbose: bool = False) -> None:
     """
     Quantize an ONNX model to INT8.
     """
@@ -332,6 +280,24 @@ def quantize_onnx(model_path: str, output_path: str, calib_data_dir: str,
 
     dr = ONNXCalibrationDataReader(calib_data_dir, model, pos_len, batch_size, disable_mask, num_samples)
     
+    # Identify nodes to exclude from quantization (input/output heads)
+    nodes_to_exclude = []
+    try:
+        import onnx
+        onnx_model = onnx.load(actual_input_path)
+        for node in onnx_model.graph.node:
+            for module_name in UNSUPPORTED_QUANTIZATION_MODULES:
+                # Check if module name is in node name (PyTorch export usually includes scope)
+                if module_name in node.name:
+                    nodes_to_exclude.append(node.name)
+                    break
+        if nodes_to_exclude:
+            logging.info(f"Excluding {len(nodes_to_exclude)} nodes from quantization (matched UNSUPPORTED_QUANTIZATION_MODULES)")
+            if verbose:
+                logging.debug(f"Excluded nodes: {nodes_to_exclude}")
+    except Exception as e:
+        logging.warning(f"Failed to identify nodes to exclude from ONNX model: {e}")
+
     # Map method string to CalibrationMethod
     calib_method = {
         "MinMax": CalibrationMethod.MinMax,
@@ -348,9 +314,10 @@ def quantize_onnx(model_path: str, output_path: str, calib_data_dir: str,
         "calibrate_method": calib_method,
         "activation_type": QuantType.QInt8,  # 改为 QInt8 以实现对称量化，兼容 TensorRT
         "weight_type": QuantType.QInt8,      # 权重保持 QInt8
-        "per_channel": False,                # 关闭 per_channel 以避免标量(如eps)量化时的 axis 错误 (TensorRT 报错 nbDims=0)
+        "per_channel": True,                # 关闭 per_channel 以避免标量(如eps)量化时的 axis 错误 (TensorRT 报错 nbDims=0)
         "reduce_range": False,
         "quant_format": QuantFormat.QDQ,
+        "nodes_to_exclude": nodes_to_exclude,
         "extra_options": {
             "ActivationSymmetric": True, 
             "WeightSymmetric": True,
@@ -374,7 +341,8 @@ def quantize_onnx(model_path: str, output_path: str, calib_data_dir: str,
 def export_to_onnx(model: Model, save_name: str ,export_path: str, pos_len: int = 19, 
                    batch_size: int = 1, opset_version: int = 20, disable_mask: bool = False,
                    verbose: bool = False, extra_meta_data: Dict[str, str] = None,
-                   auto_fp16: bool = False, fix_batchsize: bool = False) -> None:
+                   auto_fp16: bool = False, fix_batchsize: bool = False,
+                   dynamo: bool = False) -> None:
     """
     Export PyTorch model to ONNX format.
     
@@ -387,6 +355,7 @@ def export_to_onnx(model: Model, save_name: str ,export_path: str, pos_len: int 
         verbose: Whether to enable verbose logging
         auto_fp16: Whether to automatically convert to mixed precision (FP16)
         fix_batchsize: Whether to fix the batch size to the specified value
+        dynamo: Whether to use TorchDynamo for export
     """
     
     # Set model to evaluation mode
@@ -425,23 +394,39 @@ def export_to_onnx(model: Model, save_name: str ,export_path: str, pos_len: int 
     
     # Dynamic axes for variable batch size
     dynamic_axes = {}
+    dynamic_shapes = None
     if not fix_batchsize:
-        for name in input_names:
-            dynamic_axes[name] = {0: 'batch_size'}
-        for name in output_names:
-            dynamic_axes[name] = {0: 'batch_size'}
+        if dynamo:
+              # For dynamo, we need to provide dynamic_shapes as a dict or tuple
+              # Now that forward has explicit arguments, we can use a dict matching input names
+              dynamic_shapes = {}
+              batch_dim = None
+              if hasattr(torch, "export") and hasattr(torch.export, "Dim"):
+                  batch_dim = torch.export.Dim("batch_size", min=1, max=16384)
+              
+              for name in input_names:
+                  if batch_dim is not None:
+                      dynamic_shapes[name] = {0: batch_dim}
+                  else:
+                      dynamic_shapes[name] = {0: "batch_size"}
+              
+              dynamic_axes = None # dynamo uses dynamic_shapes
+        else:
+            for name in input_names:
+                dynamic_axes[name] = {0: 'batch_size'}
+            for name in output_names:
+                dynamic_axes[name] = {0: 'batch_size'}
     else:
         dynamic_axes = None
+        dynamic_shapes = None
         logging.info(f"Fixed batch size enabled: {batch_size}")
     
     # Export to ONNX
     logging.info(f"Exporting model to ONNX format: {export_path}")
     logging.info(f"Input shapes: spatial={list(input_spatial.shape)}, global={list(input_global.shape)}")
     
-    dynamo=False # now it does not support True
     report=False
     if dynamo:
-        dynamic_axes=None
         report=True
 
 
@@ -456,6 +441,7 @@ def export_to_onnx(model: Model, save_name: str ,export_path: str, pos_len: int 
             input_names=input_names,
             output_names=output_names,
             dynamic_axes=dynamic_axes,
+            dynamic_shapes=dynamic_shapes,
             verbose=verbose,
             dynamo=dynamo,
             report=report
@@ -529,18 +515,20 @@ def export_to_onnx(model: Model, save_name: str ,export_path: str, pos_len: int 
         logging.error(f"Failed to add metadata: {e}")
 
 
-def verify_onnx_model(onnx_path: str, original_model: Model, pos_len: int = 19, 
-                      batch_size: int = 1, ignore_intermediate_head: bool = True) -> bool:
-    torch.nn.RMSNorm.forward = original_rms_norm_forward
+def compare_models(model1, model2, model1_type: str, model2_type: str, pos_len: int = 19, 
+                   batch_size: int = 1, calib_data_dir: str = None, config=None) -> bool:
     """
-    Verify that the ONNX model produces similar outputs to the original PyTorch model.
+    Compare two models (either PyTorch or ONNX) to ensure they produce similar outputs.
     
     Args:
-        onnx_path: Path to the ONNX model
-        original_model: Original PyTorch model
+        model1: First model (Model object or ONNX path)
+        model2: Second model (Model object or ONNX path)
+        model1_type: 'pytorch' or 'onnx'
+        model2_type: 'pytorch' or 'onnx'
         pos_len: Board position length
         batch_size: Batch size for testing
-        ignore_intermediate_head: Whether to ignore intermediate head outputs
+        calib_data_dir: Directory with .npz files for validation data
+        config: Model config (required if both are ONNX)
         
     Returns:
         True if verification passes, False otherwise
@@ -548,68 +536,102 @@ def verify_onnx_model(onnx_path: str, original_model: Model, pos_len: int = 19,
     try:
         import onnxruntime as ort
     except ImportError:
-        logging.warning("onnxruntime not available, skipping verification")
-        return True
+        if model1_type == 'onnx' or model2_type == 'onnx':
+            assert False, "onnxruntime not available, cannot compare ONNX models"
     
-    # Load ONNX model
-    ort_session = ort.InferenceSession(onnx_path)
-    
-    # Create test inputs
-    num_spatial_inputs = modelconfigs.get_num_bin_input_features(original_model.config)
-    input_spatial = torch.randn(batch_size, num_spatial_inputs, pos_len, pos_len, dtype=torch.float32)
-    input_spatial[:,0,:,:]=1.0
-    num_global_inputs = modelconfigs.get_num_global_input_features(original_model.config)
-    input_global = torch.randn(batch_size, num_global_inputs, dtype=torch.float32)
-    
-    input_meta = None
-    if original_model.get_has_metadata_encoder():
-        num_meta_input_features = modelconfigs.get_num_meta_encoder_input_features(original_model.config)
-        input_meta = torch.randn(batch_size, num_meta_input_features, dtype=torch.float32)
-
-    # Get PyTorch outputs
-    original_model.eval()
-    with torch.no_grad():
-        if input_meta is not None:
-            pytorch_outputs = original_model(input_spatial, input_global, input_meta)
+    # Get config
+    if config is None:
+        if model1_type == 'pytorch':
+            config = model1.config
+        elif model2_type == 'pytorch':
+            config = model2.config
         else:
-            pytorch_outputs = original_model(input_spatial, input_global)
-    pytorch_outputs = pytorch_outputs[0]
-    pytorch_outputs = [pytorch_outputs[i] for i in [0, 1, 2, 3, 4]]
+            assert False, "Config must be provided if both models are ONNX"
 
-    # Prepare ONNX inputs
-    onnx_inputs = {
-        'input_spatial': input_spatial.numpy(),
-        'input_global': input_global.numpy()
-    }
-    if input_meta is not None:
-        onnx_inputs['input_meta'] = input_meta.numpy()
+    # Create test inputs
+    input_spatial, input_global, input_meta = None, None, None
+    if calib_data_dir is not None:
+        logging.info(f"Using calibration data from {calib_data_dir} for comparison")
+        # Use a temporary model for data reader if needed
+        data_reader_model = model1 if model1_type == 'pytorch' else model2
+        dr = ONNXCalibrationDataReader(calib_data_dir, data_reader_model, pos_len, batch_size, require_exact_poslen=False, num_samples=batch_size)
+        batch = dr.get_next()
+        if batch is not None:
+            input_spatial = torch.from_numpy(batch['input_spatial'])
+            input_global = torch.from_numpy(batch['input_global'])
+            if 'input_meta' in batch:
+                input_meta = torch.from_numpy(batch['input_meta'])
+        else:
+            logging.warning(f"No .npz files found in {calib_data_dir} for comparison. Falling back to dummy_input.py")
     
-    # Get ONNX outputs
-    onnx_outputs = ort_session.run(None, onnx_inputs)
-    
+    if input_spatial is None:
+        if calib_data_dir is None:
+            logging.warning("No -calib-data provided, using dummy_input.py for comparison")
+        import dummy_input
+        input_spatial, input_global, input_meta = dummy_input.generate_dummy_inputs(config, batch_size, pos_len, "cpu")
+
+    def get_outputs(model, model_type, spatial, global_in, meta):
+        if model_type == 'pytorch':
+            model.eval()
+            with torch.no_grad():
+                if meta is not None:
+                    outputs = model(spatial, global_in, meta)
+                else:
+                    outputs = model(spatial, global_in)
+            outputs = outputs[0]
+            return [outputs[i] for i in [0, 1, 2, 3, 4]]
+        else:
+            ort_session = ort.InferenceSession(model)
+            onnx_inputs = {
+                'input_spatial': spatial.numpy(),
+                'input_global': global_in.numpy()
+            }
+            if meta is not None:
+                onnx_inputs['input_meta'] = meta.numpy()
+            onnx_outputs = ort_session.run(None, onnx_inputs)
+            return [torch.from_numpy(out) for out in onnx_outputs]
+
+    outputs1 = get_outputs(model1, model1_type, input_spatial, input_global, input_meta)
+    outputs2 = get_outputs(model2, model2_type, input_spatial, input_global, input_meta)
     
     # Check if number of outputs match
-    if len(onnx_outputs) != len(pytorch_outputs):
-        logging.error(f"Output count mismatch: ONNX={len(onnx_outputs)}, PyTorch={len(pytorch_outputs)}")
+    if len(outputs1) != len(outputs2):
+        logging.error(f"Output count mismatch: {model1_type}={len(outputs1)}, {model2_type}={len(outputs2)}")
         return False
     
     # Check output shapes and values
-    for i, (onnx_out, pytorch_out) in enumerate(zip(onnx_outputs, pytorch_outputs)):
-        pytorch_np = pytorch_out.detach().numpy()
-        #print(onnx_out[0], pytorch_out[0])
-        
-        if onnx_out.shape != pytorch_np.shape:
-            logging.error(f"Output {i} shape mismatch: ONNX={onnx_out.shape}, PyTorch={pytorch_np.shape}")
+    for i, (out1, out2) in enumerate(zip(outputs1, outputs2)):
+        if out1.shape != out2.shape:
+            logging.error(f"Output {i} shape mismatch: {model1_type}={out1.shape}, {model2_type}={out2.shape}")
             return False
         
-        # Check if values are close (allowing for small numerical differences)
-        if not np.allclose(onnx_out, pytorch_np, rtol=1e-5, atol=1e-6):
-            max_diff = np.max(np.abs(onnx_out - pytorch_np))
-            logging.warning(f"Output {i} values differ, max difference: {max_diff}")
-            # Don't fail on small differences, just warn
+        # Policy cross-entropy validation (channel 0)
+        if i == 0:
+            # Formula: CrossEntropy(new, original) - Entropy(original) = KL(original || new)
+            p_logits = out1[:, 0, :]
+            q_logits = out2[:, 0, :]
+            
+            p_probs = torch.nn.functional.softmax(p_logits, dim=-1)
+            q_logprobs = torch.nn.functional.log_softmax(q_logits, dim=-1)
+            
+            kl = torch.nn.functional.kl_div(q_logprobs, p_probs, reduction='batchmean')
+            logging.info(f"Policy channel 0 cross-entropy diff (KL Divergence) between {model1_type} and {model2_type}: {kl.item():.6f}")
+
+        # Check if values are close
+        out1_np = out1.detach().numpy()
+        out2_np = out2.detach().numpy()
+        if not np.allclose(out1_np, out2_np, rtol=1e-5, atol=1e-6):
+            max_diff = np.max(np.abs(out1_np - out2_np))
+            logging.warning(f"Output {i} values differ between {model1_type} and {model2_type}, max difference: {max_diff}")
     
-    logging.info("ONNX model verification passed!")
+    logging.info(f"Model comparison between {model1_type} and {model2_type} completed!")
     return True
+
+
+def verify_onnx_model(onnx_path: str, original_model: Model, pos_len: int = 19, 
+                      batch_size: int = 1, calib_data_dir: str = None) -> bool:
+    torch.nn.RMSNorm.forward = original_rms_norm_forward
+    return compare_models(original_model, onnx_path, 'pytorch', 'onnx', pos_len, batch_size, calib_data_dir)
 
 
 if __name__ == "__main__":
@@ -631,9 +653,11 @@ if __name__ == "__main__":
         parser.add_argument('-calib-data', help='Directory with .npz files for INT8 calibration', required=False)
         parser.add_argument('-calib-num', help='Number of samples for INT8 calibration', type=int, default=128, required=False)
         parser.add_argument('-calib-method', help='Calibration method: MinMax, Entropy, Percentile', default='Entropy', required=False)
+        parser.add_argument('-convert-qat-to-float', help='Convert QAT model to traditional float model', action='store_true', required=False)
         parser.add_argument('-verbose', help='Verbose output', action='store_true', required=False)
         parser.add_argument('-author', help='Author name for metadata', required=False,default="unknown")
         parser.add_argument('-comment', help='Comment for metadata', required=False,default="")
+        parser.add_argument('-dynamo', help='Use TorchDynamo for ONNX export', action='store_true', required=False)
         
         args = parser.parse_args()
 
@@ -654,9 +678,11 @@ if __name__ == "__main__":
         calib_data = args.calib_data
         calib_num = args.calib_num
         calib_method = args.calib_method
+        convert_qat_to_float = args.convert_qat_to_float
         verbose = args.verbose
         author = args.author
         comment = args.comment
+        dynamo = args.dynamo
         extra_meta_data = {}
         if author is not None:
             extra_meta_data["author"] = author
@@ -677,7 +703,9 @@ if __name__ == "__main__":
         calib_data = None
         calib_num = 128
         calib_method = "Entropy"
+        convert_qat_to_float = False
         verbose = False
+        dynamo = False
     
     # Create export directory
     os.makedirs(export_dir, exist_ok=True)
@@ -698,10 +726,32 @@ if __name__ == "__main__":
     
     # Load model
     logging.info(f"Loading model from checkpoint: {checkpoint_file}")
-    model, swa_model, other_state_dict, is_qat = load_model_for_export(
-        checkpoint_file, use_swa, device="cpu", pos_len=pos_len, verbose=True
+    model, swa_model, other_state_dict, is_qat_in_checkpoint = load_model_for_export(
+        checkpoint_file, use_swa, device="cpu", pos_len=pos_len, verbose=True, convert_qat_to_float=False
     )
     
+    # If convert_qat_to_float is requested, we need the float version too
+    export_model = None
+    if convert_qat_to_float and is_qat_in_checkpoint:
+        logging.info("Loading float version of the QAT model for comparison...")
+        float_model, float_swa_model, _, _ = load_model_for_export(
+            checkpoint_file, use_swa, device="cpu", pos_len=pos_len, verbose=True, convert_qat_to_float=True
+        )
+        
+        # Original QAT model for comparison
+        qat_model_to_compare = swa_model if (use_swa and swa_model is not None) else model
+        # Converted float model for export
+        export_model = float_swa_model if (use_swa and float_swa_model is not None) else float_model
+        
+        logging.info("Comparing original QAT model with converted float model...")
+        compare_models(qat_model_to_compare, export_model, 'pytorch', 'pytorch', pos_len, batch_size, calib_data)
+        
+        # Now we proceed with the float model as the one to export
+        is_qat = False 
+    else:
+        export_model = swa_model if (use_swa and swa_model is not None) else model
+        is_qat = is_qat_in_checkpoint
+
     if is_qat:
         logging.info("Model loaded and converted from QAT checkpoint.")
         if extra_meta_data is None:
@@ -710,7 +760,6 @@ if __name__ == "__main__":
         extra_meta_data["is_int8"] = "true"
     
     # Use SWA model if requested and available
-    export_model = swa_model if (use_swa and swa_model is not None) else model
     model_type = "SWA" if (use_swa and swa_model is not None) else "regular"
     
     logging.info(f"Exporting {model_type} model")
@@ -739,12 +788,13 @@ if __name__ == "__main__":
         verbose=verbose,
         extra_meta_data=extra_meta_data,
         auto_fp16=auto_fp16,
-        fix_batchsize=fix_batchsize
+        fix_batchsize=fix_batchsize,
+        dynamo=dynamo
     )
     
     # Verify the exported model
     logging.info("Verifying exported ONNX model...")
-    verification_passed = verify_onnx_model(onnx_path, export_model, pos_len, batch_size)
+    verification_passed = verify_onnx_model(onnx_path, export_model, pos_len, batch_size, calib_data_dir=calib_data)
     
     if not verification_passed:
         logging.error("ONNX model verification failed!")
@@ -794,12 +844,13 @@ if __name__ == "__main__":
                 batch_size, 
                 disable_mask,
                 num_samples=calib_num,
-                method=calib_method
+                method=calib_method,
+                verbose=verbose
             )
             
             # Verify the quantized model
             logging.info("Verifying quantized INT8 model...")
-            int8_verification_passed = verify_onnx_model(onnx_int8_path, export_model, pos_len, batch_size)
+            int8_verification_passed = verify_onnx_model(onnx_int8_path, export_model, pos_len, batch_size, calib_data_dir=calib_data)
             if not int8_verification_passed:
                 logging.warning("INT8 model verification failed! (This is common for INT8, check accuracy manually)")
             
