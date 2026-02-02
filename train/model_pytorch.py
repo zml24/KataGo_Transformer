@@ -1064,13 +1064,15 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         config: Dict,
         activation: str,
         pos_len: int,
-        use_swiglu: bool
+        use_swiglu: bool,
+        use_rope: bool = True
     ):
         super(TransformerRoPEGQABlock, self).__init__()
         self.name = name
         self.norm_kind = config.get("norm_kind", "layer")
         self.ffn_dim = config.get("transformer_ffn_channels", c_main * 2)
         self.use_swiglu = use_swiglu  
+        self.use_rope = use_rope
         # --- GQA Config ---
         self.num_heads = config.get("transformer_heads", 4)             # Query Heads
         self.num_kv_heads = config.get("transformer_kv_heads", self.num_heads) # KV Heads (Key/Value)
@@ -1095,11 +1097,15 @@ class TransformerRoPEGQABlock(torch.nn.Module):
 
         # Cache cos and sin
         # Assume precompute_freqs_cos_sin_2d_fixed is defined externally
-        self.rope_theta = config.get("rope_theta", 100.0) # KV Heads (Key/Value)
-        assert self.rope_theta > pos_len * 2.0, f"theta={self.rope_theta} of RoPE may be too small for pos_len={pos_len}"
-        cos_cached, sin_cached = precompute_freqs_cos_sin_2d(self.head_dim, pos_len, self.rope_theta)
-        self.register_buffer("cos_cached", cos_cached, persistent=False)
-        self.register_buffer("sin_cached", sin_cached, persistent=False)
+        if self.use_rope:
+            self.rope_theta = config.get("rope_theta", 100.0) # KV Heads (Key/Value)
+            assert self.rope_theta > pos_len * 2.0, f"theta={self.rope_theta} of RoPE may be too small for pos_len={pos_len}"
+            cos_cached, sin_cached = precompute_freqs_cos_sin_2d(self.head_dim, pos_len, self.rope_theta)
+            self.register_buffer("cos_cached", cos_cached, persistent=False)
+            self.register_buffer("sin_cached", sin_cached, persistent=False)
+        else:
+            self.cos_cached = None
+            self.sin_cached = None
 
         self.ffn_linear1 = torch.nn.Linear(c_main, self.ffn_dim, bias=False)
         if self.use_swiglu:
@@ -1153,7 +1159,8 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         
         # 3. Apply RoPE (Broadcasting works here automatically)
-        q, k = apply_rotary_emb(q, k, self.cos_cached, self.sin_cached)
+        if self.use_rope:
+            q, k = apply_rotary_emb(q, k, self.cos_cached, self.sin_cached)
         
         # 4. Permute to (B, H, S, D)
         q = q.permute(0, 2, 1, 3) 
@@ -2071,6 +2078,26 @@ class Model(torch.nn.Module):
                     config=self.config,
                     activation=self.activation,
                 ))
+            elif block_kind == "transformerg":
+                self.blocks.append(TransformerRoPEGQABlock(
+                    name=block_name,
+                    c_main=self.c_trunk,
+                    config=self.config,
+                    activation=self.activation,
+                    pos_len=pos_len,
+                    use_swiglu=False,
+                    use_rope=False
+                ))
+            elif block_kind == "transformersg":
+                self.blocks.append(TransformerRoPEGQABlock(
+                    name=block_name,
+                    c_main=self.c_trunk,
+                    config=self.config,
+                    activation=self.activation,
+                    pos_len=pos_len,
+                    use_swiglu=True,
+                    use_rope=False
+                ))
             elif block_kind == "transformerropeg":
                 self.blocks.append(TransformerRoPEGQABlock(
                     name=block_name,
@@ -2079,6 +2106,7 @@ class Model(torch.nn.Module):
                     activation=self.activation,
                     pos_len=pos_len,
                     use_swiglu=False,
+                    use_rope=True
                 ))
             elif block_kind == "transformerropesg":
                 self.blocks.append(TransformerRoPEGQABlock(
@@ -2088,6 +2116,7 @@ class Model(torch.nn.Module):
                     activation=self.activation,
                     pos_len=pos_len,
                     use_swiglu=True,
+                    use_rope=True
                 ))
             else:
                 assert False, f"Unknown block kind: {block_config[1]}"
