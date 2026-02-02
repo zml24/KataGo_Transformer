@@ -13,6 +13,12 @@ import logging
 import modelconfigs
 from packaging.version import parse
 
+MAYBE_QAT = True # An extra QuantStub will be added to ensure the conv is quantized. If false, tensorrt will not detect the QDQ nodes and the model will run on fp16
+if MAYBE_QAT:
+    from torch.ao.quantization import QuantStub
+QUANT_ACTIVATION = False # If false, the NormMask will not be quantized. There is no extra QDQ before activation so the activation will not be quantized.
+assert not QUANT_ACTIVATION, "The model become completely random when QUANT_ACTIVATION because of unknown reason. And it will not accelerate the inference speed."
+
 MIN_VERSION = '2.7'
 current_version = torch.__version__
 ERROR_MSG = (
@@ -131,7 +137,11 @@ class BiasMask(torch.nn.Module):
         self.scale = None
 
     def set_scale(self, scale: Optional[float]):
-        self.scale = scale
+        del self.scale
+        if scale is not None:
+            self.register_buffer("scale", torch.tensor([scale,], dtype=torch.float32), persistent=False)
+        else:
+            self.scale = None
 
     def add_reg_dict(self, reg_dict:Dict[str,List]):
         if self.is_after_batchnorm:
@@ -200,6 +210,12 @@ class NormMask(torch.nn.Module):
         )
         self.c_in = c_in
 
+        if MAYBE_QAT and QUANT_ACTIVATION:
+            if(self.use_gamma):
+                self.quant_after_gamma = QuantStub()
+            self.quant_after_beta = QuantStub()
+            self.quant_after_mask = QuantStub()
+
         self.scale = None
         self.gamma = None
         if self.norm_kind == "bnorm" or (self.norm_kind == "fixscaleonenorm" and self.is_last_batchnorm):
@@ -249,7 +265,11 @@ class NormMask(torch.nn.Module):
             assert False, f"Unimplemented norm_kind: {self.norm_kind}"
 
     def set_scale(self, scale: Optional[float]):
-        self.scale = scale
+        del self.scale
+        if scale is not None:
+            self.register_buffer("scale", torch.tensor([scale,], dtype=torch.float32), persistent=False)
+        else:
+            self.scale = None
 
     def add_reg_dict(self, reg_dict:Dict[str,List]):
         if self.is_last_batchnorm:
@@ -290,29 +310,26 @@ class NormMask(torch.nn.Module):
 
     def apply_gamma_beta_scale_mask(self, x, mask):
         #logging.info(f"{(x*x).mean()},{(x*x).max()}")
+        y = x
+        if self.gamma is not None:
+            y = y * (self.gamma + 1.0)
+            if MAYBE_QAT and QUANT_ACTIVATION:
+                y = self.quant_after_gamma(y)
         
+        if self.scale is not None:
+            y = y * self.scale
+            
+        y = y + self.beta
+        if MAYBE_QAT and QUANT_ACTIVATION:
+            y = self.quant_after_beta(y)
+            
         if mask is not None:
-            if self.scale is not None:
-                if self.gamma is not None:
-                    return (x * ((self.gamma + 1.0) * self.scale) + self.beta) * mask
-                else:
-                    return (x * self.scale + self.beta) * mask
-            else:
-                if self.gamma is not None:
-                    return (x * (self.gamma + 1.0) + self.beta) * mask
-                else:
-                    return (x + self.beta) * mask
-        else:
-            if self.scale is not None:
-                if self.gamma is not None:
-                    return (x * ((self.gamma + 1.0) * self.scale) + self.beta) 
-                else:
-                    return (x * self.scale + self.beta) 
-            else:
-                if self.gamma is not None:
-                    return (x * (self.gamma + 1.0) + self.beta) 
-                else:
-                    return (x + self.beta) 
+            y = y * mask
+        
+        if MAYBE_QAT and QUANT_ACTIVATION:
+            y = self.quant_after_mask(y) # always
+            
+        return y
             
 
 
@@ -393,6 +410,10 @@ class NormMask(torch.nn.Module):
 class KataGPool(torch.nn.Module):
     def __init__(self):
         super(KataGPool, self).__init__()
+        # Constants should be tensor to make tensorrt work on int8
+        self.register_buffer("t_14", torch.tensor([14.0,], dtype=torch.float32), persistent=False)
+        self.register_buffer("t_10", torch.tensor([10.0,], dtype=torch.float32), persistent=False)
+        self.register_buffer("t_1", torch.tensor([1.0,], dtype=torch.float32), persistent=False)
 
     def forward(self, x, mask, mask_sum_hw):
         """
@@ -404,15 +425,15 @@ class KataGPool(torch.nn.Module):
         Returns: NC11
         """
         if mask is not None:
-            mask_sum_hw_sqrt_offset = torch.sqrt(mask_sum_hw) - 14.0
+            mask_sum_hw_sqrt_offset = torch.sqrt(mask_sum_hw) - self.t_14
         
             x_fp32=x.to(torch.float32)
             layer_mean = torch.sum(x_fp32, dim=(2, 3), keepdim=True) / mask_sum_hw
             # All activation functions we use right now are always greater than -1.0, and map 0 -> 0.
             # So off-board areas will equal 0, and then this max is mask-safe if we assign -1.0 to off-board areas.
-            (layer_max,_argmax) = torch.max((x+(mask-1.0)).view(x.shape[0],x.shape[1],-1).to(torch.float32), dim=2)
+            (layer_max,_argmax) = torch.max((x+(mask-self.t_1)).view(x.shape[0],x.shape[1],-1).to(torch.float32), dim=2)
         else:
-            mask_sum_hw_sqrt_offset = (x.shape[2]*x.shape[3])**0.5 - 14.0
+            mask_sum_hw_sqrt_offset = (x.shape[2]*x.shape[3])**0.5 - self.t_14
             x_fp32=x.to(torch.float32)
             layer_mean = torch.mean(x_fp32, dim=(2, 3), keepdim=True) 
             # All activation functions we use right now are always greater than -1.0, and map 0 -> 0.
@@ -422,7 +443,7 @@ class KataGPool(torch.nn.Module):
         layer_max = layer_max.view(x.shape[0],x.shape[1],1,1)
 
         out_pool1 = layer_mean
-        out_pool2 = layer_mean * (mask_sum_hw_sqrt_offset / 10.0)
+        out_pool2 = layer_mean * (mask_sum_hw_sqrt_offset / self.t_10)
         out_pool3 = layer_max
 
         out = torch.cat((out_pool1, out_pool2, out_pool3), dim=1)
@@ -432,6 +453,11 @@ class KataGPool(torch.nn.Module):
 class KataValueHeadGPool(torch.nn.Module):
     def __init__(self):
         super(KataValueHeadGPool, self).__init__()
+        # Constants should be tensor to make tensorrt work on int8
+        self.register_buffer("t_14", torch.tensor([14.0,], dtype=torch.float32), persistent=False) 
+        self.register_buffer("t_10", torch.tensor([10.0,], dtype=torch.float32), persistent=False)
+        self.register_buffer("t_100", torch.tensor([100.0,], dtype=torch.float32), persistent=False)
+        self.register_buffer("t_0_1", torch.tensor([0.1,], dtype=torch.float32), persistent=False)
 
     def forward(self, x, mask, mask_sum_hw):
         """
@@ -443,18 +469,18 @@ class KataValueHeadGPool(torch.nn.Module):
         Returns: NC11
         """
         if mask is not None:
-            mask_sum_hw_sqrt_offset = torch.sqrt(mask_sum_hw) - 14.0
+            mask_sum_hw_sqrt_offset = torch.sqrt(mask_sum_hw) - self.t_14
         
             x_fp32=x.to(torch.float32)
             layer_mean = torch.sum(x_fp32, dim=(2, 3), keepdim=True) / mask_sum_hw
         else:
-            mask_sum_hw_sqrt_offset = (x.shape[2]*x.shape[3])**0.5 - 14.0
+            mask_sum_hw_sqrt_offset = (x.shape[2]*x.shape[3])**0.5 - self.t_14
             x_fp32=x.to(torch.float32)
             layer_mean = torch.mean(x_fp32, dim=(2, 3), keepdim=True) 
 
         out_pool1 = layer_mean
-        out_pool2 = layer_mean * (mask_sum_hw_sqrt_offset / 10.0)
-        out_pool3 = layer_mean * ((mask_sum_hw_sqrt_offset * mask_sum_hw_sqrt_offset) / 100.0 - 0.1)
+        out_pool2 = layer_mean * (mask_sum_hw_sqrt_offset / self.t_10)
+        out_pool3 = layer_mean * ((mask_sum_hw_sqrt_offset * mask_sum_hw_sqrt_offset) / self.t_100 - self.t_0_1)
 
         out = torch.cat((out_pool1, out_pool2, out_pool3), dim=1)
         return out
@@ -548,6 +574,10 @@ class KataConvAndAttentionPool(torch.nn.Module):
         self.actg = act(activation, inplace=True)
         self.conv_mix = torch.nn.Conv2d(c_gpool*2, c_out, kernel_size=1, padding="same", bias=False)
 
+        self.register_buffer("t_1", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("t_6000", torch.tensor(6000.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("t_0_1", torch.tensor(0.1, dtype=torch.float32), persistent=False)
+
     def initialize(self, scale):
         # Scaling so that variance on the r and g branches adds up to 1.0
         r_scale = 0.8
@@ -600,10 +630,10 @@ class KataConvAndAttentionPool(torch.nn.Module):
         outq = self.conv1q(out).view(n*self.c_apheads, self.c_gpool//self.c_apheads, h*w)
         attention_logits = torch.bmm(torch.transpose(outk,1,2), outq) # n*heads, src h*w, dst h*w
         attention_logits = attention_logits.view(n, self.c_apheads, h*w, h*w)
-        attention_logits = attention_logits - (1.0 - mask.view(n,1,h*w,1)) * 6000.0
+        attention_logits = attention_logits - (self.t_1 - mask.view(n,1,h*w,1)) * self.t_6000
         attention_logits = attention_logits.view(n * self.c_apheads, h*w, h*w)
         attention = torch.nn.functional.softmax(attention_logits, dim=1)
-        attention_scale = 0.1 / torch.sqrt(torch.sum(torch.square(attention), dim=1, keepdim=True)) # n*heads, 1, h*w
+        attention_scale = self.t_0_1 / torch.sqrt(torch.sum(torch.square(attention), dim=1, keepdim=True)) # n*heads, 1, h*w
 
         outg = self.normg(outg, mask=mask, mask_sum=mask_sum)
         outg = self.actg(outg).view(n*self.c_apheads, self.c_gpool//self.c_apheads, h*w)
@@ -699,6 +729,9 @@ class NormActConv(torch.nn.Module):
         self.conv1x1 = None
         if self.conv is not None and kernel_size > 1 and "use_repvgg_linear" in config and config["use_repvgg_linear"]:
             self.conv1x1 = torch.nn.Conv2d(c_in, c_out, kernel_size=1, padding="same", bias=False)
+        
+        if MAYBE_QAT:
+            self.quant_before_conv = QuantStub()
 
     def initialize(self, scale, norm_scale=None):
         self.norm.set_scale(norm_scale)
@@ -750,6 +783,8 @@ class NormActConv(torch.nn.Module):
         out = x
         out = self.norm(out, mask=mask, mask_sum=mask_sum)
         out = self.act(out)
+        if MAYBE_QAT:  # Automatic quant will not add QDQ nodes here, so manually add them to ensure the conv is quantized
+            out = self.quant_before_conv(out)
         # print("TENSOR AFTER NORMACT")
         # print(out)
         if self.convpool is not None:
@@ -1029,13 +1064,15 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         config: Dict,
         activation: str,
         pos_len: int,
-        use_swiglu: bool
+        use_swiglu: bool,
+        use_rope: bool = True
     ):
         super(TransformerRoPEGQABlock, self).__init__()
         self.name = name
         self.norm_kind = config.get("norm_kind", "layer")
         self.ffn_dim = config.get("transformer_ffn_channels", c_main * 2)
         self.use_swiglu = use_swiglu  
+        self.use_rope = use_rope
         # --- GQA Config ---
         self.num_heads = config.get("transformer_heads", 4)             # Query Heads
         self.num_kv_heads = config.get("transformer_kv_heads", self.num_heads) # KV Heads (Key/Value)
@@ -1060,18 +1097,22 @@ class TransformerRoPEGQABlock(torch.nn.Module):
 
         # Cache cos and sin
         # Assume precompute_freqs_cos_sin_2d_fixed is defined externally
-        self.rope_theta = config.get("rope_theta", 100.0) # KV Heads (Key/Value)
-        assert self.rope_theta > pos_len * 2.0, f"theta={self.rope_theta} of RoPE may be too small for pos_len={pos_len}"
-        cos_cached, sin_cached = precompute_freqs_cos_sin_2d(self.head_dim, pos_len, self.rope_theta)
-        self.register_buffer("cos_cached", cos_cached, persistent=False)
-        self.register_buffer("sin_cached", sin_cached, persistent=False)
+        if self.use_rope:
+            self.rope_theta = config.get("rope_theta", 100.0) # KV Heads (Key/Value)
+            assert self.rope_theta > pos_len * 2.0, f"theta={self.rope_theta} of RoPE may be too small for pos_len={pos_len}"
+            cos_cached, sin_cached = precompute_freqs_cos_sin_2d(self.head_dim, pos_len, self.rope_theta)
+            self.register_buffer("cos_cached", cos_cached, persistent=False)
+            self.register_buffer("sin_cached", sin_cached, persistent=False)
+        else:
+            self.cos_cached = None
+            self.sin_cached = None
 
         self.ffn_linear1 = torch.nn.Linear(c_main, self.ffn_dim, bias=False)
         if self.use_swiglu:
             self.ffn_linear_gate = torch.nn.Linear(c_main, self.ffn_dim, bias=False)
-            self.ffn_act = torch.nn.SiLU(inplace=True)
+            self.ffn_act = torch.nn.SiLU(inplace=False)  # Only QAT-int8 training requires inplace=False, but for normal training it will not be harmful after compilation
         else:
-            self.ffn_act = act(activation, inplace=True)
+            self.ffn_act = act(activation, inplace=False) # Only QAT-int8 training requires inplace=False, but for normal training it will not be harmful after compilation
             
         self.ffn_linear2 = torch.nn.Linear(self.ffn_dim, c_main, bias=False)
         
@@ -1118,7 +1159,8 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         
         # 3. Apply RoPE (Broadcasting works here automatically)
-        q, k = apply_rotary_emb(q, k, self.cos_cached, self.sin_cached)
+        if self.use_rope:
+            q, k = apply_rotary_emb(q, k, self.cos_cached, self.sin_cached)
         
         # 4. Permute to (B, H, S, D)
         q = q.permute(0, 2, 1, 3) 
@@ -1562,6 +1604,10 @@ class PolicyHead(torch.nn.Module):
         self.act2 = act(activation)
         self.conv2p = torch.nn.Conv2d(c_p1, self.num_policy_outputs, kernel_size=1, padding="same", bias=False)
 
+        # Constants should be tensor to make tensorrt work on int8
+        self.register_buffer("t_1", torch.tensor([1.0,], dtype=torch.float32), persistent=False)
+        self.register_buffer("t_5000", torch.tensor([5000.0,], dtype=torch.float32), persistent=False)
+
 
     def initialize(self):
         # Scaling so that variance on the p and g branches adds up to 1.0
@@ -1627,7 +1673,7 @@ class PolicyHead(torch.nn.Module):
 
         # mask out parts outside the board by making them a huge neg number, so that they're 0 after softmax
         if mask is not None:
-            outpolicy = outpolicy - (1.0 - mask) * 5000.0
+            outpolicy = outpolicy - (self.t_1 - mask) * self.t_5000
         # NC(HW) concat with NC1
         return torch.cat((outpolicy.view(outpolicy.shape[0],outpolicy.shape[1],-1), outpass.unsqueeze(-1)),dim=2)
 
@@ -2032,6 +2078,26 @@ class Model(torch.nn.Module):
                     config=self.config,
                     activation=self.activation,
                 ))
+            elif block_kind == "transformerg":
+                self.blocks.append(TransformerRoPEGQABlock(
+                    name=block_name,
+                    c_main=self.c_trunk,
+                    config=self.config,
+                    activation=self.activation,
+                    pos_len=pos_len,
+                    use_swiglu=False,
+                    use_rope=False
+                ))
+            elif block_kind == "transformersg":
+                self.blocks.append(TransformerRoPEGQABlock(
+                    name=block_name,
+                    c_main=self.c_trunk,
+                    config=self.config,
+                    activation=self.activation,
+                    pos_len=pos_len,
+                    use_swiglu=True,
+                    use_rope=False
+                ))
             elif block_kind == "transformerropeg":
                 self.blocks.append(TransformerRoPEGQABlock(
                     name=block_name,
@@ -2040,6 +2106,7 @@ class Model(torch.nn.Module):
                     activation=self.activation,
                     pos_len=pos_len,
                     use_swiglu=False,
+                    use_rope=True
                 ))
             elif block_kind == "transformerropesg":
                 self.blocks.append(TransformerRoPEGQABlock(
@@ -2049,6 +2116,7 @@ class Model(torch.nn.Module):
                     activation=self.activation,
                     pos_len=pos_len,
                     use_swiglu=True,
+                    use_rope=True
                 ))
             else:
                 assert False, f"Unknown block kind: {block_config[1]}"

@@ -1142,6 +1142,44 @@ b14c192h6tfrs = {
     "v2_size":96,
 }
 
+b14c192h6tfr2s = {
+    "version":15,
+    "norm_kind":"fixup",
+    "bnorm_epsilon": 1e-4,
+    "bnorm_running_avg_momentum": 0.001,
+    "initial_conv_1x1": False,
+    "trunk_num_channels":192,
+    "mid_num_channels":192,
+    "gpool_num_channels":32,
+    "transformer_ffn_channels":512,
+    "transformer_heads":6,
+    "transformer_kv_heads":6,
+    "use_attention_pool":False,
+    "num_attention_pool_heads":4,
+    "block_kind": [
+        ["rconv1","transformerropesg"],
+        ["rconv2","transformerropesg"],
+        ["rconv3","transformerropesg"],
+        ["rconv4","transformerropesg"],
+        ["rconv5","transformerropesg"],
+        ["rconv6","transformerropesg"],
+        ["rconv7","transformersg"],
+        ["rconv8","transformersg"],
+        ["rconv9","transformersg"],
+        ["rconv10","transformersg"],
+        ["rconv11","transformersg"],
+        ["rconv12","transformersg"],
+        ["rconv13","transformersg"],
+        ["rconv14","transformersg"],
+    ],
+    "p1_num_channels":32,
+    "g1_num_channels":32,
+    "v1_num_channels":32,
+    "sbv2_num_channels":80,
+    "num_scorebeliefs":8,
+    "v2_size":96,
+}
+
 b7c256h8tfrs = {
     "version":15,
     "norm_kind":"fixup",
@@ -1836,6 +1874,8 @@ base_config_of_name = {
     "b14c192h6tfrs":b14c192h6tfrs, # good trade-off, Recommended
     "b7c256h8tfrs":b7c256h8tfrs,   # fast but weak
 
+    "b14c192h6tfr2s": b14c192h6tfr2s, # partly rope
+
 # 20M parameter:
     "b12c384h12tfrs":b12c384h12tfrs, 
     "b24c256h8tfrs":b24c256h8tfrs, 
@@ -1957,7 +1997,7 @@ for name, base_config in list(config_of_name.items()):
     # Add parallel heads that uses the final trunk batchnorm.
     # The original normal heads disables the final trunk batchnorm
     # This only makes sense for configs that use some form of batchnorm.
-    if "norm" in config["norm_kind"]:
+    if "norm" in base_config["norm_kind"]:
         config = base_config.copy()
         config["has_intermediate_head"] = True
         if("intermediate_head_blocks" not in config):
