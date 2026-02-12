@@ -2,6 +2,10 @@
 """
 Download KataGo training data from katagoarchive.org for use with KataGo_Transformer.
 
+The archive (S3 bucket: katago-public) hosts training data as .tgz archives,
+each containing .npz selfplay data files. This script downloads and extracts
+them into the directory structure expected by shuffle.sh and train scripts.
+
 Usage:
     # Download all kata1 training data to ./data/selfplay/
     python download_training_data.py
@@ -27,32 +31,29 @@ After downloading, run the shuffle script to prepare data for training:
 """
 
 import argparse
-import hashlib
 import html.parser
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tarfile
-import tempfile
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
-ARCHIVE_BASE_URL = "https://katagoarchive.org/kata1/trainingdata"
-INDEX_URL = f"{ARCHIVE_BASE_URL}/index.html"
+# S3 bucket: katago-public, region: us-east-1
+# Served via S3 static website hosting at katagoarchive.org
+# Bucket does NOT allow ListObjects API - must use index.html pages
 
-# Older runs
-OLDER_RUNS = {
-    "g170": "https://katagoarchive.org/g170/selfplay",
-    "g104": "https://katagoarchive.org/g104",
-    "g65": "https://katagoarchive.org/g65",
+ARCHIVE_URLS = {
+    "kata1": "https://katagoarchive.org/kata1/trainingdata/index.html",
+    "g170": "https://katagoarchive.org/g170/selfplay/index.html",
+    "g104": "https://katagoarchive.org/g104/index.html",
+    "g65": "https://katagoarchive.org/g65/index.html",
 }
 
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) KataGo-Training-Downloader/1.0"
+USER_AGENT = "Mozilla/5.0 (compatible; KataGo-Training-Downloader/1.0)"
 
 
 class LinkExtractor(html.parser.HTMLParser):
@@ -69,182 +70,165 @@ class LinkExtractor(html.parser.HTMLParser):
                     self.links.append(attr_value)
 
 
-def make_request(url, retries=4, timeout=30):
+def make_request(url, retries=4, timeout=120):
     """Make an HTTP request with retries and exponential backoff."""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    last_error = None
     for attempt in range(retries):
         try:
             return urllib.request.urlopen(req, timeout=timeout)
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+            last_error = e
             if attempt == retries - 1:
                 raise
             wait = 2 ** (attempt + 1)
-            print(f"  Retry {attempt + 1}/{retries - 1} for {url} after {wait}s: {e}")
+            print(f"  Retry {attempt + 1}/{retries} for {os.path.basename(url)} "
+                  f"after {wait}s: {e}")
             time.sleep(wait)
 
 
-def fetch_index(url):
-    """Fetch and parse an HTML index page to extract file links."""
-    print(f"Fetching index: {url}")
-    resp = make_request(url)
-    content = resp.read().decode("utf-8", errors="replace")
+def fetch_index(index_url):
+    """Fetch an S3 static website index.html and extract all links.
+
+    The katagoarchive.org site uses S3 static website hosting.
+    Bare directory URLs return 403; only index.html URLs work.
+    The index page may be large (chunked transfer), so we use a generous timeout.
+    """
+    print(f"Fetching index: {index_url}")
+    resp = make_request(index_url, timeout=180)
+
+    # Read in chunks to handle large chunked-transfer responses
+    chunks = []
+    while True:
+        chunk = resp.read(1024 * 1024)  # 1MB at a time
+        if not chunk:
+            break
+        chunks.append(chunk)
+    content = b"".join(chunks).decode("utf-8", errors="replace")
+    print(f"  Received {len(content)} bytes")
 
     parser = LinkExtractor()
     parser.feed(content)
-
     return parser.links
 
 
-def discover_tgz_files(url):
-    """Discover all .tgz files from the index page."""
-    links = fetch_index(url)
-    tgz_files = []
+def resolve_url(link, index_url):
+    """Resolve a relative link against the index page URL."""
+    if link.startswith("http://") or link.startswith("https://"):
+        return link
+    # Get the base URL (directory containing index.html)
+    base = index_url.rsplit("/", 1)[0]
+    if link.startswith("/"):
+        # Absolute path - resolve against origin
+        from urllib.parse import urlparse
+        parsed = urlparse(index_url)
+        return f"{parsed.scheme}://{parsed.netloc}{link}"
+    return f"{base}/{link}"
+
+
+def discover_files(index_url, extensions=(".tgz", ".tar.gz", ".npz")):
+    """Discover all downloadable files from an index.html page."""
+    links = fetch_index(index_url)
+
+    files = []
     for link in links:
-        if link.endswith(".tgz") or link.endswith(".tar.gz") or link.endswith(".npz"):
-            # Handle relative and absolute URLs
-            if link.startswith("http://") or link.startswith("https://"):
-                tgz_files.append(link)
-            elif link.startswith("/"):
-                tgz_files.append(f"https://katagoarchive.org{link}")
-            else:
-                base = url.rsplit("/", 1)[0]
-                tgz_files.append(f"{base}/{link}")
-    return tgz_files
+        if any(link.endswith(ext) for ext in extensions):
+            files.append(resolve_url(link, index_url))
 
-
-def discover_subdirectories(url):
-    """Discover subdirectories from index page (for recursive crawling)."""
-    links = fetch_index(url)
+    # Also discover subdirectory index pages and recurse
     subdirs = []
     for link in links:
-        # Skip parent directory links and non-directory links
-        if link in ("../", ".", "..", "/"):
+        if link in ("../", ".", "..", "/", "index.html"):
             continue
-        if link.endswith("/") and not link.startswith("http"):
-            base = url.rsplit("/", 1)[0] if not url.endswith("/") else url.rstrip("/")
-            subdirs.append(f"{base}/{link}")
-        elif link.endswith("/") and link.startswith("http"):
-            subdirs.append(link)
-    return subdirs
+        if link.endswith("/"):
+            subdir_url = resolve_url(link, index_url)
+            if not subdir_url.endswith("index.html"):
+                subdir_url = subdir_url.rstrip("/") + "/index.html"
+            subdirs.append(subdir_url)
 
-
-def discover_all_files(base_url, recursive=True):
-    """Recursively discover all downloadable files."""
-    all_files = []
-
-    # First try the direct index
-    try:
-        files = discover_tgz_files(base_url)
-        all_files.extend(files)
-    except Exception as e:
-        print(f"  Warning: Could not fetch {base_url}: {e}")
-
-    # If recursive, also check subdirectories
-    if recursive:
+    for subdir_url in subdirs:
         try:
-            subdirs = discover_subdirectories(base_url)
-            for subdir in subdirs:
-                try:
-                    sub_files = discover_tgz_files(subdir)
-                    all_files.extend(sub_files)
-                    print(f"  Found {len(sub_files)} files in {subdir}")
-                except Exception as e:
-                    print(f"  Warning: Could not fetch {subdir}: {e}")
-        except Exception:
-            pass
+            sub_links = fetch_index(subdir_url)
+            for link in sub_links:
+                if any(link.endswith(ext) for ext in extensions):
+                    files.append(resolve_url(link, subdir_url))
+            print(f"  Found files in subdirectory: {subdir_url}")
+        except Exception as e:
+            print(f"  Warning: Could not fetch {subdir_url}: {e}")
 
-    return all_files
+    return files
 
 
-def get_file_size(url):
-    """Get file size via HEAD request."""
-    try:
-        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": USER_AGENT})
-        resp = urllib.request.urlopen(req, timeout=15)
-        size = resp.headers.get("Content-Length")
-        return int(size) if size else None
-    except Exception:
-        return None
-
-
-def download_file(url, output_path, chunk_size=1024 * 1024):
-    """Download a file with resume support."""
-    tmp_path = output_path + ".downloading"
-    downloaded = 0
-
-    # Resume support
-    if os.path.exists(tmp_path):
-        downloaded = os.path.getsize(tmp_path)
+def download_file(url, output_path, retries=4, chunk_size=1024 * 1024):
+    """Download a file with resume support and retries."""
+    tmp_path = output_path + ".part"
 
     # If final file already exists, skip
     if os.path.exists(output_path):
         return output_path, True, "already exists"
 
-    headers = {"User-Agent": USER_AGENT}
-    if downloaded > 0:
-        headers["Range"] = f"bytes={downloaded}-"
+    downloaded = 0
+    # Resume from partial download
+    if os.path.exists(tmp_path):
+        downloaded = os.path.getsize(tmp_path)
 
-    req = urllib.request.Request(url, headers=headers)
+    last_error = None
+    for attempt in range(retries):
+        try:
+            headers = {"User-Agent": USER_AGENT}
+            if downloaded > 0:
+                headers["Range"] = f"bytes={downloaded}-"
 
-    try:
-        resp = urllib.request.urlopen(req, timeout=60)
-        total_size = resp.headers.get("Content-Length")
-        if total_size:
-            total_size = int(total_size) + downloaded
+            req = urllib.request.Request(url, headers=headers)
+            resp = urllib.request.urlopen(req, timeout=120)
 
-        mode = "ab" if downloaded > 0 else "wb"
-        with open(tmp_path, mode) as f:
-            while True:
-                chunk = resp.read(chunk_size)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
+            # Check if server supports range requests
+            if downloaded > 0 and resp.status != 206:
+                # Server doesn't support range; start over
+                downloaded = 0
 
-        # Rename to final path
-        os.rename(tmp_path, output_path)
-        return output_path, True, f"{downloaded / 1024 / 1024:.1f} MB"
+            total_size = resp.headers.get("Content-Length")
+            if total_size:
+                total_size = int(total_size) + downloaded
 
-    except Exception as e:
-        return output_path, False, str(e)
+            mode = "ab" if downloaded > 0 else "wb"
+            with open(tmp_path, mode) as f:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+
+            # Rename to final path
+            os.rename(tmp_path, output_path)
+            size_str = f"{downloaded / 1024 / 1024:.1f} MB"
+            return output_path, True, size_str
+
+        except Exception as e:
+            last_error = e
+            if attempt < retries - 1:
+                wait = 2 ** (attempt + 1)
+                time.sleep(wait)
+
+    return output_path, False, str(last_error)
 
 
 def extract_tgz(tgz_path, extract_dir):
-    """Extract a .tgz file into the target directory."""
+    """Extract a .tgz file, filtering out unsafe paths."""
     try:
         with tarfile.open(tgz_path, "r:gz") as tar:
-            # Safety: check for path traversal
+            safe_members = []
             for member in tar.getmembers():
+                # Skip absolute paths and path traversal
                 if member.name.startswith("/") or ".." in member.name:
-                    print(f"  WARNING: Skipping unsafe path in {tgz_path}: {member.name}")
                     continue
-            tar.extractall(path=extract_dir, filter="data")
+                safe_members.append(member)
+            tar.extractall(path=extract_dir, members=safe_members)
         return True
-    except (tarfile.TarError, AttributeError):
-        # filter="data" requires Python 3.12+; fallback for older versions
-        try:
-            with tarfile.open(tgz_path, "r:gz") as tar:
-                safe_members = []
-                for member in tar.getmembers():
-                    if member.name.startswith("/") or ".." in member.name:
-                        continue
-                    safe_members.append(member)
-                tar.extractall(path=extract_dir, members=safe_members)
-            return True
-        except Exception as e:
-            print(f"  ERROR extracting {tgz_path}: {e}")
-            return False
-
-
-def format_size(size_bytes):
-    """Format bytes to human readable string."""
-    if size_bytes is None:
-        return "unknown size"
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size_bytes < 1024:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024
-    return f"{size_bytes:.1f} PB"
+    except Exception as e:
+        print(f"  ERROR extracting {os.path.basename(tgz_path)}: {e}")
+        return False
 
 
 def download_and_extract_one(url, download_dir, selfplay_dir, keep_archives):
@@ -257,20 +241,28 @@ def download_and_extract_one(url, download_dir, selfplay_dir, keep_archives):
     if not success:
         return url, False, f"download failed: {msg}"
 
-    # If it's a .tgz or .tar.gz, extract it
+    # Extract .tgz / .tar.gz files
     if filename.endswith(".tgz") or filename.endswith(".tar.gz"):
         ok = extract_tgz(download_path, selfplay_dir)
         if not ok:
             return url, False, "extraction failed"
         if not keep_archives:
-            os.remove(download_path)
-        return url, True, f"downloaded and extracted ({msg})"
+            try:
+                os.remove(download_path)
+            except OSError:
+                pass
+        return url, True, f"downloaded+extracted ({msg})"
 
-    # If it's already an .npz file, just move it
+    # Move standalone .npz files
     elif filename.endswith(".npz"):
         target = os.path.join(selfplay_dir, filename)
         if not os.path.exists(target):
-            shutil.move(download_path, target)
+            shutil.copy2(download_path, target)
+            if not keep_archives:
+                try:
+                    os.remove(download_path)
+                except OSError:
+                    pass
         return url, True, f"downloaded ({msg})"
 
     return url, True, f"downloaded ({msg})"
@@ -281,6 +273,10 @@ def main():
         description="Download KataGo training data from katagoarchive.org",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+The archive (S3 bucket: katago-public) serves index.html pages via
+S3 static website hosting. This script parses those pages to find
+.tgz files, downloads them, and extracts the .npz selfplay data.
+
 Examples:
   %(prog)s                              # Download all kata1 data
   %(prog)s --latest 100                 # Download only latest 100 files
@@ -294,86 +290,64 @@ After downloading, prepare data for training:
         """,
     )
     parser.add_argument(
-        "--output-dir",
-        default="data/selfplay",
+        "--output-dir", default="data/selfplay",
         help="Output directory for extracted NPZ files (default: data/selfplay)",
     )
     parser.add_argument(
-        "--download-dir",
-        default=None,
-        help="Directory to store downloaded archives (default: <output-dir>/../downloads)",
+        "--download-dir", default=None,
+        help="Directory for downloaded archives (default: <output-dir>/../downloads)",
     )
     parser.add_argument(
-        "--run",
-        default="kata1",
-        choices=["kata1", "g170", "g104", "g65"],
+        "--run", default="kata1", choices=["kata1", "g170", "g104", "g65"],
         help="Which training run to download (default: kata1)",
     )
     parser.add_argument(
-        "--latest",
-        type=int,
-        default=None,
+        "--latest", type=int, default=None,
         help="Only download the latest N files (most recent by listing order)",
     )
     parser.add_argument(
-        "--start",
-        type=int,
-        default=None,
+        "--start", type=int, default=None,
         help="Start index for file range to download",
     )
     parser.add_argument(
-        "--end",
-        type=int,
-        default=None,
+        "--end", type=int, default=None,
         help="End index (exclusive) for file range to download",
     )
     parser.add_argument(
-        "--workers",
-        type=int,
-        default=4,
+        "--workers", type=int, default=4,
         help="Number of parallel download workers (default: 4)",
     )
     parser.add_argument(
-        "--keep-archives",
-        action="store_true",
-        help="Keep .tgz files after extraction (default: delete after extracting)",
+        "--keep-archives", action="store_true",
+        help="Keep .tgz files after extraction (default: delete)",
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
+        "--dry-run", action="store_true",
         help="Only list files, do not download",
     )
     parser.add_argument(
-        "--url",
-        default=None,
-        help="Override the archive index URL",
+        "--url", default=None,
+        help="Override the archive index URL (must point to an index.html page)",
     )
 
     args = parser.parse_args()
 
-    # Resolve output directory relative to script location
+    # Resolve paths relative to script location
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    if not os.path.isabs(args.output_dir):
-        output_dir = os.path.join(script_dir, args.output_dir)
-    else:
-        output_dir = args.output_dir
+    output_dir = (args.output_dir if os.path.isabs(args.output_dir)
+                  else os.path.join(script_dir, args.output_dir))
+    download_dir = (args.download_dir if args.download_dir
+                    else os.path.join(os.path.dirname(output_dir), "downloads"))
 
-    if args.download_dir:
-        download_dir = args.download_dir
-    else:
-        download_dir = os.path.join(os.path.dirname(output_dir), "downloads")
-
-    # Determine base URL
+    # Determine index URL
     if args.url:
-        base_url = args.url
-    elif args.run == "kata1":
-        base_url = ARCHIVE_BASE_URL
+        index_url = args.url
+        if not index_url.endswith(".html"):
+            index_url = index_url.rstrip("/") + "/index.html"
     else:
-        base_url = OLDER_RUNS[args.run]
+        index_url = ARCHIVE_URLS[args.run]
 
-    index_url = base_url if base_url.endswith(".html") else f"{base_url}/index.html"
-
-    print(f"=== KataGo Training Data Downloader ===")
+    print("=== KataGo Training Data Downloader ===")
     print(f"Run:          {args.run}")
     print(f"Index URL:    {index_url}")
     print(f"Output dir:   {output_dir}")
@@ -381,37 +355,37 @@ After downloading, prepare data for training:
     print(f"Workers:      {args.workers}")
     print()
 
-    # Discover files
+    # --- Discover files ---
     print("Discovering available files...")
     try:
-        all_files = discover_all_files(base_url, recursive=True)
-        # Also try index.html directly
-        if not all_files:
-            all_files = discover_all_files(index_url, recursive=True)
+        all_files = discover_files(index_url)
     except Exception as e:
-        print(f"ERROR: Could not fetch file listing from {index_url}")
+        print(f"\nERROR: Could not fetch file listing from {index_url}")
         print(f"  {e}")
         print()
-        print("If the website is down or blocking requests, you can try:")
-        print("  1. Download manually from a browser at:")
-        print(f"     {index_url}")
-        print("  2. Use wget:")
-        print(f"     wget -r -np -nd -A '*.tgz' -P {download_dir} {base_url}/")
-        print("  3. Use a mirror or alternative URL with --url")
+        print("Troubleshooting:")
+        print(f"  1. Open in browser: {index_url}")
+        print(f"  2. curl -L '{index_url}' | head -100")
+        print(f"  3. wget alternative:")
+        base_dir = index_url.rsplit("/", 1)[0]
+        print(f"     wget -r -np -nd -A '*.tgz' -P downloads/ '{base_dir}/'")
         sys.exit(1)
+
+    # Deduplicate preserving order
+    seen = set()
+    unique_files = []
+    for f in all_files:
+        if f not in seen:
+            seen.add(f)
+            unique_files.append(f)
+    all_files = unique_files
 
     if not all_files:
-        print("No downloadable files found at the index page.")
+        print("No downloadable files (.tgz/.npz) found on the index page.")
         print()
-        print("The archive may use a different page structure. Try downloading with wget:")
-        print(f"  wget -r -np -nd -A '*.tgz' -P {download_dir} {base_url}/")
-        print()
-        print("Or try with curl to inspect the page:")
-        print(f"  curl -L '{index_url}'")
+        print("The page might have a different structure. Try inspecting it:")
+        print(f"  curl -L '{index_url}' | head -200")
         sys.exit(1)
-
-    # Deduplicate
-    all_files = list(dict.fromkeys(all_files))
 
     print(f"Found {len(all_files)} files")
 
@@ -425,39 +399,40 @@ After downloading, prepare data for training:
         all_files = all_files[start:end]
         print(f"  Selected files [{start}:{end}], {len(all_files)} files")
 
+    # --- Dry run ---
     if args.dry_run:
-        print()
-        print("Files that would be downloaded:")
+        print("\nFiles that would be downloaded:")
         for i, url in enumerate(all_files):
-            print(f"  [{i:4d}] {url}")
+            print(f"  [{i:4d}] {url.rsplit('/', 1)[-1]}")
         print(f"\nTotal: {len(all_files)} files")
+        print(f"\nFull URLs saved to stdout. Pipe to a file for batch download:")
+        print(f"  python {sys.argv[0]} --dry-run 2>/dev/null | grep http > urls.txt")
         return
 
-    # Create directories
+    # --- Download ---
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(download_dir, exist_ok=True)
 
-    # Download and extract
-    print(f"\nStarting download of {len(all_files)} files with {args.workers} workers...")
+    print(f"\nDownloading {len(all_files)} files with {args.workers} workers...")
     print()
 
     success_count = 0
     fail_count = 0
     skip_count = 0
+    total = len(all_files)
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {}
-        for url in all_files:
-            future = executor.submit(
-                download_and_extract_one,
-                url,
-                download_dir,
-                output_dir,
-                args.keep_archives,
-            )
-            futures[future] = url
+        futures = {
+            executor.submit(
+                download_and_extract_one, url, download_dir, output_dir,
+                args.keep_archives
+            ): url
+            for url in all_files
+        }
 
+        done = 0
         for future in as_completed(futures):
+            done += 1
             url = futures[future]
             filename = url.rsplit("/", 1)[-1]
             try:
@@ -465,35 +440,40 @@ After downloading, prepare data for training:
                 if success:
                     if "already exists" in msg:
                         skip_count += 1
-                        print(f"  SKIP  {filename} ({msg})")
+                        status = "SKIP"
                     else:
                         success_count += 1
-                        print(f"  OK    {filename} ({msg})")
+                        status = "OK  "
                 else:
                     fail_count += 1
-                    print(f"  FAIL  {filename} ({msg})")
+                    status = "FAIL"
+                print(f"  [{done}/{total}] {status} {filename} ({msg})")
             except Exception as e:
                 fail_count += 1
-                print(f"  ERROR {filename}: {e}")
+                print(f"  [{done}/{total}] ERR  {filename}: {e}")
 
+    # --- Summary ---
     print()
-    print(f"=== Download Complete ===")
-    print(f"  Success:  {success_count}")
-    print(f"  Skipped:  {skip_count}")
-    print(f"  Failed:   {fail_count}")
-    print()
+    print("=== Download Complete ===")
+    print(f"  Downloaded: {success_count}")
+    print(f"  Skipped:    {skip_count}")
+    print(f"  Failed:     {fail_count}")
 
-    # Count NPZ files in output
-    npz_count = 0
-    for root, dirs, files in os.walk(output_dir):
-        npz_count += sum(1 for f in files if f.endswith(".npz"))
-    print(f"Total NPZ files in {output_dir}: {npz_count}")
+    npz_count = sum(
+        1 for root, _, files in os.walk(output_dir)
+        for f in files if f.endswith(".npz")
+    )
+    print(f"  NPZ files:  {npz_count}")
+    print(f"  Output dir: {output_dir}")
+
+    if fail_count > 0:
+        print(f"\n  {fail_count} files failed. Re-run the script to retry "
+              "(already-downloaded files will be skipped).")
 
     if npz_count > 0:
-        print()
-        print("Next steps - shuffle data for training:")
-        print(f"  cd {os.path.join(script_dir, 'train')}")
         data_dir = os.path.dirname(output_dir)
+        print(f"\nNext steps - shuffle data for training:")
+        print(f"  cd {os.path.join(script_dir, 'train')}")
         print(f"  bash shuffle.sh {data_dir} {data_dir} {data_dir}/tmp 8 384")
 
 

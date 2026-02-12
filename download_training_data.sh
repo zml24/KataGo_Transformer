@@ -4,9 +4,9 @@ set -euo pipefail
 # =============================================================================
 # Download KataGo training data from katagoarchive.org
 #
-# The archive hosts training data as .tgz archives, each containing
-# multiple .npz selfplay data files. This script downloads and extracts
-# them into the directory structure expected by shuffle.sh and train scripts.
+# The archive (S3 bucket: katago-public) hosts training data as .tgz archives,
+# each containing .npz selfplay data files. The site uses S3 static website
+# hosting - index.html pages serve as directory listings.
 #
 # Usage:
 #   bash download_training_data.sh [OUTPUT_DIR] [OPTIONS]
@@ -20,7 +20,6 @@ set -euo pipefail
 # After downloading, prepare data for training:
 #   cd train
 #   bash shuffle.sh ../data ../data ../data/tmp 8 384
-#   bash train_muon_ki.sh ../data ../data/shuffleddata/current ...
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="${1:-${SCRIPT_DIR}/data/selfplay}"
 shift || true
 
-ARCHIVE_URL="https://katagoarchive.org/kata1/trainingdata"
+INDEX_URL="https://katagoarchive.org/kata1/trainingdata/index.html"
 DOWNLOAD_DIR="$(dirname "$OUTPUT_DIR")/downloads"
 KEEP_TGZ=false
 DRY_RUN=false
@@ -43,7 +42,17 @@ while [[ $# -gt 0 ]]; do
         --dry-run)    DRY_RUN=true; shift ;;
         --parallel)   PARALLEL="$2"; shift 2 ;;
         --retries)    RETRIES="$2"; shift 2 ;;
-        --url)        ARCHIVE_URL="$2"; shift 2 ;;
+        --url)        INDEX_URL="$2"; shift 2 ;;
+        --run)
+            case "$2" in
+                kata1) INDEX_URL="https://katagoarchive.org/kata1/trainingdata/index.html" ;;
+                g170)  INDEX_URL="https://katagoarchive.org/g170/selfplay/index.html" ;;
+                g104)  INDEX_URL="https://katagoarchive.org/g104/index.html" ;;
+                g65)   INDEX_URL="https://katagoarchive.org/g65/index.html" ;;
+                *)     echo "Unknown run: $2"; exit 1 ;;
+            esac
+            shift 2
+            ;;
         --help|-h)
             head -25 "$0" | tail -20
             exit 0
@@ -52,146 +61,173 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Ensure index URL ends with index.html
+if [[ "$INDEX_URL" != *".html" ]]; then
+    INDEX_URL="${INDEX_URL%/}/index.html"
+fi
+
+# Base URL for resolving relative links (directory containing index.html)
+BASE_URL="${INDEX_URL%/index.html}"
+
 echo "=== KataGo Training Data Downloader ==="
-echo "Archive URL:   ${ARCHIVE_URL}"
+echo "Index URL:     ${INDEX_URL}"
 echo "Output dir:    ${OUTPUT_DIR}"
 echo "Download dir:  ${DOWNLOAD_DIR}"
 echo "Keep archives: ${KEEP_TGZ}"
 echo "Parallel:      ${PARALLEL}"
 echo ""
 
-# Check dependencies
-for cmd in wget; do
-    if ! command -v "$cmd" &>/dev/null; then
-        echo "ERROR: $cmd is required but not found. Install it first."
-        echo "  Ubuntu/Debian: sudo apt-get install wget"
-        echo "  macOS: brew install wget"
-        exit 1
+# Check for curl or wget
+if command -v curl &>/dev/null; then
+    FETCHER="curl"
+elif command -v wget &>/dev/null; then
+    FETCHER="wget"
+else
+    echo "ERROR: Either curl or wget is required."
+    exit 1
+fi
+
+fetch_url() {
+    local url="$1"
+    if [ "$FETCHER" = "curl" ]; then
+        curl -sL --retry "$RETRIES" --retry-delay 2 --max-time 180 "$url"
+    else
+        wget -qO- --tries="$RETRIES" --timeout=180 "$url"
     fi
-done
+}
+
+download_file() {
+    local url="$1"
+    local target="$2"
+    if [ "$FETCHER" = "curl" ]; then
+        curl -sL --retry "$RETRIES" --retry-delay 2 --max-time 600 \
+            -C - -o "$target" "$url"
+    else
+        wget -q -c --tries="$RETRIES" --timeout=600 -O "$target" "$url"
+    fi
+}
 
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$DOWNLOAD_DIR"
 
-# ---- Step 1: Discover available files ----
+# ---- Step 1: Discover available files from index.html ----
 
-echo "Step 1: Discovering files from index page..."
-INDEX_URL="${ARCHIVE_URL}/index.html"
+echo "Step 1: Fetching index page..."
 
-# Try to fetch the index and extract all .tgz links
 TGZ_LIST_FILE=$(mktemp)
 trap "rm -f ${TGZ_LIST_FILE}" EXIT
 
-# Method 1: wget + parse HTML for links
-wget -q -O - --tries="$RETRIES" --timeout=30 "$INDEX_URL" 2>/dev/null \
-    | grep -oP 'href="[^"]*\.tgz"' \
-    | sed 's/href="//;s/"$//' \
-    | sort -u > "$TGZ_LIST_FILE" 2>/dev/null || true
+# Fetch index.html and extract href links to .tgz files
+# Uses sed/grep compatible with both macOS and Linux (no grep -P)
+INDEX_CONTENT=$(fetch_url "$INDEX_URL" 2>/dev/null || true)
 
-# If no results, try the directory listing directly
-if [ ! -s "$TGZ_LIST_FILE" ]; then
-    wget -q -O - --tries="$RETRIES" --timeout=30 "${ARCHIVE_URL}/" 2>/dev/null \
-        | grep -oP 'href="[^"]*\.(tgz|tar\.gz|npz)"' \
-        | sed 's/href="//;s/"$//' \
-        | sort -u > "$TGZ_LIST_FILE" 2>/dev/null || true
+if [ -z "$INDEX_CONTENT" ]; then
+    echo "WARNING: Got empty response from ${INDEX_URL}"
+    echo ""
+    echo "The S3 static website may be temporarily unavailable."
+    echo "Try opening in a browser: ${INDEX_URL}"
+    echo ""
+    echo "Alternative: use the Python script instead:"
+    echo "  python download_training_data.py"
+    exit 1
 fi
 
-# Count discovered files
+# Extract all href="..." values that end in .tgz, .tar.gz, or .npz
+# This uses only POSIX-compatible grep/sed (works on macOS and Linux)
+echo "$INDEX_CONTENT" \
+    | sed 's/href="/\nhref="/g' \
+    | grep '^href="' \
+    | sed 's/^href="//;s/".*//' \
+    | grep -E '\.(tgz|tar\.gz|npz)$' \
+    | sort -u > "$TGZ_LIST_FILE"
+
 NUM_FILES=$(wc -l < "$TGZ_LIST_FILE" | tr -d ' ')
+
+echo "  Received $(echo "$INDEX_CONTENT" | wc -c | tr -d ' ') bytes"
+echo "  Found ${NUM_FILES} downloadable files"
 
 if [ "$NUM_FILES" -eq 0 ]; then
     echo ""
-    echo "Could not automatically discover files from the index page."
+    echo "No .tgz/.npz files found in the index page."
     echo ""
-    echo "Falling back to wget recursive download..."
-    echo "This will crawl the archive and download all .tgz files."
+    echo "Debug: first 500 chars of response:"
+    echo "$INDEX_CONTENT" | head -c 500
     echo ""
-
-    if [ "$DRY_RUN" = true ]; then
-        echo "[DRY RUN] Would run:"
-        echo "  wget -r -np -nd -A '*.tgz' --tries=${RETRIES} -P '${DOWNLOAD_DIR}' '${ARCHIVE_URL}/'"
-        exit 0
-    fi
-
-    # Recursive wget download
-    wget -r -np -nd -A '*.tgz,*.npz' \
-        --tries="$RETRIES" \
-        --timeout=60 \
-        --wait=1 \
-        --random-wait \
-        -c \
-        -P "$DOWNLOAD_DIR" \
-        "${ARCHIVE_URL}/" || {
-            echo ""
-            echo "wget recursive download completed (some errors may be normal)."
-        }
-
-else
-    echo "Found ${NUM_FILES} files to download."
     echo ""
-
-    if [ "$DRY_RUN" = true ]; then
-        echo "Files that would be downloaded:"
-        cat "$TGZ_LIST_FILE" | head -20
-        if [ "$NUM_FILES" -gt 20 ]; then
-            echo "  ... and $((NUM_FILES - 20)) more"
-        fi
-        echo ""
-        echo "Total: ${NUM_FILES} files"
-        exit 0
-    fi
-
-    # ---- Step 2: Download files ----
-    echo "Step 2: Downloading ${NUM_FILES} files (${PARALLEL} parallel)..."
-    echo ""
-
-    # Build full URLs and download with wget
-    SUCCESS=0
-    FAIL=0
-    SKIP=0
-
-    download_one() {
-        local filename="$1"
-        local url
-
-        # Build full URL
-        if [[ "$filename" == http* ]]; then
-            url="$filename"
-            filename=$(basename "$filename")
-        else
-            url="${ARCHIVE_URL}/${filename}"
-        fi
-
-        local target="${DOWNLOAD_DIR}/${filename}"
-
-        # Skip if already downloaded
-        if [ -f "$target" ]; then
-            echo "  SKIP  ${filename}"
-            return 0
-        fi
-
-        # Download with retries and resume
-        wget -q -c \
-            --tries="$RETRIES" \
-            --timeout=60 \
-            --waitretry=2 \
-            -O "${target}.part" \
-            "$url" && \
-            mv "${target}.part" "$target" && \
-            echo "  OK    ${filename}" || \
-            { echo "  FAIL  ${filename}"; return 1; }
-    }
-
-    export -f download_one
-    export ARCHIVE_URL DOWNLOAD_DIR RETRIES
-
-    # Run downloads in parallel
-    cat "$TGZ_LIST_FILE" | xargs -P "$PARALLEL" -I {} bash -c 'download_one "$@"' _ {}
-
+    echo "Try the Python script instead:"
+    echo "  python download_training_data.py"
+    exit 1
 fi
 
-# ---- Step 3: Extract archives ----
+if [ "$DRY_RUN" = true ]; then
+    echo ""
+    echo "Files that would be downloaded:"
+    head -20 "$TGZ_LIST_FILE" | while read -r f; do echo "  $f"; done
+    if [ "$NUM_FILES" -gt 20 ]; then
+        echo "  ... and $((NUM_FILES - 20)) more"
+    fi
+    echo ""
+    echo "Total: ${NUM_FILES} files"
+    exit 0
+fi
+
+# ---- Step 2: Download files ----
 echo ""
+echo "Step 2: Downloading ${NUM_FILES} files (${PARALLEL} parallel)..."
+echo ""
+
+SUCCESS=0
+FAIL=0
+SKIP=0
+COUNT=0
+
+download_one() {
+    local filename="$1"
+    local url
+
+    # Build full URL from relative filename
+    if [[ "$filename" == http* ]]; then
+        url="$filename"
+        filename=$(basename "$filename")
+    elif [[ "$filename" == /* ]]; then
+        url="https://katagoarchive.org${filename}"
+        filename=$(basename "$filename")
+    else
+        url="${BASE_URL}/${filename}"
+        filename=$(basename "$filename")
+    fi
+
+    local target="${DOWNLOAD_DIR}/${filename}"
+
+    # Skip if already downloaded
+    if [ -f "$target" ]; then
+        echo "  SKIP  ${filename}"
+        return 0
+    fi
+
+    # Download with retries and resume
+    local tmp="${target}.part"
+    if download_file "$url" "$tmp" 2>/dev/null; then
+        mv "$tmp" "$target"
+        local size
+        size=$(du -h "$target" 2>/dev/null | cut -f1)
+        echo "  OK    ${filename} (${size})"
+    else
+        rm -f "$tmp"
+        echo "  FAIL  ${filename}"
+        return 1
+    fi
+}
+
+export -f download_one download_file
+export BASE_URL DOWNLOAD_DIR RETRIES FETCHER
+
+# Run downloads in parallel using xargs
+cat "$TGZ_LIST_FILE" | xargs -P "$PARALLEL" -I {} bash -c 'download_one "$@"' _ {}
+
+echo ""
+
+# ---- Step 3: Extract archives ----
 echo "Step 3: Extracting archives to ${OUTPUT_DIR}..."
 
 EXTRACTED=0
@@ -221,7 +257,10 @@ for npz_file in "$DOWNLOAD_DIR"/*.npz; do
 done
 
 # ---- Summary ----
-NPZ_COUNT=$(find "$OUTPUT_DIR" -name "*.npz" -type f 2>/dev/null | wc -l | tr -d ' ')
+NPZ_COUNT=0
+if command -v find &>/dev/null; then
+    NPZ_COUNT=$(find "$OUTPUT_DIR" -name "*.npz" -type f 2>/dev/null | wc -l | tr -d ' ')
+fi
 
 echo ""
 echo "=== Download Complete ==="
@@ -236,10 +275,7 @@ if [ "$NPZ_COUNT" -gt 0 ]; then
     echo "Next steps - shuffle and train:"
     echo "  cd ${SCRIPT_DIR}/train"
     echo "  bash shuffle.sh ${DATA_DIR} ${DATA_DIR} ${DATA_DIR}/tmp 8 384"
-    echo "  bash train_muon_ki.sh ${DATA_DIR} ${DATA_DIR}/shuffleddata/current \\"
-    echo "    b14c192h6tfrs_1 b14c192h6tfrs-bng-silu 384 extra -multi-gpus 0,1,2,3"
 else
-    echo "No NPZ files found. The archive structure may differ from expected."
-    echo "Please check the archive manually at:"
-    echo "  ${ARCHIVE_URL}/index.html"
+    echo "No NPZ files found. Re-run the script to retry failed downloads."
+    echo "Or try the Python script: python download_training_data.py"
 fi
