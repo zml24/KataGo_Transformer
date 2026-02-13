@@ -19,7 +19,7 @@ if MAYBE_QAT:
 QUANT_ACTIVATION = False # If false, the NormMask will not be quantized. There is no extra QDQ before activation so the activation will not be quantized.
 assert not QUANT_ACTIVATION, "The model become completely random when QUANT_ACTIVATION because of unknown reason. And it will not accelerate the inference speed."
 
-MIN_VERSION = '2.7'
+MIN_VERSION = '2.6'
 current_version = torch.__version__
 ERROR_MSG = (
     f"PyTorch version {current_version} is too old. "

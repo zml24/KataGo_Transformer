@@ -31,7 +31,13 @@ def assert_keys(npz,include_meta):
     ]
     if include_meta:
         keys.append("metadataInputNC")
-    assert(set(npz.keys()) == set(keys))
+    npz_keys = set(npz.keys())
+    expected_keys = set(keys)
+    missing = expected_keys - npz_keys
+    if missing:
+        raise AssertionError(
+            f"Missing keys: {missing}, NPZ keys: {sorted(npz_keys)}, Expected: {sorted(expected_keys)}"
+        )
 
 def is_temp_npz_like(filename):
     return "_" in filename

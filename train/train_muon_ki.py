@@ -23,7 +23,10 @@ from typing import Dict, List
 
 import torch
 import torch._dynamo
-torch._dynamo.config.recompile_limit = 32
+if hasattr(torch._dynamo.config, "cache_size_limit"):
+    torch._dynamo.config.cache_size_limit = 32
+else:
+    torch._dynamo.config.recompile_limit = 32
 import torch.ao.quantization
 import torch.nn
 import torch.optim
@@ -1038,7 +1041,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             if(should_update or train_state["brenorm_rmax"]-rmax>delta_threhold or train_state["brenorm_rmax"]-rmax < -delta_threhold or train_state["brenorm_dmax"]-dmax>delta_threhold or train_state["brenorm_dmax"]-dmax < -delta_threhold):
                 train_state["brenorm_rmax"]=rmax
                 train_state["brenorm_dmax"]=dmax
-                logging.info(f"update brenorm params: rmax {train_state["brenorm_rmax"]}, dmax {train_state["brenorm_dmax"]}")
+                logging.info(f"update brenorm params: rmax {train_state['brenorm_rmax']}, dmax {train_state['brenorm_dmax']}")
                 raw_model.set_brenorm_params(brenorm_avg_momentum, train_state["brenorm_rmax"], train_state["brenorm_dmax"])
                 last_brenorm_update_samples_this_instance = train_state["global_step_samples"]
 

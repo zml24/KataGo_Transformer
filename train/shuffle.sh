@@ -40,7 +40,7 @@ echo "Beginning shuffle at" $(date "+%Y-%m-%d %H:%M:%S")
 
 #set -x
 (
-    time python ./shuffle.py \
+    time python3 ./shuffle.py \
          "$BASEDIR"/selfplay/ \
          -expand-window-per-row 0.4 \
          -taper-window-exponent 0.65 \
@@ -60,7 +60,7 @@ echo "Beginning shuffle at" $(date "+%Y-%m-%d %H:%M:%S")
     wait
 )
 (
-    time python ./shuffle.py \
+    time python3 ./shuffle.py \
          "$BASEDIR"/selfplay/ \
          -expand-window-per-row 0.4 \
          -taper-window-exponent 0.65 \
