@@ -111,6 +111,7 @@ if __name__ == "__main__":
     optional_args.add_argument('-no-repeat-files', help='Track what shuffled data was used and do not repeat, even when killed and resumed', required=False, action='store_true')
     optional_args.add_argument('-quit-if-no-data', help='If no data, quit instead of waiting for data', required=False, action='store_true')
 
+    optional_args.add_argument('-tensorboard-dir', help='TensorBoard log directory. Defaults to {traindir}/tb_logs/', required=False)
     optional_args.add_argument('-gnorm-stats-debug', required=False, action='store_true')
 
     optional_args.add_argument('-lookahead-k', help='Use lookahead optimizer', type=int, default=6, required=False)
@@ -349,6 +350,14 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             ],
         )
     np.set_printoptions(linewidth=150)
+
+    # TensorBoard
+    tb_writer = None
+    if rank == 0:
+        from torch.utils.tensorboard import SummaryWriter
+        tb_log_dir = args["tensorboard_dir"] if args["tensorboard_dir"] else os.path.join(os.path.dirname(traindir), "tb_logs", os.path.basename(traindir))
+        tb_writer = SummaryWriter(log_dir=tb_log_dir)
+        logging.info(f"TensorBoard logging to: {tb_log_dir}")
 
     logging.info(str(sys.argv))
 
@@ -1499,7 +1508,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     timediff = t1 - last_train_stats_time
                     last_train_stats_time = t1
                     metrics["time_since_last_print"] = timediff
-                    log_metrics(running_metrics["sums"], running_metrics["weights"], metrics, train_metrics_out, exportprefix)
+                    log_metrics(running_metrics["sums"], running_metrics["weights"], metrics, train_metrics_out, exportprefix,
+                               tb_writer=tb_writer, tb_global_step=train_state["global_step_samples"], tb_prefix="train/")
 
                 # Update LR more frequently at the start for smoother warmup ramp and wd adjustment
                 if train_state["global_step_samples"] <= 350000000 and batch_count_this_epoch % 50 == 0:
@@ -1626,7 +1636,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                         val_metric_weights["wsum_train"] = running_metrics["weights"]["wsum"]
                     last_val_metrics["sums"] = val_metric_sums
                     last_val_metrics["weights"] = val_metric_weights
-                    log_metrics(val_metric_sums, val_metric_weights, metrics, val_metrics_out, exportprefix)
+                    log_metrics(val_metric_sums, val_metric_weights, metrics, val_metrics_out, exportprefix,
+                               tb_writer=tb_writer, tb_global_step=train_state["global_step_samples"], tb_prefix="val/")
                     t1 = time.perf_counter()
                     logging.info(f"Validation took {t1-t0} seconds")
                     ddp_model.train()
@@ -1690,7 +1701,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                             val_metric_sums["wsum_train"] = running_metrics["sums"]["wsum"]
                             val_metric_weights["wsum_train"] = running_metrics["weights"]["wsum"]
                         
-                        log_metrics(val_metric_sums, val_metric_weights, metrics,  val_swa_metrics_outs[swa_idx], exportprefix)
+                        log_metrics(val_metric_sums, val_metric_weights, metrics,  val_swa_metrics_outs[swa_idx], exportprefix,
+                                   tb_writer=tb_writer, tb_global_step=train_state["global_step_samples"], tb_prefix=f"val_swa{swa_idx}/")
                         t1 = time.perf_counter()
                         logging.info(f"Validation swa took {t1-t0} seconds")
                         swa_model.train()
@@ -1745,6 +1757,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
     train_metrics_out.close()
     val_metrics_out.close()
+    if tb_writer is not None:
+        tb_writer.close()
 
 
 if __name__ == "__main__":

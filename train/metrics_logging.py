@@ -25,7 +25,7 @@ def accumulate_metrics(metric_sums, metric_weights, metrics, batch_size, decay, 
             metric_sums[metric] += metrics[metric]
             metric_weights[metric] += batch_size
 
-def log_metrics(metric_sums, metric_weights, metrics, metrics_out, exportprefix):
+def log_metrics(metric_sums, metric_weights, metrics, metrics_out, exportprefix, tb_writer=None, tb_global_step=None, tb_prefix=""):
     metrics_to_print = {}
     for metric in metric_sums:
         if metric.endswith("_sum"):
@@ -55,6 +55,12 @@ def log_metrics(metric_sums, metric_weights, metrics, metrics_out, exportprefix)
     if metrics_out:
         metrics_out.write(json.dumps(metrics_to_print) + "\n")
         metrics_out.flush()
+
+    if tb_writer is not None and tb_global_step is not None:
+        for metric, value in metrics_to_print.items():
+            if isinstance(value, (int, float, np.integer, np.floating)) and math.isfinite(value):
+                tb_writer.add_scalar(f"{tb_prefix}{metric}", value, tb_global_step)
+        tb_writer.flush()
 
 def clear_metric_nonfinite(metric_sums, metric_weights):
     for metric in metric_sums:
