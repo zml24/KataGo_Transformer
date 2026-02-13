@@ -54,7 +54,7 @@ else
 fi
 
      
-time python -u ./train_muon_ki.py \
+time python3 -u ./train_muon_ki.py \
      -traindir "$BASEDIR"/train/"$TRAININGNAME" \
      -datadir "$DATADIR" \
      -exportdir "$BASEDIR"/"$EXPORT_SUBDIR" \
