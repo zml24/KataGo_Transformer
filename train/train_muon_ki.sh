@@ -60,11 +60,11 @@ time python3 -u ./train_muon_ki.py \
      -exportdir "$BASEDIR"/"$EXPORT_SUBDIR" \
      -exportprefix "$TRAININGNAME" \
      -max-epochs-this-instance 100 \
+     -max-training-samples 50000000 \
      -pos-len 19 \
      -samples-per-epoch 5000000 \
      -lr-scale 1.0 \
      -swa-scales "32.0" \
-     -use-fp16 \
      -symmetry-type "xyt" \
      -batch-size "$BATCHSIZE" \
      -model-kind "$MODELKIND" \

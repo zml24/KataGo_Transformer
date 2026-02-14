@@ -1,0 +1,3 @@
+### 26.02.13
+
+CUDA is configured to enable BF16 mixed-precision training by default. We ran FP32, TF32, BF16, and FP16 training on approximately 3M samples and found that the losses across all four approaches are largely aligned. When the batch size is maximized, BF16 and FP16 are roughly twice as fast as the other two. Considering the current adoption of mixed-precision training in other fields, we chose to use BF16 for subsequent supervised learning experiments.

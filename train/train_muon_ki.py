@@ -91,8 +91,10 @@ if __name__ == "__main__":
     optional_args.add_argument('-swa-scales', help='Number of samples to average in expectation together for SWA', type=str, required=False)
 
     optional_args.add_argument('-multi-gpus', help='Use multiple gpus, comma-separated device ids', required=False)
-    optional_args.add_argument('-use-fp16', help='Use fp16 training', required=False, action='store_true')
-    optional_args.add_argument('-qat-int8', help='Enable INT8 QAT', required=False, action='store_true')    
+    optional_args.add_argument('-use-fp16', help='(Deprecated, use -dtype instead) Use fp16 training', required=False, action='store_true')
+    optional_args.add_argument('-dtype', help='Training precision: fp32, fp16, bf16, tf32', type=str, choices=['fp32', 'fp16', 'bf16', 'tf32'], default='bf16', required=False)
+    optional_args.add_argument('-print-every', help='Print training metrics every N batches (default 100)', type=int, default=100, required=False)
+    optional_args.add_argument('-qat-int8', help='Enable INT8 QAT', required=False, action='store_true')
     optional_args.add_argument('-master-port', help='Localhost port', default=23456, type=int, required=False)
     optional_args.add_argument('-no-compile', help='Do not torch.compile', required=False, action='store_true')
 
@@ -256,10 +258,22 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     lookahead_print = args["lookahead_print"]
     enable_history_matrices = args["enable_history_matrices"]
 
-    use_fp16 = args["use_fp16"]
+    # Resolve dtype: -dtype takes priority over deprecated -use-fp16
+    dtype_arg = args["dtype"]
+    use_fp16_legacy = args["use_fp16"]
+    if dtype_arg is not None and use_fp16_legacy:
+        raise ValueError("Cannot specify both -dtype and -use-fp16. Use -dtype only.")
+    if dtype_arg is not None:
+        pass  # use dtype_arg as-is
+    elif use_fp16_legacy:
+        logging.warning("WARNING: -use-fp16 is deprecated, use -dtype fp16 instead.")
+        dtype_arg = "fp16"
+    else:
+        dtype_arg = "fp32"
+
     master_port = args["master_port"]
     no_compile = args["no_compile"]
-    
+
     epochs_per_export = args["epochs_per_export"]
     export_prob = args["export_prob"]
     max_epochs_this_instance = args["max_epochs_this_instance"]
@@ -278,7 +292,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
     if qat_int8:
         assert no_compile, "QAT INT8 enabled. Compilation is not supported. Remove this if it not report any error."
-        assert not use_fp16, "QAT INT8 enabled. FP16/AMP is not supported. Remove this if it not report any error."
+        assert dtype_arg in ("fp32", "tf32"), f"QAT INT8 enabled. Only fp32/tf32 are supported, got {dtype_arg}. Mixed precision (fp16/bf16) is incompatible with QAT."
 
     gnorm_stats_debug = args["gnorm_stats_debug"]
 
@@ -1256,7 +1270,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
     last_longterm_checkpoint_save_time = datetime.datetime.now()
     num_epochs_this_instance = 0
-    print_train_loss_every_batches = 100 if not gnorm_stats_debug else 1000
+    print_train_loss_every_batches = (args["print_every"] if not gnorm_stats_debug else 1000)
 
     if "sums" not in running_metrics:
         running_metrics["sums"] = defaultdict(float)
@@ -1269,10 +1283,37 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
     torch.backends.cudnn.benchmark = True
 
-    if use_fp16:
-        logging.info("Training in FP16! Creating scaler")
-        scaler = GradScaler()
+    # Precision mode setup
+    use_mixed_precision = False
+    use_grad_scaler = False
+    amp_device_type = "cuda"
+    amp_dtype = torch.float16
+    scaler = None
+
+    if dtype_arg == "tf32":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logging.info("Training in TF32 (FP32 storage, TF32 matmul).")
+    elif dtype_arg == "fp16":
+        use_mixed_precision = True
+        amp_dtype = torch.float16
+        if device.type == "cuda":
+            use_grad_scaler = True
+            scaler = GradScaler()
+        logging.info("Training in FP16 mixed precision! Creating scaler")
+    elif dtype_arg == "bf16":
+        use_mixed_precision = True
+        amp_dtype = torch.bfloat16
+        if device.type == "cuda" and torch.cuda.is_bf16_supported():
+            logging.info("Training in BF16 mixed precision (no GradScaler needed).")
+        else:
+            logging.warning("WARNING: BF16 not supported on this device, falling back to FP16.")
+            amp_dtype = torch.float16
+            if device.type == "cuda":
+                use_grad_scaler = True
+                scaler = GradScaler()
     else:
+        # fp32
         logging.info("Training in FP32.")
 
     # All ddp threads should be lined up at this point before continuing
@@ -1330,7 +1371,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
         logging.info("Currently up to data row " + str(train_state["total_num_data_rows"]))
         logging.info(f"Training dir: {traindir}")
         logging.info(f"Export dir: {exportdir}")
-        if use_fp16:
+        if use_grad_scaler:
             logging.info(f"Current grad scale: {scaler.get_scale()}")
 
         lr_right_now, normal_weight_decay_right_now = update_and_return_lr_and_wd()
@@ -1389,8 +1430,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 # if raw_model.get_has_metadata_encoder():
                 #     extra_outputs = ExtraOutputs([MetadataEncoder.OUTMEAN_KEY,MetadataEncoder.OUTLOGVAR_KEY])
 
-                if use_fp16:
-                    with torch.amp.autocast(device_type='cuda'):
+                if use_mixed_precision:
+                    with torch.amp.autocast(device_type=amp_device_type, dtype=amp_dtype):
                         model_outputs = ddp_model(
                             batch["binaryInputNCHW"],
                             batch["globalInputNC"],
@@ -1428,7 +1469,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 loss = metrics["loss_sum"] * world_size
 
                 # Reduce gradients across DDP
-                if use_fp16:
+                if use_grad_scaler:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                 else:
@@ -1468,7 +1509,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 metrics["batch_size_batch"] = batch_size * world_size
                 metrics["world_size_batch"] = world_size
 
-                if use_fp16:
+                if use_grad_scaler:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
@@ -1479,6 +1520,10 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 train_state["global_step_samples"] += batch_size * world_size
 
                 metrics = detensorify_metrics(metrics)
+
+                if max_training_samples is not None and train_state["global_step_samples"] >= max_training_samples:
+                    logging.info("Hit max training samples mid-epoch, breaking out of step loop")
+                    break
 
                 if lookahead_k is not None and lookahead_print:
                     # Only accumulate metrics when lookahead is synced if lookahead_print is True
