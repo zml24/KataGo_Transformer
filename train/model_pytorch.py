@@ -886,6 +886,7 @@ class TransformerBlock(torch.nn.Module):
         super(TransformerBlock, self).__init__()
         self.name = name
         self.norm_kind = config["norm_kind"]
+        self.activation = activation
         self.ffn_dim = config["transformer_ffn_channels"] if "transformer_ffn_channels" in config else c_main*2
         
 
@@ -912,11 +913,28 @@ class TransformerBlock(torch.nn.Module):
 
         
     def initialize(self, fixup_scale):
-        pass
-        # Initialize weights
-        #for p in self.parameters():
-        #    if p.dim() > 1:
-        #        torch.nn.init.xavier_uniform_(p)
+        if self.norm_kind == "fixup":
+            proj_scale = math.sqrt(fixup_scale)
+            out_scale = 0.0
+        elif self.norm_kind == "fixscale" or self.norm_kind == "fixbrenorm" or self.norm_kind == "fixscaleonenorm":
+            proj_scale = 1.0
+            out_scale = fixup_scale
+        else:
+            proj_scale = 1.0
+            out_scale = 1.0
+
+        with torch.no_grad():
+            for name, param in self.attention.named_parameters():
+                if "weight" in name:
+                    if "out_proj.weight" in name:
+                        init_weights(param, "identity", scale=out_scale)
+                    else:
+                        init_weights(param, "identity", scale=proj_scale)
+                elif "bias" in name:
+                    param.zero_()
+
+            init_weights(self.ffn_linear1.weight, self.activation, scale=proj_scale)
+            init_weights(self.ffn_linear2.weight, "identity", scale=out_scale)
                 
                 
     def add_reg_dict(self, reg_dict: Dict[str, List]):
@@ -1070,6 +1088,7 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         super(TransformerRoPEGQABlock, self).__init__()
         self.name = name
         self.norm_kind = config.get("norm_kind", "layer")
+        self.activation = activation
         self.ffn_dim = config.get("transformer_ffn_channels", c_main * 2)
         self.use_swiglu = use_swiglu  
         self.use_rope = use_rope
@@ -1136,7 +1155,27 @@ class TransformerRoPEGQABlock(torch.nn.Module):
                 reg_dict["noreg"].append(param)
 
     def initialize(self, fixup_scale):
-        pass
+        if self.norm_kind == "fixup":
+            proj_scale = math.sqrt(fixup_scale)
+            out_scale = 0.0
+        elif self.norm_kind == "fixscale" or self.norm_kind == "fixbrenorm" or self.norm_kind == "fixscaleonenorm":
+            proj_scale = 1.0
+            out_scale = fixup_scale
+        else:
+            proj_scale = 1.0
+            out_scale = 1.0
+
+        ffn_activation = "silu" if self.use_swiglu else self.activation
+        with torch.no_grad():
+            init_weights(self.q_proj.weight, "identity", scale=proj_scale)
+            init_weights(self.k_proj.weight, "identity", scale=proj_scale)
+            init_weights(self.v_proj.weight, "identity", scale=proj_scale)
+            init_weights(self.out_proj.weight, "identity", scale=out_scale)
+
+            init_weights(self.ffn_linear1.weight, ffn_activation, scale=proj_scale)
+            if self.use_swiglu:
+                init_weights(self.ffn_linear_gate.weight, ffn_activation, scale=proj_scale)
+            init_weights(self.ffn_linear2.weight, "identity", scale=out_scale)
         
     def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[Dict] = None):
         batch_size, channels, height, width = x.shape

@@ -84,6 +84,11 @@ if __name__ == "__main__":
     optional_args.add_argument('-wd-scale', help='Weight decay scale', type=float, default=20.0, required=False)
     
     optional_args.add_argument('-muon-momentum', type=float, help='momentum of Muon optimizer', default=0.95, required=False)
+    optional_args.add_argument('-optimizer-type', type=str, help='Optimizer type: muon (Muon+Adam, default), adam (pure Adam), katago (SGD like original KataGo)', choices=['muon', 'adam', 'katago'], default='muon', required=False)
+    optional_args.add_argument('-init-std', type=float, help='(Adam mode) Init std for all weight matrices (ndim>=2). Default 0.006', default=None, required=False)
+    optional_args.add_argument('-adam-betas', type=str, help='(Adam mode) Adam beta1,beta2. Default "0.9,0.95"', default=None, required=False)
+    optional_args.add_argument('-warmup-samples', type=int, help='(Adam mode) Linear warmup duration in samples. Default 2000000', default=None, required=False)
+    optional_args.add_argument('-min-lr-fraction', type=float, help='(Adam mode) Cosine decay min LR as fraction of peak. Default 0.1', default=None, required=False)
     
     optional_args.add_argument('-gnorm-clip-scale', help='Multiplier on gradient clipping threshold', type=float, required=False)
     optional_args.add_argument('-sub-epochs', help='Reload training data up to this many times per epoch', type=int, default=1, required=False)
@@ -117,7 +122,7 @@ if __name__ == "__main__":
     optional_args.add_argument('-gnorm-stats-debug', required=False, action='store_true')
 
     optional_args.add_argument('-lookahead-k', help='Use lookahead optimizer', type=int, default=6, required=False)
-    optional_args.add_argument('-lookahead-alpha', help='Use lookahead optimizer, 1.0 to disable', type=float, default=1.0, required=False)
+    optional_args.add_argument('-lookahead-alpha', help='Use lookahead optimizer, 1.0 to disable (default: katago=0.5, others=1.0)', type=float, default=None, required=False)
     optional_args.add_argument('-lookahead-print', help='Only print on lookahead syncs', required=False, action='store_true')
     optional_args.add_argument('-brenorm-avg-momentum', type=float, help='Set brenorm running avg rate to this value', required=False)
     optional_args.add_argument('-brenorm-target-rmax', type=float, help='Gradually adjust brenorm rmax to this value', required=False)
@@ -248,6 +253,26 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     lr_scale = args["lr_scale"]
     wd_scale = args["wd_scale"]
     muon_momentum = args["muon_momentum"]
+    optimizer_type = args["optimizer_type"]
+    force_all_adam = (optimizer_type == "adam")
+    use_katago_opt = (optimizer_type == "katago")
+    init_std = args["init_std"]
+    if init_std is None and force_all_adam:
+        init_std = 0.006
+    adam_betas_str = args["adam_betas"]
+    if adam_betas_str is not None:
+        adam_betas = tuple(float(x) for x in adam_betas_str.split(","))
+        assert len(adam_betas) == 2, f"-adam-betas must be two comma-separated floats, got: {adam_betas_str}"
+    elif force_all_adam:
+        adam_betas = (0.9, 0.95)
+    else:
+        adam_betas = None
+    warmup_samples = args["warmup_samples"]
+    if warmup_samples is None and force_all_adam:
+        warmup_samples = 2000000
+    min_lr_fraction = args["min_lr_fraction"]
+    if min_lr_fraction is None and force_all_adam:
+        min_lr_fraction = 0.1
     lr_scale_auto_type = args["lr_scale_auto_type"]
     gnorm_clip_scale = args["gnorm_clip_scale"]
     sub_epochs = args["sub_epochs"]
@@ -327,6 +352,10 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
         swa_period_samples = max(1, samples_per_epoch // 2)
     if swa_scales is None:
         swa_scales = [8,]
+
+    if lookahead_alpha is None:
+        # Keep legacy KataGo behavior when using katago optimizer path.
+        lookahead_alpha = 0.5 if use_katago_opt else 1.0
 
     assert lookahead_alpha > 0.0 and lookahead_alpha <= 1.0
     if lookahead_alpha >= 1.0:  # 1.0 means to disable lookahead optimizer
@@ -434,11 +463,29 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
         return lr0 * 2 ** (-7.0)
     
         
+    def lr_scale_auto_factor_katago(train_state):
+        """KataGo original lr_scale_auto schedule (step-based, 200M~650M samples)."""
+        if train_state["global_step_samples"] < 200_000_000:
+            return 8.00
+        if train_state["global_step_samples"] < 400_000_000:
+            return 4.00
+        if train_state["global_step_samples"] < 500_000_000:
+            return 2.00
+        if train_state["global_step_samples"] < 550_000_000:
+            return 1.00
+        if train_state["global_step_samples"] < 600_000_000:
+            return 0.50
+        if train_state["global_step_samples"] < 650_000_000:
+            return 0.25
+        return 0.25
+
     def lr_scale_auto_factor(train_state):
         if lr_scale_auto_type == "":
             return 1.0
         elif lr_scale_auto_type == "custom":
             return lr_scale_auto_factor_custom(train_state)
+        elif lr_scale_auto_type == "katago":
+            return lr_scale_auto_factor_katago(train_state)
         #elif lr_scale_auto_type == "1b":
         #    return lr_scale_auto_factor_1b(train_state)
         #elif lr_scale_auto_type == "2":
@@ -557,7 +604,15 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 os.replace(get_checkpoint_path() + ".tmp", get_checkpoint_path())
 
     def pslr_func(batchsize,lrscale):
-        pslr = lr_base * lrscale * (batchsize/1.0)**0.5
+        if force_all_adam:
+            # Pure Adam: lr = lr_base * lr_scale, no batchsize scaling, no auto factor
+            pslr = lr_base * lr_scale
+        elif use_katago_opt:
+            # KataGo original: per_sample_lr = 0.00003 * lr_scale * lr_scale_auto_factor
+            # lr_scale_auto_factor is already folded into lrscale by callers
+            pslr = 0.00003 * lrscale
+        else:
+            pslr = lr_base * lrscale * (batchsize/1.0)**0.5
         return pslr
 
         
@@ -571,6 +626,19 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
         
     def get_weight_decay(raw_model, lr_scale, warmup_scale, train_state, running_metrics, group_name, wd_scale):
         lr_scale_with_auto = lr_scale * lr_scale_auto_factor(train_state)
+
+        if force_all_adam:
+            # Pure Adam: fixed WD=0.1 for weight matrices, 0 for norm/bias
+            if group_name in ("normal", "normal_attn", "output"):
+                return 0.1
+            else:
+                # normal_gamma (norm scale), noreg (norm bias), output_noreg (output bias)
+                return 0.0
+
+        if use_katago_opt:
+            # KataGo original weight decay formulas
+            return _get_weight_decay_katago(raw_model, lr_scale_with_auto, warmup_scale, train_state, running_metrics, group_name)
+
         if raw_model.get_norm_kind() == "fixup" or raw_model.get_norm_kind() == "fixscale":
             if group_name == "normal" or group_name == "normal_gamma" or group_name == "normal_attn" or group_name == "output":
                 return 0.00000003 * world_size * batch_size / 256.0 * wd_scale
@@ -586,26 +654,65 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             raw_model.get_norm_kind() == "fixbrenorm" or
             raw_model.get_norm_kind() == "fixscaleonenorm"
         ):
-            
+
             wd0 = wd_factor(batch_size * world_size,lr_scale * lr_scale_auto_factor(train_state))
-            
-            
+
+
             if group_name == "normal":
                 group_factor = 1.0
             elif group_name == "normal_attn":
                 group_factor = 0.5
             elif group_name == "normal_gamma":
-                group_factor = 0.1 
+                group_factor = 0.1
             elif group_name == "output":
-                group_factor = 0.25 
+                group_factor = 0.25
             elif group_name == "noreg":
                 group_factor = 0.001
             elif group_name == "output_noreg":
                 group_factor = 0.001
             else:
                 assert False
-                
+
             return group_factor * wd0 * wd_scale
+        else:
+            assert False
+
+    def _get_weight_decay_katago(raw_model, lr_scale_with_auto, warmup_scale, train_state, running_metrics, group_name):
+        """KataGo original weight decay: adaptive based on model norm, no wd_scale parameter."""
+        if raw_model.get_norm_kind() == "fixup" or raw_model.get_norm_kind() == "fixscale":
+            if group_name == "normal" or group_name == "normal_gamma" or group_name == "normal_attn" or group_name == "output":
+                return 0.000001 * world_size * batch_size / 256.0
+            elif group_name == "noreg":
+                return 0.00000001 * world_size * batch_size / 256.0
+            elif group_name == "output_noreg":
+                return 0.00000001 * world_size * batch_size / 256.0
+            else:
+                assert False
+        elif (
+            raw_model.get_norm_kind() == "bnorm" or
+            raw_model.get_norm_kind() == "brenorm" or
+            raw_model.get_norm_kind() == "fixbrenorm" or
+            raw_model.get_norm_kind() == "fixscaleonenorm"
+        ):
+            if group_name == "normal" or group_name == "normal_gamma" or group_name == "normal_attn":
+                adaptive_scale = 1.0
+                if "sums" in running_metrics and "norm_normal_batch" in running_metrics["sums"]:
+                    norm_normal_batch = running_metrics["sums"]["norm_normal_batch"] / running_metrics["weights"]["norm_normal_batch"]
+                    baseline = train_state["modelnorm_normal_baseline"]
+                    ratio = norm_normal_batch / (baseline + 1e-30)
+                    adaptive_scale = math.pow(2.0, 2.0 * math.tanh(math.log(ratio+1e-30) * 1.5))
+
+                gamma_scale = 0.125 if group_name == "normal_gamma" else 1.0
+                # normal_attn treated same as normal in KataGo original (no separate group there)
+                return 0.00125 * world_size * batch_size / 256.0 * math.pow(lr_scale_with_auto * warmup_scale, 0.75) * adaptive_scale * gamma_scale
+            elif group_name == "output":
+                return 0.000001 * world_size * batch_size / 256.0
+            elif group_name == "noreg":
+                return 0.000001 * world_size * batch_size / 256.0 * math.pow(lr_scale_with_auto * warmup_scale, 0.75)
+            elif group_name == "output_noreg":
+                return 0.00000001 * world_size * batch_size / 256.0
+            else:
+                assert False
         else:
             assert False
 
@@ -681,7 +788,23 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             logging.info(str(model_config))
             raw_model = Model(model_config,pos_len)
             raw_model.initialize()
-            
+
+            if init_std is not None:
+                with torch.no_grad():
+                    reinit_count = 0
+                    zero_count = 0
+                    for name, param in raw_model.named_parameters():
+                        effective_ndim = sum(1 for s in param.shape if s > 1)
+                        if effective_ndim >= 2:
+                            # Weight matrices: trunc_normal with init_std
+                            torch.nn.init.trunc_normal_(param, mean=0.0, std=init_std, a=-3.0*init_std, b=3.0*init_std)
+                            reinit_count += 1
+                        else:
+                            # Bias, gamma, beta: zero
+                            param.zero_()
+                            zero_count += 1
+                    logging.info(f"Re-initialized {reinit_count} weight matrices with std={init_std}, zeroed {zero_count} bias/norm params")
+
             if qat_int8:
                 logging.info("Preparing model for INT8 QAT (TensorRT compatible)...")
                 # raw_model = QATModelWrapper(raw_model)
@@ -734,7 +857,11 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 train_state["modelnorm_normal_baseline"] = modelnorm_normal_baseline
                 logging.info(f"Model norm normal baseline computed: {modelnorm_normal_baseline}")
 
-            optimizer = MuonWithAuxAdamKimi(get_param_groups(raw_model,train_state,running_metrics),muon_momentum)
+            if use_katago_opt:
+                optimizer = torch.optim.SGD(get_param_groups(raw_model,train_state,running_metrics), lr=1.0, momentum=0.9)
+                logging.info("Optimizer: KataGo original SGD(momentum=0.9)")
+            else:
+                optimizer = MuonWithAuxAdamKimi(get_param_groups(raw_model,train_state,running_metrics),muon_momentum,force_all_adam=force_all_adam,adam_betas=adam_betas)
 
             return (model_config, ddp_model, raw_model, swa_models, optimizer, metrics_obj, running_metrics, train_state, last_val_metrics)
         else:
@@ -857,9 +984,17 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             else:
                 logging.info("WARNING: Running metrics not found in state dict, using fresh last val metrics")
 
-            optimizer = MuonWithAuxAdamKimi(get_param_groups(raw_model,train_state,running_metrics),muon_momentum)
+            if use_katago_opt:
+                optimizer = torch.optim.SGD(get_param_groups(raw_model,train_state,running_metrics), lr=1.0, momentum=0.9)
+                logging.info("Optimizer: KataGo original SGD(momentum=0.9)")
+            else:
+                optimizer = MuonWithAuxAdamKimi(get_param_groups(raw_model,train_state,running_metrics),muon_momentum,force_all_adam=force_all_adam,adam_betas=adam_betas)
             if "optimizer" in state_dict:
-                optimizer.load_state_dict(state_dict["optimizer"])
+                try:
+                    optimizer.load_state_dict(state_dict["optimizer"])
+                except (ValueError, KeyError) as e:
+                    logging.info(f"WARNING: Could not load optimizer state (possibly switching optimizer type): {e}")
+                    logging.info("Using fresh optimizer state")
             else:
                 logging.info("WARNING: Optimizer not found in state dict, using fresh optimizer")
 
@@ -944,75 +1079,160 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     # EPOCHS AND LR ---------------------------------------------------------------------
 
     
-    def update_and_return_lr_and_wd():
-        per_sample_lr = pslr_func(batch_size * world_size,lr_scale * lr_scale_auto_factor(train_state))
-
-        # Warmup for initial training
-        warmup_scale = 1.0
+    def _get_warmup_scale():
+        """Existing stepped warmup schedule, shared by all optimizer modes."""
         if model_config["norm_kind"] == "fixup" or model_config["norm_kind"] == "fixscale" or model_config["norm_kind"] == "fixscaleonenorm":
             if train_state["global_step_samples"] < 1000000:
-                warmup_scale = 1.0 / 5.0
+                return 1.0 / 5.0
             elif train_state["global_step_samples"] < 2000000:
-                warmup_scale = 1.0 / 3.0
+                return 1.0 / 3.0
             elif train_state["global_step_samples"] < 4000000:
-                warmup_scale = 1.0 / 2.0
+                return 1.0 / 2.0
             elif train_state["global_step_samples"] < 6000000:
-                warmup_scale = 1.0 / 1.4
+                return 1.0 / 1.4
+            return 1.0
         elif model_config["norm_kind"] == "bnorm" or model_config["norm_kind"] == "brenorm" or model_config["norm_kind"] == "fixbrenorm":
             if train_state["global_step_samples"] < 250000:
-                warmup_scale = 1.0 / 20.0
+                return 1.0 / 20.0
             elif train_state["global_step_samples"] < 500000:
-                warmup_scale = 1.0 / 14.0
+                return 1.0 / 14.0
             elif train_state["global_step_samples"] < 750000:
-                warmup_scale = 1.0 / 10.0
+                return 1.0 / 10.0
             elif train_state["global_step_samples"] < 1000000:
-                warmup_scale = 1.0 / 7.0
+                return 1.0 / 7.0
             elif train_state["global_step_samples"] < 1250000:
-                warmup_scale = 1.0 / 5.0
+                return 1.0 / 5.0
             elif train_state["global_step_samples"] < 1500000:
-                warmup_scale = 1.0 / 3.0
+                return 1.0 / 3.0
             elif train_state["global_step_samples"] < 1750000:
-                warmup_scale = 1.0 / 2.0
+                return 1.0 / 2.0
             elif train_state["global_step_samples"] < 2000000:
-                warmup_scale = 1.0 / 1.4
-            else:
-                warmup_scale = 1.0 / 1.0
+                return 1.0 / 1.4
+            return 1.0
         else:
             assert False
+
+    def _get_warmup_end_samples():
+        """Return the sample count at which warmup completes (warmup_scale reaches 1.0)."""
+        if model_config["norm_kind"] == "fixup" or model_config["norm_kind"] == "fixscale" or model_config["norm_kind"] == "fixscaleonenorm":
+            return 6000000
+        elif model_config["norm_kind"] == "bnorm" or model_config["norm_kind"] == "brenorm" or model_config["norm_kind"] == "fixbrenorm":
+            return 2000000
+        else:
+            assert False
+
+    def update_and_return_lr_and_wd():
+        per_sample_lr = pslr_func(batch_size * world_size,lr_scale * lr_scale_auto_factor(train_state))
+        warmup_scale = _get_warmup_scale()
+
+        if force_all_adam:
+            # Pure Adam LLM-style: linear warmup → cosine decay to min_lr
+            cur = train_state["global_step_samples"]
+            warmup_end = warmup_samples
+            peak_lr = per_sample_lr
+            min_lr = per_sample_lr * min_lr_fraction
+
+            if cur < warmup_end:
+                # Linear warmup: 0 → peak_lr
+                lr_now = peak_lr * (cur / warmup_end) if warmup_end > 0 else peak_lr
+            else:
+                # Cosine decay: peak_lr → min_lr
+                assert max_training_samples is not None, "-max-training-samples is required for -optimizer-type adam (cosine decay endpoint)"
+                total = max(max_training_samples, warmup_end + 1)
+                progress = min(1.0, (cur - warmup_end) / (total - warmup_end))
+                cosine_scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+                lr_now = min_lr + (peak_lr - min_lr) * cosine_scale
+
+            normal_weight_decay = 0.0
+            for param_group in optimizer.param_groups:
+                group_name = param_group["group_name"]
+                changed = False
+
+                # All groups use the same LR
+                new_lr_this_group = lr_now
+                if lookahead_alpha is not None:
+                    new_lr_this_group = new_lr_this_group / lookahead_alpha
+
+                # No muon_lr_multiplier scaling
+                if "muon_lr_multiplier" in param_group:
+                    param_group["muon_lr_multiplier"] = 1.0
+
+                if param_group["lr"] != new_lr_this_group:
+                    param_group["lr"] = new_lr_this_group
+                    changed = True
+
+                new_weight_decay_this_group = get_weight_decay(
+                    raw_model, lr_scale, warmup_scale=warmup_scale,
+                    train_state=train_state, running_metrics=running_metrics,
+                    group_name=group_name, wd_scale=wd_scale
+                )
+                if param_group["weight_decay"] != new_weight_decay_this_group:
+                    param_group["weight_decay"] = new_weight_decay_this_group
+                    changed = True
+
+                if group_name == "normal":
+                    normal_weight_decay = param_group["weight_decay"]
+
+            return lr_now, normal_weight_decay
+
+        # --- Muon / KataGo modes below ---
 
         normal_weight_decay = 0.0
 
         for param_group in optimizer.param_groups:
             group_name = param_group["group_name"]
-            if group_name == "normal":
-                group_scale = 1.0
-            elif group_name == "normal_gamma":
-                group_scale = 1.0
-            elif group_name == "normal_attn":
-                group_scale = 1.0
-            elif group_name == "output":
-                group_scale = 0.5
-            elif group_name == "noreg":
-                group_scale = 0.2
-            elif group_name == "output_noreg":
-                group_scale = 0.2
+            if use_katago_opt:
+                # KataGo original group scales
+                if group_name == "normal":
+                    group_scale = 1.0
+                elif group_name == "normal_gamma":
+                    group_scale = 1.0
+                elif group_name == "normal_attn":
+                    group_scale = 1.0
+                elif group_name == "output":
+                    group_scale = 0.5
+                elif group_name == "noreg":
+                    group_scale = 1.0
+                elif group_name == "output_noreg":
+                    group_scale = 0.5
+                else:
+                    assert False
             else:
-                assert False
+                if group_name == "normal":
+                    group_scale = 1.0
+                elif group_name == "normal_gamma":
+                    group_scale = 1.0
+                elif group_name == "normal_attn":
+                    group_scale = 1.0
+                elif group_name == "output":
+                    group_scale = 0.5
+                elif group_name == "noreg":
+                    group_scale = 0.2
+                elif group_name == "output_noreg":
+                    group_scale = 0.2
+                else:
+                    assert False
 
             changed = False
 
-            param_group["eps"] = 1e-6
+            if not use_katago_opt:
+                param_group["eps"] = 1e-6
             # For lookahead optimizer, use weight decay appropriate for lr scale,
             # but tell optimizer to take larger steps so as to maintain the same
             # effective learning rate after lookahead averaging.
             if lookahead_alpha is not None:
                 new_lr_this_group = per_sample_lr * warmup_scale * group_scale / lookahead_alpha
             else:
-                new_lr_this_group = per_sample_lr * warmup_scale * group_scale 
+                new_lr_this_group = per_sample_lr * warmup_scale * group_scale
 
-            #new_lr_this_group*=0.125
-            if("muon_lr_multiplier" in param_group):
-                param_group["muon_lr_multiplier"] = 8.0
+            if use_katago_opt:
+                # KataGo original uses SGD directly, no muon_lr_multiplier scaling
+                if "muon_lr_multiplier" in param_group:
+                    param_group["muon_lr_multiplier"] = 1.0
+            else:
+                #new_lr_this_group*=0.125
+                if("muon_lr_multiplier" in param_group):
+                    param_group["muon_lr_multiplier"] = 8.0
             
             if param_group["lr"] != new_lr_this_group:
                 param_group["lr"] = new_lr_this_group
@@ -1051,22 +1271,27 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 train_state["brenorm_dmax"] = 0.0
                 should_update=True
 
-            #num_samples_elapsed = train_state["global_step_samples"] - last_brenorm_update_samples_this_instance
-            #factor = math.exp(-num_samples_elapsed / brenorm_adjustment_scale)
-            #train_state["brenorm_rmax"] = train_state["brenorm_rmax"] + (1.0 - factor) * (brenorm_target_rmax - train_state["brenorm_rmax"])
-            #train_state["brenorm_dmax"] = train_state["brenorm_dmax"] + (1.0 - factor) * (brenorm_target_dmax - train_state["brenorm_dmax"])
+            if use_katago_opt:
+                # KataGo original: incremental EMA based on elapsed samples since last update
+                num_samples_elapsed = train_state["global_step_samples"] - last_brenorm_update_samples_this_instance
+                factor = math.exp(-num_samples_elapsed / brenorm_adjustment_scale)
+                train_state["brenorm_rmax"] = train_state["brenorm_rmax"] + (1.0 - factor) * (brenorm_target_rmax - train_state["brenorm_rmax"])
+                train_state["brenorm_dmax"] = train_state["brenorm_dmax"] + (1.0 - factor) * (brenorm_target_dmax - train_state["brenorm_dmax"])
 
-            factor = math.exp(-train_state["global_step_samples"] / brenorm_adjustment_scale)
-            rmax=1.0 + (1.0 - factor) * (brenorm_target_rmax - 1.0)
-            dmax=0.0 + (1.0 - factor) * (brenorm_target_dmax - 0.0)
-
-            delta_threhold=0.1
-            if(should_update or train_state["brenorm_rmax"]-rmax>delta_threhold or train_state["brenorm_rmax"]-rmax < -delta_threhold or train_state["brenorm_dmax"]-dmax>delta_threhold or train_state["brenorm_dmax"]-dmax < -delta_threhold):
-                train_state["brenorm_rmax"]=rmax
-                train_state["brenorm_dmax"]=dmax
-                logging.info(f"update brenorm params: rmax {train_state['brenorm_rmax']}, dmax {train_state['brenorm_dmax']}")
                 raw_model.set_brenorm_params(brenorm_avg_momentum, train_state["brenorm_rmax"], train_state["brenorm_dmax"])
                 last_brenorm_update_samples_this_instance = train_state["global_step_samples"]
+            else:
+                factor = math.exp(-train_state["global_step_samples"] / brenorm_adjustment_scale)
+                rmax=1.0 + (1.0 - factor) * (brenorm_target_rmax - 1.0)
+                dmax=0.0 + (1.0 - factor) * (brenorm_target_dmax - 0.0)
+
+                delta_threhold=0.1
+                if(should_update or train_state["brenorm_rmax"]-rmax>delta_threhold or train_state["brenorm_rmax"]-rmax < -delta_threhold or train_state["brenorm_dmax"]-dmax>delta_threhold or train_state["brenorm_dmax"]-dmax < -delta_threhold):
+                    train_state["brenorm_rmax"]=rmax
+                    train_state["brenorm_dmax"]=dmax
+                    logging.info(f"update brenorm params: rmax {train_state['brenorm_rmax']}, dmax {train_state['brenorm_dmax']}")
+                    raw_model.set_brenorm_params(brenorm_avg_momentum, train_state["brenorm_rmax"], train_state["brenorm_dmax"])
+                    last_brenorm_update_samples_this_instance = train_state["global_step_samples"]
 
     # DATA RELOADING GENERATOR ------------------------------------------------------------
 
@@ -1475,12 +1700,25 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 else:
                     loss.backward()
 
-                if model_config["norm_kind"] == "fixup" or model_config["norm_kind"] == "fixscale" or model_config["norm_kind"] == "fixscaleonenorm":
-                    gnorm_cap = 20000.0 * (1.0 if gnorm_clip_scale is None else gnorm_clip_scale)
-                elif model_config["norm_kind"] == "bnorm" or model_config["norm_kind"] == "brenorm" or model_config["norm_kind"] == "fixbrenorm":
-                    gnorm_cap = 50000.0 * (1.0 if gnorm_clip_scale is None else gnorm_clip_scale)
+                if force_all_adam:
+                    # Pure Adam: equivalent to max_norm=1.0 with mean loss
+                    # Since loss is sum-based, gradient norm ∝ batch_size * world_size
+                    gnorm_cap = float(batch_size * world_size) * (1.0 if gnorm_clip_scale is None else gnorm_clip_scale)
+                elif use_katago_opt:
+                    # KataGo original gradient clipping thresholds
+                    if model_config["norm_kind"] == "fixup" or model_config["norm_kind"] == "fixscale" or model_config["norm_kind"] == "fixscaleonenorm":
+                        gnorm_cap = 2500.0 * (1.0 if gnorm_clip_scale is None else gnorm_clip_scale)
+                    elif model_config["norm_kind"] == "bnorm" or model_config["norm_kind"] == "brenorm" or model_config["norm_kind"] == "fixbrenorm":
+                        gnorm_cap = 5500.0 * (1.0 if gnorm_clip_scale is None else gnorm_clip_scale)
+                    else:
+                        assert False
                 else:
-                    assert False
+                    if model_config["norm_kind"] == "fixup" or model_config["norm_kind"] == "fixscale" or model_config["norm_kind"] == "fixscaleonenorm":
+                        gnorm_cap = 20000.0 * (1.0 if gnorm_clip_scale is None else gnorm_clip_scale)
+                    elif model_config["norm_kind"] == "bnorm" or model_config["norm_kind"] == "brenorm" or model_config["norm_kind"] == "fixbrenorm":
+                        gnorm_cap = 50000.0 * (1.0 if gnorm_clip_scale is None else gnorm_clip_scale)
+                    else:
+                        assert False
 
                 if gnorm_stats_debug:
                     stats = metrics_obj.get_specific_norms_and_gradient_stats(raw_model)
@@ -1494,7 +1732,9 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                             param.grad *= gradscale_constant
 
                 # Loosen gradient clipping as we shift to smaller learning rates
-                gnorm_cap = gnorm_cap / math.sqrt(max(0.0000001,lr_scale * lr_scale_auto_factor(train_state)))
+                # (not applied for pure Adam mode - cosine decay handles LR reduction)
+                if not force_all_adam:
+                    gnorm_cap = gnorm_cap / math.sqrt(max(0.0000001,lr_scale * lr_scale_auto_factor(train_state)))
 
                 gnorm = torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), gnorm_cap).detach().cpu().item()
 
@@ -1528,11 +1768,13 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 if lookahead_k is not None and lookahead_print:
                     # Only accumulate metrics when lookahead is synced if lookahead_print is True
                     if lookahead_counter == 0:
-                        accumulate_metrics(running_metrics["sums"], running_metrics["weights"], metrics, batch_size, decay=math.exp(-0.01 * lookahead_k), new_weight=1.0)
+                        metrics_decay_la = math.exp(-0.001 * lookahead_k) if use_katago_opt else math.exp(-0.01 * lookahead_k)
+                        accumulate_metrics(running_metrics["sums"], running_metrics["weights"], metrics, batch_size, decay=metrics_decay_la, new_weight=1.0)
                     else:
                         accumulate_metrics(running_metrics["sums"], running_metrics["weights"], metrics, batch_size, decay=1.0, new_weight=0.0)
                 else:
-                    accumulate_metrics(running_metrics["sums"], running_metrics["weights"], metrics, batch_size, decay=0.99, new_weight=1.0)
+                    metrics_decay = 0.999 if use_katago_opt else 0.99
+                    accumulate_metrics(running_metrics["sums"], running_metrics["weights"], metrics, batch_size, decay=metrics_decay, new_weight=1.0)
 
 
                 if batch_count_this_epoch % print_train_loss_every_batches == 0:
@@ -1557,11 +1799,13 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                                tb_writer=tb_writer, tb_global_step=train_state["global_step_samples"], tb_prefix="train/")
 
                 # Update LR more frequently at the start for smoother warmup ramp and wd adjustment
-                if train_state["global_step_samples"] <= 350000000 and batch_count_this_epoch % 50 == 0:
+                lr_frequent_update_threshold = 50000000 if use_katago_opt else 350000000
+                if train_state["global_step_samples"] <= lr_frequent_update_threshold and batch_count_this_epoch % 50 == 0:
                     lr_right_now, normal_weight_decay_right_now = update_and_return_lr_and_wd()
 
                 # Update batch renorm parameters
-                if batch_count_this_epoch % 100 == 0:
+                brenorm_update_interval = 500 if use_katago_opt else 100
+                if batch_count_this_epoch % brenorm_update_interval == 0:
                     maybe_update_brenorm_params()
 
                 # Perform lookahead

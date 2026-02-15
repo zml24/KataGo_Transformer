@@ -85,9 +85,14 @@ def adam_update(grad, buf1, buf2, step, betas, eps):
 
 
 class MuonWithAuxAdamKimi(torch.optim.Optimizer):
-    def __init__(self, param_groups, momentum_default=0.95):
+    def __init__(self, param_groups, momentum_default=0.95, force_all_adam=False, adam_betas=None):
         self.is_distributed = dist.is_initialized()
         self.momentum_default=momentum_default
+        self.force_all_adam=force_all_adam
+        self.adam_betas=adam_betas
+        if force_all_adam:
+            betas_str = f", betas={adam_betas}" if adam_betas else ""
+            logging.info(f"Optimizer: Pure Adam mode (force_all_adam=True){betas_str}, all param groups use Adam")
         for group in param_groups:
             # 确保所有参数组都有group_name
             #group["group_name"] = group.get("group_name", "")
@@ -98,7 +103,7 @@ class MuonWithAuxAdamKimi(torch.optim.Optimizer):
             group["muon_lr_multiplier"] = group.get("muon_lr_multiplier", 8.0)
             
             if "use_muon" not in group:
-                group["use_muon"] = self.is_muon_group(group["group_name"])
+                group["use_muon"] = False if self.force_all_adam else self.is_muon_group(group["group_name"])
             
             if group["use_muon"]:
                 group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
@@ -109,7 +114,10 @@ class MuonWithAuxAdamKimi(torch.optim.Optimizer):
                                                 "use_muon", "group_name", "muon_lr_multiplier"])
             else:
                 # Adam参数组的默认值
-                group["betas"] = group.get("betas", (self.momentum_default,  0.995))
+                if self.adam_betas is not None:
+                    group["betas"] = self.adam_betas
+                else:
+                    group["betas"] = group.get("betas", (self.momentum_default,  0.995))
                 group["eps"] = group.get("eps", 1e-8)
                 group["weight_decay"] = group.get("weight_decay", 0)
                 assert set(group.keys()) <= set(["params", "lr", "betas", "eps", "weight_decay", 
