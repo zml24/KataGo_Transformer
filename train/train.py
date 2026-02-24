@@ -875,11 +875,11 @@ def main():
     parser.add_argument("-lr", type=float, default=3e-4, help="Peak learning rate")
     parser.add_argument("-wd", type=float, default=0.1, help="Weight decay")
     parser.add_argument("-init-std", type=float, default=0.02, help="Init std for weights (Megatron-LM style)")
-    parser.add_argument("-epochs", type=int, default=100, help="Number of epochs")
-    parser.add_argument("-samples-per-epoch", type=int, default=1000000, help="Samples per epoch")
+    parser.add_argument("-max-training-samples", type=int, default=100000000, help="Total training samples")
+    parser.add_argument("-save-every-samples", type=int, default=1000000, help="Save checkpoint every N samples")
     parser.add_argument("-symmetry-type", type=str, default="xyt", help="Data symmetry type")
     parser.add_argument("-print-every", type=int, default=100, help="Print every N batches")
-    parser.add_argument("-save-every-epoch", type=int, default=1, help="Save checkpoint every N epochs")
+    parser.add_argument("-val-every-samples", type=int, default=1000000, help="Run validation every N samples")
     parser.add_argument("-warmup-samples", type=int, default=2000000, help="LR warmup samples")
     parser.add_argument("-enable-history-matrices", action="store_true", help="Enable history matrices (for Go)")
     parser.add_argument("-initial-checkpoint", type=str, default=None, help="Initial checkpoint to load from")
@@ -953,8 +953,8 @@ def main():
         model.moving_unowned_proportion_sum = state.get("moving_unowned_proportion_sum", 0.0)
         model.moving_unowned_proportion_weight = state.get("moving_unowned_proportion_weight", 0.0)
         global_step = state.get("global_step", 0)
-        start_epoch = state.get("epoch", 0)
-        logging.info(f"Resumed from epoch {start_epoch}, step {global_step}")
+        total_samples_trained = state.get("total_samples_trained", global_step * batch_size)
+        logging.info(f"Resumed from step {global_step}, {total_samples_trained} samples")
     elif args.initial_checkpoint is not None:
         logging.info(f"Loading initial checkpoint: {args.initial_checkpoint}")
         state = torch.load(args.initial_checkpoint, map_location="cpu", weights_only=False)
@@ -962,14 +962,14 @@ def main():
         model = Model(model_config, pos_len)
         model.load_state_dict(state["model"])
         global_step = 0
-        start_epoch = 0
+        total_samples_trained = 0
     else:
         logging.info("Creating new model")
         model = Model(model_config, pos_len)
         model.initialize(init_std=args.init_std)
         logging.info(f"Initialized weights with std={args.init_std}, output_std={args.init_std / math.sqrt(2.0 * len(model.blocks)):.6f}")
         global_step = 0
-        start_epoch = 0
+        total_samples_trained = 0
 
     model.to(device)
 
@@ -1007,7 +1007,7 @@ def main():
 
     # LR scheduler: linear warmup then cosine decay
     warmup_steps = args.warmup_samples // batch_size
-    total_steps = args.epochs * (args.samples_per_epoch // batch_size)
+    total_steps = args.max_training_samples // batch_size
 
     def lr_lambda(step):
         if step < warmup_steps:
@@ -1032,20 +1032,20 @@ def main():
         logging.info("TensorBoard not available")
 
     # Save helper
-    def save_checkpoint(epoch):
+    def save_checkpoint():
         state_dict = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "config": model_config,
             "global_step": global_step,
-            "epoch": epoch,
+            "total_samples_trained": total_samples_trained,
             "moving_unowned_proportion_sum": model.moving_unowned_proportion_sum,
             "moving_unowned_proportion_weight": model.moving_unowned_proportion_weight,
         }
         path = os.path.join(args.traindir, "checkpoint.ckpt")
         torch.save(state_dict, path + ".tmp")
         os.replace(path + ".tmp", path)
-        logging.info(f"Saved checkpoint at epoch {epoch}, step {global_step}")
+        logging.info(f"Saved checkpoint at step {global_step}, {total_samples_trained} samples")
 
     # Metrics accumulation — all keys returned by compute_loss + count/grad_norm
     _metric_keys = [
@@ -1072,7 +1072,7 @@ def main():
         w = max(running["wsum"], 1e-10)
         bs = max(running["count"], 1)
         logging.info(
-            f"step={global_step}, "
+            f"step={global_step}, samples={total_samples_trained}, "
             f"time={elapsed:.1f}s, "
             f"lr={scheduler.get_last_lr()[0]:.2e}, "
             f"loss={running['loss'] / bs:.4f}, "
@@ -1091,10 +1091,16 @@ def main():
 
     # Training
     logging.info("=" * 60)
-    logging.info("Starting training")
+    logging.info(f"Starting training: {total_samples_trained}/{args.max_training_samples} samples done")
     logging.info("=" * 60)
 
-    for epoch in range(start_epoch, args.epochs):
+    last_save_samples = total_samples_trained
+    last_val_samples = total_samples_trained
+    reset_running()
+    t0 = time.perf_counter()
+    last_print_time = t0
+
+    while total_samples_trained < args.max_training_samples:
         model.train()
 
         # Find training files
@@ -1105,10 +1111,6 @@ def main():
             continue
 
         np.random.shuffle(train_files)
-        epoch_samples = 0
-        reset_running()
-        t0 = time.perf_counter()
-        last_print_time = t0
 
         for batch in data_processing_pytorch.read_npz_training_data(
             train_files,
@@ -1146,7 +1148,7 @@ def main():
             scheduler.step()
 
             global_step += 1
-            epoch_samples += batch_size
+            total_samples_trained += batch_size
 
             # Accumulate
             for k in metrics:
@@ -1160,69 +1162,71 @@ def main():
                 reset_running()
                 last_print_time = t1
 
-            if epoch_samples >= args.samples_per_epoch:
+            # Save checkpoint
+            if total_samples_trained - last_save_samples >= args.save_every_samples:
+                save_checkpoint()
+                last_save_samples = total_samples_trained
+
+            # Validation
+            if total_samples_trained - last_val_samples >= args.val_every_samples:
+                last_val_samples = total_samples_trained
+                val_files = sorted(glob.glob(os.path.join(val_dir, "*.npz")))
+                if val_files:
+                    model.eval()
+                    val_metrics = {k: 0.0 for k in _metric_keys}
+                    val_metrics["count"] = 0
+                    with torch.no_grad():
+                        for vbatch in data_processing_pytorch.read_npz_training_data(
+                            val_files[:3],
+                            batch_size=batch_size,
+                            world_size=1,
+                            rank=0,
+                            pos_len=pos_len,
+                            device=device,
+                            symmetry_type=None,
+                            include_meta=False,
+                            enable_history_matrices=args.enable_history_matrices,
+                            model_config=model_config,
+                        ):
+                            with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
+                                outputs = model(vbatch["binaryInputNCHW"], vbatch["globalInputNC"])
+                            postprocessed = model.postprocess(outputs)
+                            _, m = compute_loss(
+                                model, postprocessed, vbatch, pos_len,
+                                is_training=False,
+                                soft_policy_weight_scale=args.soft_policy_weight_scale,
+                                value_loss_scale=args.value_loss_scale,
+                                td_value_loss_scales=td_value_loss_scales,
+                                seki_loss_scale=args.seki_loss_scale,
+                                variance_time_loss_scale=args.variance_time_loss_scale,
+                                disable_optimistic_policy=args.disable_optimistic_policy,
+                            )
+                            for k in m:
+                                val_metrics[k] += m[k]
+                            val_metrics["count"] += 1
+
+                    w = max(val_metrics["wsum"], 1e-10)
+                    bs = max(val_metrics["count"], 1)
+                    logging.info(
+                        f"  VAL [{total_samples_trained} samples]: loss={val_metrics['loss'] / bs:.4f}, "
+                        f"p0loss={val_metrics['p0loss'] / w:.4f}, "
+                        f"vloss={val_metrics['vloss'] / w:.4f}, "
+                        f"oloss={val_metrics['oloss'] / w:.4f}, "
+                        f"skloss={val_metrics['skloss'] / w:.4f}, "
+                        f"pacc1={val_metrics['pacc1'] / w:.4f}"
+                    )
+                    if tb_writer is not None:
+                        tb_writer.add_scalar("val/loss", val_metrics["loss"] / bs, global_step)
+                        for k in _per_sample_keys:
+                            tb_writer.add_scalar(f"val/{k}", val_metrics[k] / w, global_step)
+                    model.train()
+
+            if total_samples_trained >= args.max_training_samples:
                 break
 
-        # End of epoch
-        t_epoch = time.perf_counter() - t0
-        logging.info(f"Epoch {epoch} done in {t_epoch:.1f}s, {epoch_samples} samples")
-
-        # Save
-        if (epoch + 1) % args.save_every_epoch == 0:
-            save_checkpoint(epoch + 1)
-
-        # Validation
-        val_files = sorted(glob.glob(os.path.join(val_dir, "*.npz")))
-        if val_files:
-            model.eval()
-            val_metrics = {k: 0.0 for k in _metric_keys}
-            val_metrics["count"] = 0
-            with torch.no_grad():
-                for batch in data_processing_pytorch.read_npz_training_data(
-                    val_files[:3],  # 只用前几个文件做验证
-                    batch_size=batch_size,
-                    world_size=1,
-                    rank=0,
-                    pos_len=pos_len,
-                    device=device,
-                    symmetry_type=None,
-                    include_meta=False,
-                    enable_history_matrices=args.enable_history_matrices,
-                    model_config=model_config,
-                ):
-                    with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
-                        outputs = model(batch["binaryInputNCHW"], batch["globalInputNC"])
-                    postprocessed = model.postprocess(outputs)
-                    loss, m = compute_loss(
-                        model, postprocessed, batch, pos_len,
-                        is_training=False,
-                        soft_policy_weight_scale=args.soft_policy_weight_scale,
-                        value_loss_scale=args.value_loss_scale,
-                        td_value_loss_scales=td_value_loss_scales,
-                        seki_loss_scale=args.seki_loss_scale,
-                        variance_time_loss_scale=args.variance_time_loss_scale,
-                        disable_optimistic_policy=args.disable_optimistic_policy,
-                    )
-                    for k in m:
-                        val_metrics[k] += m[k]
-                    val_metrics["count"] += 1
-
-            w = max(val_metrics["wsum"], 1e-10)
-            bs = max(val_metrics["count"], 1)
-            logging.info(
-                f"  VAL: loss={val_metrics['loss'] / bs:.4f}, "
-                f"p0loss={val_metrics['p0loss'] / w:.4f}, "
-                f"vloss={val_metrics['vloss'] / w:.4f}, "
-                f"oloss={val_metrics['oloss'] / w:.4f}, "
-                f"skloss={val_metrics['skloss'] / w:.4f}, "
-                f"pacc1={val_metrics['pacc1'] / w:.4f}"
-            )
-            if tb_writer is not None:
-                tb_writer.add_scalar("val/loss", val_metrics["loss"] / bs, global_step)
-                for k in _per_sample_keys:
-                    tb_writer.add_scalar(f"val/{k}", val_metrics[k] / w, global_step)
-
-    logging.info("Training complete!")
+    # Final save
+    save_checkpoint()
+    logging.info(f"Training complete: {total_samples_trained} samples, {global_step} steps")
     if tb_writer is not None:
         tb_writer.close()
 
