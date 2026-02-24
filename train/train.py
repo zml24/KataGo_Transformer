@@ -799,7 +799,7 @@ def compute_loss(
         pred_shortterm_score_error, sqerror_s, delta=100.0
     )).sum()
 
-    # --- Total loss (对齐 metrics_pytorch.py 的 loss_sum) ---
+    # --- Total loss (对齐 metrics_pytorch.py 的 loss_sum，再除以 N 取 mean) ---
     loss_sum = (
         loss_policy_player * policy_opt_loss_scale
         + loss_policy_opponent
@@ -824,7 +824,7 @@ def compute_loss(
         + loss_variance_time * variance_time_loss_scale
         + loss_st_value_error
         + loss_st_score_error
-    )
+    ) / N
 
     # Accuracy
     with torch.no_grad():
