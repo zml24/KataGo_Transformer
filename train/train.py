@@ -1083,11 +1083,11 @@ def main():
             f"pacc1={running['pacc1'] / w:.4f}"
         )
         if tb_writer is not None:
-            tb_writer.add_scalar("train/loss", running["loss"] / bs, global_step)
+            tb_writer.add_scalar("train/loss", running["loss"] / bs, total_samples_trained)
             for k in _per_sample_keys:
-                tb_writer.add_scalar(f"train/{k}", running[k] / w, global_step)
-            tb_writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
-            tb_writer.add_scalar("train/grad_norm", running["grad_norm"] / bs, global_step)
+                tb_writer.add_scalar(f"train/{k}", running[k] / w, total_samples_trained)
+            tb_writer.add_scalar("train/lr", scheduler.get_last_lr()[0], total_samples_trained)
+            tb_writer.add_scalar("train/grad_norm", running["grad_norm"] / bs, total_samples_trained)
 
     # Training
     logging.info("=" * 60)
@@ -1216,9 +1216,9 @@ def main():
                         f"pacc1={val_metrics['pacc1'] / w:.4f}"
                     )
                     if tb_writer is not None:
-                        tb_writer.add_scalar("val/loss", val_metrics["loss"] / bs, global_step)
+                        tb_writer.add_scalar("val/loss", val_metrics["loss"] / bs, total_samples_trained)
                         for k in _per_sample_keys:
-                            tb_writer.add_scalar(f"val/{k}", val_metrics[k] / w, global_step)
+                            tb_writer.add_scalar(f"val/{k}", val_metrics[k] / w, total_samples_trained)
                     model.train()
 
             if total_samples_trained >= args.max_training_samples:
