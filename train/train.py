@@ -265,6 +265,47 @@ class PolicyHead(nn.Module):
         return torch.cat([outpolicy, outpass.unsqueeze(-1)], dim=2)
 
 
+class SimplePolicyHeadPool(nn.Module):
+    """Global mean pool -> single linear -> all policy logits."""
+    def __init__(self, c_in, pos_len):
+        super().__init__()
+        self.pos_len = pos_len
+        self.num_policy_outputs = 6
+        self.linear = nn.Linear(c_in, (pos_len * pos_len + 1) * self.num_policy_outputs)
+
+    def forward(self, x_nlc, mask, mask_sum_hw):
+        N, L, _ = x_nlc.shape
+        if mask is not None:
+            pooled = (x_nlc * mask.view(N, L, 1)).sum(dim=1) / mask_sum_hw.view(N, 1)
+        else:
+            pooled = x_nlc.mean(dim=1)
+        out = self.linear(pooled).view(N, self.num_policy_outputs, L + 1)
+        if mask is not None:
+            out[:, :, :L] = out[:, :, :L] - (1.0 - mask.view(N, 1, L)) * 5000.0
+        return out
+
+
+class SimplePolicyHeadLinear(nn.Module):
+    """Per-position linear for board + global pool linear for pass."""
+    def __init__(self, c_in, pos_len):
+        super().__init__()
+        self.pos_len = pos_len
+        self.num_policy_outputs = 6
+        self.linear_board = nn.Linear(c_in, self.num_policy_outputs)
+        self.linear_pass = nn.Linear(c_in, self.num_policy_outputs)
+
+    def forward(self, x_nlc, mask, mask_sum_hw):
+        N, L, _ = x_nlc.shape
+        board = self.linear_board(x_nlc).permute(0, 2, 1)  # (N, 6, L)
+        if mask is not None:
+            board = board - (1.0 - mask.view(N, 1, L)) * 5000.0
+            pooled = (x_nlc * mask.view(N, L, 1)).sum(dim=1) / mask_sum_hw.view(N, 1)
+        else:
+            pooled = x_nlc.mean(dim=1)
+        pass_logits = self.linear_pass(pooled)  # (N, 6)
+        return torch.cat([board, pass_logits.unsqueeze(-1)], dim=2)  # (N, 6, L+1)
+
+
 # ---------------------------------------------------------------------------
 # ValueHead (NLC 输入, 1x1 conv -> Linear)
 # ---------------------------------------------------------------------------
@@ -433,7 +474,13 @@ class Model(nn.Module):
         c_sv2 = config["sbv2_num_channels"]
         num_scorebeliefs = config["num_scorebeliefs"]
 
-        self.policy_head = PolicyHead(self.c_trunk, c_p1, c_g1, pos_len)
+        policy_head_type = config.get("policy_head_type", "full")
+        if policy_head_type == "simple-pool":
+            self.policy_head = SimplePolicyHeadPool(self.c_trunk, pos_len)
+        elif policy_head_type == "simple-linear":
+            self.policy_head = SimplePolicyHeadLinear(self.c_trunk, pos_len)
+        else:
+            self.policy_head = PolicyHead(self.c_trunk, c_p1, c_g1, pos_len)
         self.value_head = ValueHead(self.c_trunk, c_v1, c_v2, c_sv2, num_scorebeliefs, pos_len)
 
         # Seki 动态权重的移动平均状态
@@ -882,6 +929,7 @@ def main():
     parser.add_argument("-val-every-samples", type=int, default=1000000, help="Run validation every N samples")
     parser.add_argument("-warmup-samples", type=int, default=2000000, help="LR warmup samples")
     parser.add_argument("-enable-history-matrices", action="store_true", help="Enable history matrices (for Go)")
+    parser.add_argument("-policy-head-type", type=str, default="full", choices=["full", "simple-pool", "simple-linear"], help="Policy head type")
     parser.add_argument("-initial-checkpoint", type=str, default=None, help="Initial checkpoint to load from")
     parser.add_argument("-no-compile", action="store_true", help="Disable torch.compile")
     parser.add_argument("-soft-policy-weight-scale", type=float, default=8.0, help="Soft policy loss coeff")
@@ -936,7 +984,8 @@ def main():
         use_amp = False  # CPU bf16 有兼容性问题，关闭 AMP
 
     # Model config
-    model_config = modelconfigs.config_of_name[args.model_kind]
+    model_config = modelconfigs.config_of_name[args.model_kind].copy()
+    model_config["policy_head_type"] = args.policy_head_type
     logging.info(f"Model config: {json.dumps(model_config, indent=2, default=str)}")
 
     pos_len = args.pos_len
