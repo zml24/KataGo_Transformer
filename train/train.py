@@ -515,16 +515,17 @@ class Model(nn.Module):
         x = self.norm_final(x)
         x = F.silu(x)
 
-        # Heads 在 fp32 下计算以保证数值稳定性
+        # Heads 在 fp32 下计算以保证数值稳定性（禁用 autocast 防止 linear 被降回 bf16）
         x = x.float()
         input_global = input_global.float()
 
-        out_policy = self.policy_head(x, mask, mask_sum_hw)
-        (
-            out_value, out_misc, out_moremisc,
-            out_ownership, out_scoring, out_futurepos, out_seki,
-            out_scorebelief,
-        ) = self.value_head(x, mask, mask_sum_hw, input_global)
+        with torch.amp.autocast(x.device.type, enabled=False):
+            out_policy = self.policy_head(x, mask, mask_sum_hw)
+            (
+                out_value, out_misc, out_moremisc,
+                out_ownership, out_scoring, out_futurepos, out_seki,
+                out_scorebelief,
+            ) = self.value_head(x, mask, mask_sum_hw, input_global)
 
         return (
             out_policy, out_value, out_misc, out_moremisc,
