@@ -920,6 +920,7 @@ def main():
     parser.add_argument("-seki-loss-scale", type=float, default=1.0, help="Seki loss coeff")
     parser.add_argument("-variance-time-loss-scale", type=float, default=1.0, help="Variance time loss coeff")
     parser.add_argument("-disable-optimistic-policy", action="store_true", help="Disable optimistic policy")
+    parser.add_argument("-simple-value-head", action="store_true", help="Use simple linear value head")
     parser.add_argument("-prefetch-batches", type=int, default=0, help="Prefetch queue depth (0=off, 2=recommended)")
     args = parser.parse_args()
 
@@ -968,6 +969,8 @@ def main():
 
     # Model config
     model_config = modelconfigs.config_of_name[args.model_kind].copy()
+    if args.simple_value_head:
+        model_config["value_head_type"] = "simple-linear"
     logging.info(f"Model config: {json.dumps(model_config, indent=2, default=str)}")
 
     pos_len = args.pos_len
