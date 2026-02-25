@@ -733,7 +733,7 @@ def compute_loss(
     loss_td_value2 = td_loss_weighted[:, 1].sum()
     loss_td_value3 = td_loss_weighted[:, 2].sum()
 
-    loss_td_score = 0.0048 * (global_weight * target_weight_ownership * torch.sum(
+    loss_td_score = 0.0004 * (global_weight * target_weight_ownership * torch.sum(
         F.huber_loss(pred_td_score, target_td_score, reduction="none", delta=12.0), dim=1
     )).sum()
 
@@ -785,7 +785,7 @@ def compute_loss(
     loss_seki = (global_weight * seki_weight_scale * target_weight_ownership * (loss_sign + 0.5 * loss_neutral) / mask_sum_hw).sum()
 
     # --- Score belief losses ---
-    loss_scoremean = 0.018 * (global_weight * target_weight_ownership * F.huber_loss(
+    loss_scoremean = 0.0015 * (global_weight * target_weight_ownership * F.huber_loss(
         pred_scoremean, target_scoremean, reduction="none", delta=12.0
     )).sum()
 
@@ -804,13 +804,13 @@ def compute_loss(
     sb_offset = model.value_head.score_belief_offset_vector.view(1, -1)
     expected_score = torch.sum(sb_probs * sb_offset, dim=1, keepdim=True)
     stdev_of_belief = torch.sqrt(0.001 + torch.sum(sb_probs * torch.square(sb_offset - expected_score), dim=1))
-    loss_scorestdev = 0.01 * (global_weight * F.huber_loss(pred_scorestdev, stdev_of_belief, reduction="none", delta=10.0)).sum()
+    loss_scorestdev = 0.001 * (global_weight * F.huber_loss(pred_scorestdev, stdev_of_belief, reduction="none", delta=10.0)).sum()
 
-    loss_lead = 0.048 * (global_weight * target_weight_lead * F.huber_loss(
+    loss_lead = 0.0060 * (global_weight * target_weight_lead * F.huber_loss(
         pred_lead, target_lead, reduction="none", delta=8.0
     )).sum()
 
-    loss_variance_time = 0.015 * (global_weight * target_weight_ownership * F.huber_loss(
+    loss_variance_time = 0.0003 * (global_weight * target_weight_ownership * F.huber_loss(
         pred_variance_time, target_variance_time + 1e-5, reduction="none", delta=50.0
     )).sum()
 
@@ -819,14 +819,14 @@ def compute_loss(
     predvalue = (td_val_pred_probs[:, 0] - td_val_pred_probs[:, 1]).detach()
     realvalue = target_td_value[:, 2, 0] - target_td_value[:, 2, 1]
     sqerror_v = torch.square(predvalue - realvalue) + 1e-8
-    loss_st_value_error = 0.8 * (global_weight * target_weight_ownership * F.huber_loss(
+    loss_st_value_error = 2.0 * (global_weight * target_weight_ownership * F.huber_loss(
         pred_shortterm_value_error, sqerror_v, reduction="none", delta=0.4
     )).sum()
 
     predscore = pred_td_score[:, 2].detach()
     realscore = target_td_score[:, 2]
     sqerror_s = torch.square(predscore - realscore) + 1e-4
-    loss_st_score_error = 0.002 * (global_weight * target_weight_ownership * F.huber_loss(
+    loss_st_score_error = 0.00002 * (global_weight * target_weight_ownership * F.huber_loss(
         pred_shortterm_score_error, sqerror_s, reduction="none", delta=100.0
     )).sum()
 
@@ -922,7 +922,7 @@ def main():
     parser.add_argument("-variance-time-loss-scale", type=float, default=1.0, help="Variance time loss coeff")
     parser.add_argument("-disable-optimistic-policy", action="store_true", help="Disable optimistic policy")
     parser.add_argument("-simple-value-head", action="store_true", help="Use simple linear value head")
-    parser.add_argument("-prefetch-batches", type=int, default=0, help="Prefetch queue depth (0=off, 2=recommended)")
+    parser.add_argument("-prefetch-batches", type=int, default=4, help="Prefetch queue depth (0=off, 2=recommended)")
     args = parser.parse_args()
 
     # 解析 td_value_loss_scales
