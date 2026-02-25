@@ -1,5 +1,7 @@
 import logging
 import os
+import threading
+import queue
 
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
@@ -8,6 +10,43 @@ import torch
 import torch.nn.functional
 
 import modelconfigs
+
+
+def prefetch_generator(gen, prefetch_batches):
+    """用后台线程预取 batch，使数据准备与 GPU 计算重叠。
+
+    Args:
+        gen: 产生 batch 的生成器
+        prefetch_batches: 预取队列深度，0 表示不预取（直接返回原生成器）
+    """
+    if prefetch_batches <= 0:
+        yield from gen
+        return
+
+    q = queue.Queue(maxsize=prefetch_batches)
+    _sentinel = object()
+
+    def _producer():
+        try:
+            for item in gen:
+                q.put(item)
+        except Exception as e:
+            q.put(e)
+        finally:
+            q.put(_sentinel)
+
+    t = threading.Thread(target=_producer, daemon=True)
+    t.start()
+
+    while True:
+        item = q.get()
+        if item is _sentinel:
+            break
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+    t.join()
 
 def read_npz_training_data(
     npz_files,
@@ -20,6 +59,7 @@ def read_npz_training_data(
     include_meta: bool,
     enable_history_matrices: bool,
     model_config: modelconfigs.ModelConfig,
+    use_pin_memory: bool = False,
 ):
     rand = np.random.default_rng(seed=list(os.urandom(12)))
     num_bin_features = modelconfigs.get_num_bin_input_features(model_config)
@@ -82,16 +122,28 @@ def read_npz_training_data(
                 start = (n * world_size + rank) * batch_size
                 end = start + batch_size
 
-                batch_binaryInputNCHW = torch.from_numpy(binaryInputNCHW[start:end]).to(device)
-                batch_globalInputNC = torch.from_numpy(globalInputNC[start:end]).to(device)
-                batch_policyTargetsNCMove = torch.from_numpy(policyTargetsNCMove[start:end]).to(device)
-                batch_globalTargetsNC = torch.from_numpy(globalTargetsNC[start:end]).to(device)
-                batch_scoreDistrN = torch.from_numpy(scoreDistrN[start:end]).to(device)
-                batch_valueTargetsNCHW = torch.from_numpy(valueTargetsNCHW[start:end]).to(device)
-                if include_meta:
-                    batch_metadataInputNC = torch.from_numpy(metadataInputNC[start:end]).to(device)
-                if include_qvalues:
-                    batch_qValueTargetsNCMove = torch.from_numpy(qValueTargetsNCMove[start:end]).to(device)
+                if use_pin_memory:
+                    batch_binaryInputNCHW = torch.from_numpy(binaryInputNCHW[start:end]).pin_memory().to(device, non_blocking=True)
+                    batch_globalInputNC = torch.from_numpy(globalInputNC[start:end]).pin_memory().to(device, non_blocking=True)
+                    batch_policyTargetsNCMove = torch.from_numpy(policyTargetsNCMove[start:end]).pin_memory().to(device, non_blocking=True)
+                    batch_globalTargetsNC = torch.from_numpy(globalTargetsNC[start:end]).pin_memory().to(device, non_blocking=True)
+                    batch_scoreDistrN = torch.from_numpy(scoreDistrN[start:end]).pin_memory().to(device, non_blocking=True)
+                    batch_valueTargetsNCHW = torch.from_numpy(valueTargetsNCHW[start:end]).pin_memory().to(device, non_blocking=True)
+                    if include_meta:
+                        batch_metadataInputNC = torch.from_numpy(metadataInputNC[start:end]).pin_memory().to(device, non_blocking=True)
+                    if include_qvalues:
+                        batch_qValueTargetsNCMove = torch.from_numpy(qValueTargetsNCMove[start:end]).pin_memory().to(device, non_blocking=True)
+                else:
+                    batch_binaryInputNCHW = torch.from_numpy(binaryInputNCHW[start:end]).to(device)
+                    batch_globalInputNC = torch.from_numpy(globalInputNC[start:end]).to(device)
+                    batch_policyTargetsNCMove = torch.from_numpy(policyTargetsNCMove[start:end]).to(device)
+                    batch_globalTargetsNC = torch.from_numpy(globalTargetsNC[start:end]).to(device)
+                    batch_scoreDistrN = torch.from_numpy(scoreDistrN[start:end]).to(device)
+                    batch_valueTargetsNCHW = torch.from_numpy(valueTargetsNCHW[start:end]).to(device)
+                    if include_meta:
+                        batch_metadataInputNC = torch.from_numpy(metadataInputNC[start:end]).to(device)
+                    if include_qvalues:
+                        batch_qValueTargetsNCMove = torch.from_numpy(qValueTargetsNCMove[start:end]).to(device)
 
                 if enable_history_matrices:
                     (batch_binaryInputNCHW, batch_globalInputNC) = apply_history_matrices(

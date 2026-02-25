@@ -265,26 +265,6 @@ class PolicyHead(nn.Module):
         return torch.cat([outpolicy, outpass.unsqueeze(-1)], dim=2)
 
 
-class SimplePolicyHeadPool(nn.Module):
-    """Global mean pool -> single linear -> all policy logits."""
-    def __init__(self, c_in, pos_len):
-        super().__init__()
-        self.pos_len = pos_len
-        self.num_policy_outputs = 6
-        self.linear = nn.Linear(c_in, (pos_len * pos_len + 1) * self.num_policy_outputs)
-
-    def forward(self, x_nlc, mask, mask_sum_hw):
-        N, L, _ = x_nlc.shape
-        if mask is not None:
-            pooled = (x_nlc * mask.view(N, L, 1)).sum(dim=1) / mask_sum_hw.view(N, 1)
-        else:
-            pooled = x_nlc.mean(dim=1)
-        out = self.linear(pooled).view(N, self.num_policy_outputs, L + 1)
-        if mask is not None:
-            out[:, :, :L] = out[:, :, :L] - (1.0 - mask.view(N, 1, L)) * 5000.0
-        return out
-
-
 class SimplePolicyHeadLinear(nn.Module):
     """Per-position linear for board + global pool linear for pass."""
     def __init__(self, c_in, pos_len):
@@ -475,9 +455,7 @@ class Model(nn.Module):
         num_scorebeliefs = config["num_scorebeliefs"]
 
         policy_head_type = config.get("policy_head_type", "full")
-        if policy_head_type == "simple-pool":
-            self.policy_head = SimplePolicyHeadPool(self.c_trunk, pos_len)
-        elif policy_head_type == "simple-linear":
+        if policy_head_type == "simple-linear":
             self.policy_head = SimplePolicyHeadLinear(self.c_trunk, pos_len)
         else:
             self.policy_head = PolicyHead(self.c_trunk, c_p1, c_g1, pos_len)
@@ -929,7 +907,7 @@ def main():
     parser.add_argument("-val-every-samples", type=int, default=1000000, help="Run validation every N samples")
     parser.add_argument("-warmup-samples", type=int, default=2000000, help="LR warmup samples")
     parser.add_argument("-enable-history-matrices", action="store_true", help="Enable history matrices (for Go)")
-    parser.add_argument("-policy-head-type", type=str, default="full", choices=["full", "simple-pool", "simple-linear"], help="Policy head type")
+    parser.add_argument("-policy-head-type", type=str, default="full", choices=["full", "simple-linear"], help="Policy head type")
     parser.add_argument("-initial-checkpoint", type=str, default=None, help="Initial checkpoint to load from")
     parser.add_argument("-no-compile", action="store_true", help="Disable torch.compile")
     parser.add_argument("-soft-policy-weight-scale", type=float, default=8.0, help="Soft policy loss coeff")
@@ -938,6 +916,7 @@ def main():
     parser.add_argument("-seki-loss-scale", type=float, default=1.0, help="Seki loss coeff")
     parser.add_argument("-variance-time-loss-scale", type=float, default=1.0, help="Variance time loss coeff")
     parser.add_argument("-disable-optimistic-policy", action="store_true", help="Disable optimistic policy")
+    parser.add_argument("-prefetch-batches", type=int, default=0, help="Prefetch queue depth (0=off, 2=recommended)")
     args = parser.parse_args()
 
     # 解析 td_value_loss_scales
@@ -1161,7 +1140,8 @@ def main():
 
         np.random.shuffle(train_files)
 
-        for batch in data_processing_pytorch.read_npz_training_data(
+        use_pin_memory = args.prefetch_batches > 0 and device.type == "cuda"
+        train_gen = data_processing_pytorch.read_npz_training_data(
             train_files,
             batch_size=batch_size,
             world_size=1,
@@ -1172,7 +1152,9 @@ def main():
             include_meta=False,
             enable_history_matrices=args.enable_history_matrices,
             model_config=model_config,
-        ):
+            use_pin_memory=use_pin_memory,
+        )
+        for batch in data_processing_pytorch.prefetch_generator(train_gen, args.prefetch_batches):
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
@@ -1225,7 +1207,7 @@ def main():
                     val_metrics = {k: 0.0 for k in _metric_keys}
                     val_metrics["count"] = 0
                     with torch.no_grad():
-                        for vbatch in data_processing_pytorch.read_npz_training_data(
+                        val_gen = data_processing_pytorch.read_npz_training_data(
                             val_files[:3],
                             batch_size=batch_size,
                             world_size=1,
@@ -1236,7 +1218,9 @@ def main():
                             include_meta=False,
                             enable_history_matrices=args.enable_history_matrices,
                             model_config=model_config,
-                        ):
+                            use_pin_memory=use_pin_memory,
+                        )
+                        for vbatch in data_processing_pytorch.prefetch_generator(val_gen, args.prefetch_batches):
                             with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
                                 outputs = model(vbatch["binaryInputNCHW"], vbatch["globalInputNC"])
                             postprocessed = model.postprocess(outputs)
