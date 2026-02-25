@@ -912,7 +912,7 @@ def main():
     parser.add_argument("-val-every-samples", type=int, default=1000000, help="Run validation every N samples")
     parser.add_argument("-warmup-samples", type=int, default=2000000, help="LR warmup samples")
     parser.add_argument("-enable-history-matrices", action="store_true", help="Enable history matrices (for Go)")
-parser.add_argument("-initial-checkpoint", type=str, default=None, help="Initial checkpoint to load from")
+    parser.add_argument("-initial-checkpoint", type=str, default=None, help="Initial checkpoint to load from")
     parser.add_argument("-no-compile", action="store_true", help="Disable torch.compile")
     parser.add_argument("-soft-policy-weight-scale", type=float, default=8.0, help="Soft policy loss coeff")
     parser.add_argument("-value-loss-scale", type=float, default=0.6, help="Value loss coeff")
