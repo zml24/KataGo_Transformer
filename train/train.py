@@ -55,14 +55,6 @@ def cross_entropy(pred_logits, target_probs, dim):
     return -torch.sum(target_probs * F.log_softmax(pred_logits, dim=dim), dim=dim)
 
 
-def huber_loss(x, y, delta):
-    abs_diff = torch.abs(x - y)
-    return torch.where(
-        abs_diff > delta,
-        0.5 * delta * delta + delta * (abs_diff - delta),
-        0.5 * abs_diff * abs_diff,
-    )
-
 
 # ---------------------------------------------------------------------------
 # 2D RoPE
@@ -167,26 +159,6 @@ class TransformerBlock(nn.Module):
         return x
 
 
-# ---------------------------------------------------------------------------
-# KataGPool (需要 NCHW 输入, 内部使用)
-# ---------------------------------------------------------------------------
-class KataGPool(nn.Module):
-    def forward(self, x, mask, mask_sum_hw):
-        """x: (N,C,H,W), mask: (N,1,H,W), mask_sum_hw: (N,1,1,1) -> (N,3C)"""
-        x_fp32 = x.to(torch.float32)
-        if mask is not None:
-            sqrt_offset = torch.sqrt(mask_sum_hw) - 14.0
-            layer_mean = torch.sum(x_fp32, dim=(2, 3), keepdim=True) / mask_sum_hw
-            layer_max, _ = torch.max((x + (mask - 1.0)).view(x.shape[0], x.shape[1], -1).to(torch.float32), dim=2)
-        else:
-            sqrt_offset = (x.shape[2] * x.shape[3]) ** 0.5 - 14.0
-            layer_mean = torch.mean(x_fp32, dim=(2, 3), keepdim=True)
-            layer_max, _ = torch.max(x.view(x.shape[0], x.shape[1], -1).to(torch.float32), dim=2)
-        layer_max = layer_max.view(x.shape[0], x.shape[1], 1, 1)
-        out = torch.cat([layer_mean, layer_mean * (sqrt_offset / 10.0), layer_max], dim=1)
-        return out.squeeze(-1).squeeze(-1)  # (N, 3C)
-
-
 class KataValueHeadGPool(nn.Module):
     def forward(self, x, mask, mask_sum_hw):
         """x: (N,C,H,W), mask: (N,1,H,W), mask_sum_hw: (N,1,1,1) -> (N,3C)"""
@@ -206,66 +178,9 @@ class KataValueHeadGPool(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# PolicyHead (NLC 输入, 1x1 conv -> Linear)
+# PolicyHead (NLC 输入)
 # ---------------------------------------------------------------------------
 class PolicyHead(nn.Module):
-    def __init__(self, c_in, c_p1, c_g1, pos_len):
-        super().__init__()
-        self.pos_len = pos_len
-        self.c_p1 = c_p1
-        self.c_g1 = c_g1
-        self.num_policy_outputs = 6
-
-        # 合并 linear_p (c_in→c_p1) + linear_g (c_in→c_g1)
-        self.linear_pg = nn.Linear(c_in, c_p1 + c_g1, bias=False)
-        self.bias_g = nn.Parameter(torch.zeros(c_g1))           # 对齐 model_pytorch 的 biasg
-        self.gpool = KataGPool()
-
-        # gate (no bias) 和 pass (has bias) bias 不一致，不合并
-        self.linear_gate = nn.Linear(3 * c_g1, c_p1, bias=False)
-        self.linear_pass = nn.Linear(3 * c_g1, c_p1, bias=True)
-        self.linear_pass2 = nn.Linear(c_p1, self.num_policy_outputs, bias=False)
-
-        self.bias = nn.Parameter(torch.zeros(c_p1))
-        self.linear_out = nn.Linear(c_p1, self.num_policy_outputs, bias=False)  # 替代 conv2p
-
-    def forward(self, x_nlc, mask, mask_sum_hw):
-        """x_nlc: (N,L,C), mask: (N,1,H,W) or None, mask_sum_hw: (N,1,1,1) or None"""
-        N, L, _ = x_nlc.shape
-        H = W = self.pos_len
-
-        outp, outg = self.linear_pg(x_nlc).split([self.c_p1, self.c_g1], dim=-1)
-
-        # bias + mask + activation (对齐 model_pytorch 的 biasg + actg)
-        outg = outg + self.bias_g
-        if mask is not None:
-            outg = outg * mask.view(N, L, 1)
-        outg = F.silu(outg)
-
-        # Global pool 需要 NCHW
-        outg_nchw = outg.permute(0, 2, 1).view(N, -1, H, W)
-        outg_pooled = self.gpool(outg_nchw, mask, mask_sum_hw)  # (N, 3*c_g1)
-
-        # pass logits + gate
-        outpass = F.silu(self.linear_pass(outg_pooled))
-        outpass = self.linear_pass2(outpass)
-        gate = self.linear_gate(outg_pooled)  # (N, c_p1)
-        outp = outp + gate.unsqueeze(1)
-        outp = outp + self.bias
-        if mask is not None:
-            outp = outp * mask.view(N, L, 1)
-        outp = F.silu(outp)
-        outp = self.linear_out(outp)  # (N, L, num_policy)
-
-        # (N, num_policy, L) 然后 mask 掉棋盘外
-        outpolicy = outp.permute(0, 2, 1)
-        if mask is not None:
-            outpolicy = outpolicy - (1.0 - mask.view(N, 1, L)) * 5000.0
-        # concat with pass: (N, num_policy, L+1)
-        return torch.cat([outpolicy, outpass.unsqueeze(-1)], dim=2)
-
-
-class SimplePolicyHeadLinear(nn.Module):
     """Per-position linear for board + global pool linear for pass."""
     def __init__(self, c_in, pos_len):
         super().__init__()
@@ -299,17 +214,8 @@ class ValueHead(nn.Module):
         self.c_sv2 = c_sv2
         self.c_v1 = c_v1
 
-        self.td_score_multiplier = 20.0
-        self.scoremean_multiplier = 20.0
-        self.scorestdev_multiplier = 20.0
-        self.lead_multiplier = 20.0
-        self.variance_time_multiplier = 40.0
-        self.shortterm_value_error_multiplier = 0.25
-        self.shortterm_score_error_multiplier = 150.0
-
         # 空间 -> 通道 (替代 conv1)
-        self.linear_v1 = nn.Linear(c_in, c_v1, bias=False)
-        self.bias_v1 = nn.Parameter(torch.zeros(c_v1))
+        self.linear_v1 = nn.Linear(c_in, c_v1, bias=True)
         self.gpool = KataValueHeadGPool()
 
         self.linear2 = nn.Linear(3 * c_v1, c_v2, bias=True)
@@ -351,7 +257,7 @@ class ValueHead(nn.Module):
         N, L, _ = x_nlc.shape
         H = W = self.pos_len
 
-        outv1 = self.linear_v1(x_nlc) + self.bias_v1  # (N, L, c_v1)
+        outv1 = self.linear_v1(x_nlc)  # (N, L, c_v1)
         if mask is not None:
             outv1 = outv1 * mask.view(N, L, 1)
         outv1 = F.silu(outv1)
@@ -382,6 +288,98 @@ class ValueHead(nn.Module):
         out_seki = out_seki.permute(0, 2, 1).view(N, 4, H, W)
 
         # Score belief
+        batch_size = N
+        s2_out, outsmix = self.linear_s2mix(pooled).split([self.c_sv2, self.num_scorebeliefs], dim=-1)
+        outsv2 = (
+            s2_out.view(batch_size, 1, self.c_sv2)
+            + self.linear_s2off(self.score_belief_offset_bias_vector.view(1, self.scorebelief_len, 1))
+            + self.linear_s2par(
+                (self.score_belief_parity_vector.view(1, self.scorebelief_len) * input_global[:, -1:])
+                .view(batch_size, self.scorebelief_len, 1)
+            )
+        )
+        outsv2 = F.silu(outsv2)
+        outsv3 = self.linear_s3(outsv2)
+        outsmix_logweights = F.log_softmax(outsmix, dim=1)
+        out_scorebelief_logprobs = F.log_softmax(outsv3, dim=1)
+        out_scorebelief_logprobs = torch.logsumexp(
+            out_scorebelief_logprobs + outsmix_logweights.view(-1, 1, self.num_scorebeliefs), dim=2
+        )
+
+        return (
+            out_value, out_misc, out_moremisc,
+            out_ownership, out_scoring, out_futurepos, out_seki,
+            out_scorebelief_logprobs,
+        )
+
+
+class SimpleValueHead(nn.Module):
+    """Simplified value head: per-position linear for ownership/scoring,
+    mean-pool linear for global features. Score belief unchanged."""
+    def __init__(self, c_in, c_v1, c_sv2, num_scorebeliefs, pos_len):
+        super().__init__()
+        self.pos_len = pos_len
+        self.scorebelief_mid = pos_len * pos_len + EXTRA_SCORE_DISTR_RADIUS
+        self.scorebelief_len = self.scorebelief_mid * 2
+        self.num_scorebeliefs = num_scorebeliefs
+        self.c_v1 = c_v1
+        self.c_sv2 = c_sv2
+
+        # Per-position: ownership(1) + scoring(1) + futurepos(2) + seki(4)
+        self.linear_spatial = nn.Linear(c_in, 1 + 1 + 2 + 4, bias=False)
+
+        # Global: value(3) + misc(10) + moremisc(8) via linear then mean-pool
+        self.linear_vmm = nn.Linear(c_in, 3 + 10 + 8)
+
+        # Score belief (unchanged)
+        self.linear_v1 = nn.Linear(c_in, c_v1, bias=True)
+        self.gpool = KataValueHeadGPool()
+        self.linear_s2mix = nn.Linear(3 * c_v1, c_sv2 + num_scorebeliefs, bias=True)
+        self.linear_s2off = nn.Linear(1, c_sv2, bias=False)
+        self.linear_s2par = nn.Linear(1, c_sv2, bias=False)
+        self.linear_s3 = nn.Linear(c_sv2, num_scorebeliefs, bias=True)
+
+        self.register_buffer("score_belief_offset_vector", torch.tensor(
+            [(float(i - self.scorebelief_mid) + 0.5) for i in range(self.scorebelief_len)],
+            dtype=torch.float32,
+        ), persistent=False)
+        self.register_buffer("score_belief_offset_bias_vector", torch.tensor(
+            [0.05 * (float(i - self.scorebelief_mid) + 0.5) for i in range(self.scorebelief_len)],
+            dtype=torch.float32,
+        ), persistent=False)
+        self.register_buffer("score_belief_parity_vector", torch.tensor(
+            [0.5 - float((i - self.scorebelief_mid) % 2) for i in range(self.scorebelief_len)],
+            dtype=torch.float32,
+        ), persistent=False)
+
+    def forward(self, x_nlc, mask, mask_sum_hw, input_global):
+        N, L, _ = x_nlc.shape
+        H = W = self.pos_len
+
+        # Per-position outputs directly from x_nlc
+        spatial = self.linear_spatial(x_nlc)  # (N, L, 8)
+        if mask is not None:
+            spatial = spatial * mask.view(N, L, 1)
+        spatial = spatial.permute(0, 2, 1).view(N, 8, H, W)
+        out_ownership, out_scoring, out_futurepos, out_seki = spatial.split([1, 1, 2, 4], dim=1)
+
+        # Global features: linear then mean-pool
+        vmm = self.linear_vmm(x_nlc)  # (N, L, 21)
+        if mask is not None:
+            vmm = vmm * mask.view(N, L, 1)
+            vmm = vmm.sum(dim=1) / mask_sum_hw.view(N, 1)
+        else:
+            vmm = vmm.mean(dim=1)
+        out_value, out_misc, out_moremisc = vmm.split([3, 10, 8], dim=-1)
+
+        # Score belief (unchanged)
+        outv1 = self.linear_v1(x_nlc)
+        if mask is not None:
+            outv1 = outv1 * mask.view(N, L, 1)
+        outv1 = F.silu(outv1)
+        outv1_nchw = outv1.permute(0, 2, 1).view(N, self.c_v1, H, W)
+        pooled = self.gpool(outv1_nchw, mask, mask_sum_hw)
+
         batch_size = N
         s2_out, outsmix = self.linear_s2mix(pooled).split([self.c_sv2, self.num_scorebeliefs], dim=-1)
         outsv2 = (
@@ -447,19 +445,18 @@ class Model(nn.Module):
         self.norm_final = RMSNormFP32(self.c_trunk, eps=1e-6)
 
         # Heads
-        c_p1 = config["p1_num_channels"]
-        c_g1 = config["g1_num_channels"]
         c_v1 = config["v1_num_channels"]
         c_v2 = config["v2_size"]
         c_sv2 = config["sbv2_num_channels"]
         num_scorebeliefs = config["num_scorebeliefs"]
 
-        policy_head_type = config.get("policy_head_type", "full")
-        if policy_head_type == "simple-linear":
-            self.policy_head = SimplePolicyHeadLinear(self.c_trunk, pos_len)
+        self.policy_head = PolicyHead(self.c_trunk, pos_len)
+
+        value_head_type = config.get("value_head_type", "full")
+        if value_head_type == "simple-linear":
+            self.value_head = SimpleValueHead(self.c_trunk, c_v1, c_sv2, num_scorebeliefs, pos_len)
         else:
-            self.policy_head = PolicyHead(self.c_trunk, c_p1, c_g1, pos_len)
-        self.value_head = ValueHead(self.c_trunk, c_v1, c_v2, c_sv2, num_scorebeliefs, pos_len)
+            self.value_head = ValueHead(self.c_trunk, c_v1, c_v2, c_sv2, num_scorebeliefs, pos_len)
 
         # Seki 动态权重的移动平均状态
         self.moving_unowned_proportion_sum = 0.0
@@ -542,23 +539,31 @@ class Model(nn.Module):
             out_scorebelief,
         ) = outputs
 
+        td_score_multiplier = 20.0
+        scoremean_multiplier = 20.0
+        scorestdev_multiplier = 20.0
+        lead_multiplier = 20.0
+        variance_time_multiplier = 40.0
+        shortterm_value_error_multiplier = 0.25
+        shortterm_score_error_multiplier = 150.0
+
         policy_logits = out_policy
         value_logits = out_value
         td_value_logits = torch.stack(
             (out_misc[:, 4:7], out_misc[:, 7:10], out_moremisc[:, 2:5]), dim=1
         )
-        pred_td_score = out_moremisc[:, 5:8] * self.value_head.td_score_multiplier
+        pred_td_score = out_moremisc[:, 5:8] * td_score_multiplier
         ownership_pretanh = out_ownership
         pred_scoring = out_scoring
         futurepos_pretanh = out_futurepos
         seki_logits = out_seki
-        pred_scoremean = out_misc[:, 0] * self.value_head.scoremean_multiplier
-        pred_scorestdev = SoftPlusWithGradientFloor.apply(out_misc[:, 1], 0.05, False) * self.value_head.scorestdev_multiplier
-        pred_lead = out_misc[:, 2] * self.value_head.lead_multiplier
-        pred_variance_time = SoftPlusWithGradientFloor.apply(out_misc[:, 3], 0.05, False) * self.value_head.variance_time_multiplier
+        pred_scoremean = out_misc[:, 0] * scoremean_multiplier
+        pred_scorestdev = SoftPlusWithGradientFloor.apply(out_misc[:, 1], 0.05, False) * scorestdev_multiplier
+        pred_lead = out_misc[:, 2] * lead_multiplier
+        pred_variance_time = SoftPlusWithGradientFloor.apply(out_misc[:, 3], 0.05, False) * variance_time_multiplier
 
-        pred_shortterm_value_error = SoftPlusWithGradientFloor.apply(out_moremisc[:, 0], 0.05, True) * self.value_head.shortterm_value_error_multiplier
-        pred_shortterm_score_error = SoftPlusWithGradientFloor.apply(out_moremisc[:, 1], 0.05, True) * self.value_head.shortterm_score_error_multiplier
+        pred_shortterm_value_error = SoftPlusWithGradientFloor.apply(out_moremisc[:, 0], 0.05, True) * shortterm_value_error_multiplier
+        pred_shortterm_score_error = SoftPlusWithGradientFloor.apply(out_moremisc[:, 1], 0.05, True) * shortterm_score_error_multiplier
 
         scorebelief_logits = out_scorebelief
 
@@ -727,8 +732,8 @@ def compute_loss(
     loss_td_value2 = td_loss_weighted[:, 1].sum()
     loss_td_value3 = td_loss_weighted[:, 2].sum()
 
-    loss_td_score = 0.0004 * (global_weight * target_weight_ownership * torch.sum(
-        huber_loss(pred_td_score, target_td_score, delta=12.0), dim=1
+    loss_td_score = 0.0048 * (global_weight * target_weight_ownership * torch.sum(
+        F.huber_loss(pred_td_score, target_td_score, reduction="none", delta=12.0), dim=1
     )).sum()
 
     # --- Spatial losses ---
@@ -779,8 +784,8 @@ def compute_loss(
     loss_seki = (global_weight * seki_weight_scale * target_weight_ownership * (loss_sign + 0.5 * loss_neutral) / mask_sum_hw).sum()
 
     # --- Score belief losses ---
-    loss_scoremean = 0.0015 * (global_weight * target_weight_ownership * huber_loss(
-        pred_scoremean, target_scoremean, delta=12.0
+    loss_scoremean = 0.018 * (global_weight * target_weight_ownership * F.huber_loss(
+        pred_scoremean, target_scoremean, reduction="none", delta=12.0
     )).sum()
 
     pred_cdf = torch.cumsum(F.softmax(scorebelief_logits, dim=1), dim=1)
@@ -798,14 +803,14 @@ def compute_loss(
     sb_offset = model.value_head.score_belief_offset_vector.view(1, -1)
     expected_score = torch.sum(sb_probs * sb_offset, dim=1, keepdim=True)
     stdev_of_belief = torch.sqrt(0.001 + torch.sum(sb_probs * torch.square(sb_offset - expected_score), dim=1))
-    loss_scorestdev = 0.001 * (global_weight * huber_loss(pred_scorestdev, stdev_of_belief, delta=10.0)).sum()
+    loss_scorestdev = 0.01 * (global_weight * F.huber_loss(pred_scorestdev, stdev_of_belief, reduction="none", delta=10.0)).sum()
 
-    loss_lead = 0.0060 * (global_weight * target_weight_lead * huber_loss(
-        pred_lead, target_lead, delta=8.0
+    loss_lead = 0.048 * (global_weight * target_weight_lead * F.huber_loss(
+        pred_lead, target_lead, reduction="none", delta=8.0
     )).sum()
 
-    loss_variance_time = 0.0003 * (global_weight * target_weight_ownership * huber_loss(
-        pred_variance_time, target_variance_time + 1e-5, delta=50.0
+    loss_variance_time = 0.015 * (global_weight * target_weight_ownership * F.huber_loss(
+        pred_variance_time, target_variance_time + 1e-5, reduction="none", delta=50.0
     )).sum()
 
     # Shortterm error losses
@@ -813,15 +818,15 @@ def compute_loss(
     predvalue = (td_val_pred_probs[:, 0] - td_val_pred_probs[:, 1]).detach()
     realvalue = target_td_value[:, 2, 0] - target_td_value[:, 2, 1]
     sqerror_v = torch.square(predvalue - realvalue) + 1e-8
-    loss_st_value_error = 2.0 * (global_weight * target_weight_ownership * huber_loss(
-        pred_shortterm_value_error, sqerror_v, delta=0.4
+    loss_st_value_error = 0.8 * (global_weight * target_weight_ownership * F.huber_loss(
+        pred_shortterm_value_error, sqerror_v, reduction="none", delta=0.4
     )).sum()
 
     predscore = pred_td_score[:, 2].detach()
     realscore = target_td_score[:, 2]
     sqerror_s = torch.square(predscore - realscore) + 1e-4
-    loss_st_score_error = 0.00002 * (global_weight * target_weight_ownership * huber_loss(
-        pred_shortterm_score_error, sqerror_s, delta=100.0
+    loss_st_score_error = 0.002 * (global_weight * target_weight_ownership * F.huber_loss(
+        pred_shortterm_score_error, sqerror_s, reduction="none", delta=100.0
     )).sum()
 
     # --- Total loss (对齐 metrics_pytorch.py 的 loss_sum，再除以 N 取 mean) ---
@@ -907,8 +912,7 @@ def main():
     parser.add_argument("-val-every-samples", type=int, default=1000000, help="Run validation every N samples")
     parser.add_argument("-warmup-samples", type=int, default=2000000, help="LR warmup samples")
     parser.add_argument("-enable-history-matrices", action="store_true", help="Enable history matrices (for Go)")
-    parser.add_argument("-policy-head-type", type=str, default="full", choices=["full", "simple-linear"], help="Policy head type")
-    parser.add_argument("-initial-checkpoint", type=str, default=None, help="Initial checkpoint to load from")
+parser.add_argument("-initial-checkpoint", type=str, default=None, help="Initial checkpoint to load from")
     parser.add_argument("-no-compile", action="store_true", help="Disable torch.compile")
     parser.add_argument("-soft-policy-weight-scale", type=float, default=8.0, help="Soft policy loss coeff")
     parser.add_argument("-value-loss-scale", type=float, default=0.6, help="Value loss coeff")
@@ -964,7 +968,6 @@ def main():
 
     # Model config
     model_config = modelconfigs.config_of_name[args.model_kind].copy()
-    model_config["policy_head_type"] = args.policy_head_type
     logging.info(f"Model config: {json.dumps(model_config, indent=2, default=str)}")
 
     pos_len = args.pos_len
