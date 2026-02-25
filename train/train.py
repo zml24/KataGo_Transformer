@@ -205,7 +205,7 @@ class PolicyHead(nn.Module):
 # ValueHead (NLC 输入, 1x1 conv -> Linear)
 # ---------------------------------------------------------------------------
 class ValueHead(nn.Module):
-    def __init__(self, c_in, c_v1, c_v2, c_sv2, num_scorebeliefs, pos_len):
+    def __init__(self, c_in, c_v1, c_v2, c_sv2, num_scorebeliefs, pos_len, simple_score_belief=False):
         super().__init__()
         self.pos_len = pos_len
         self.scorebelief_mid = pos_len * pos_len + EXTRA_SCORE_DISTR_RADIUS
@@ -213,6 +213,7 @@ class ValueHead(nn.Module):
         self.num_scorebeliefs = num_scorebeliefs
         self.c_sv2 = c_sv2
         self.c_v1 = c_v1
+        self.simple_score_belief = simple_score_belief
 
         # 空间 -> 通道 (替代 conv1)
         self.linear_v1 = nn.Linear(c_in, c_v1, bias=True)
@@ -229,8 +230,11 @@ class ValueHead(nn.Module):
         self.linear_fs = nn.Linear(c_in, 2 + 4, bias=False)
 
         # Score belief
-        # 合并 linear_s2 (3*c_v1→c_sv2) + linear_smix (3*c_v1→num_scorebeliefs)
-        self.linear_s2mix = nn.Linear(3 * c_v1, c_sv2 + num_scorebeliefs, bias=True)
+        if simple_score_belief:
+            self.linear_s2mix = nn.Linear(c_in, c_sv2 + num_scorebeliefs, bias=True)
+        else:
+            # 合并 linear_s2 (3*c_v1→c_sv2) + linear_smix (3*c_v1→num_scorebeliefs)
+            self.linear_s2mix = nn.Linear(3 * c_v1, c_sv2 + num_scorebeliefs, bias=True)
         self.linear_s2off = nn.Linear(1, c_sv2, bias=False)
         self.linear_s2par = nn.Linear(1, c_sv2, bias=False)
         self.linear_s3 = nn.Linear(c_sv2, num_scorebeliefs, bias=True)
@@ -248,11 +252,11 @@ class ValueHead(nn.Module):
             dtype=torch.float32,
         ), persistent=False)
 
-    def forward(self, x_nlc, mask, mask_sum_hw, input_global):
+    def forward(self, x_nlc, mask, mask_sum_hw, score_parity):
         """
         x_nlc: (N,L,C) 经过 final norm + act
         mask: (N,1,H,W) or None
-        input_global: (N, global_features)
+        score_parity: (N, 1) input_global 的最后一个特征
         """
         N, L, _ = x_nlc.shape
         H = W = self.pos_len
@@ -289,12 +293,19 @@ class ValueHead(nn.Module):
 
         # Score belief
         batch_size = N
-        s2_out, outsmix = self.linear_s2mix(pooled).split([self.c_sv2, self.num_scorebeliefs], dim=-1)
+        if self.simple_score_belief:
+            if mask is not None:
+                pooled_s = (x_nlc * mask.view(N, L, 1)).sum(dim=1) / mask_sum_hw.view(N, 1)
+            else:
+                pooled_s = x_nlc.mean(dim=1)
+            s2_out, outsmix = self.linear_s2mix(pooled_s).split([self.c_sv2, self.num_scorebeliefs], dim=-1)
+        else:
+            s2_out, outsmix = self.linear_s2mix(pooled).split([self.c_sv2, self.num_scorebeliefs], dim=-1)
         outsv2 = (
             s2_out.view(batch_size, 1, self.c_sv2)
             + self.linear_s2off(self.score_belief_offset_bias_vector.view(1, self.scorebelief_len, 1))
             + self.linear_s2par(
-                (self.score_belief_parity_vector.view(1, self.scorebelief_len) * input_global[:, -1:])
+                (self.score_belief_parity_vector.view(1, self.scorebelief_len) * score_parity)
                 .view(batch_size, self.scorebelief_len, 1)
             )
         )
@@ -316,7 +327,7 @@ class ValueHead(nn.Module):
 class SimpleValueHead(nn.Module):
     """Simplified value head: per-position linear for ownership/scoring,
     mean-pool linear for global features. Score belief unchanged."""
-    def __init__(self, c_in, c_v1, c_sv2, num_scorebeliefs, pos_len):
+    def __init__(self, c_in, c_v1, c_sv2, num_scorebeliefs, pos_len, simple_score_belief=False):
         super().__init__()
         self.pos_len = pos_len
         self.scorebelief_mid = pos_len * pos_len + EXTRA_SCORE_DISTR_RADIUS
@@ -324,6 +335,7 @@ class SimpleValueHead(nn.Module):
         self.num_scorebeliefs = num_scorebeliefs
         self.c_v1 = c_v1
         self.c_sv2 = c_sv2
+        self.simple_score_belief = simple_score_belief
 
         # Per-position: ownership(1) + scoring(1) + futurepos(2) + seki(4)
         self.linear_spatial = nn.Linear(c_in, 1 + 1 + 2 + 4, bias=False)
@@ -331,10 +343,13 @@ class SimpleValueHead(nn.Module):
         # Global: value(3) + misc(10) + moremisc(8) via linear then mean-pool
         self.linear_vmm = nn.Linear(c_in, 3 + 10 + 8)
 
-        # Score belief (unchanged)
-        self.linear_v1 = nn.Linear(c_in, c_v1, bias=True)
-        self.gpool = KataValueHeadGPool()
-        self.linear_s2mix = nn.Linear(3 * c_v1, c_sv2 + num_scorebeliefs, bias=True)
+        # Score belief
+        if simple_score_belief:
+            self.linear_s2mix = nn.Linear(c_in, c_sv2 + num_scorebeliefs, bias=True)
+        else:
+            self.linear_v1 = nn.Linear(c_in, c_v1, bias=True)
+            self.gpool = KataValueHeadGPool()
+            self.linear_s2mix = nn.Linear(3 * c_v1, c_sv2 + num_scorebeliefs, bias=True)
         self.linear_s2off = nn.Linear(1, c_sv2, bias=False)
         self.linear_s2par = nn.Linear(1, c_sv2, bias=False)
         self.linear_s3 = nn.Linear(c_sv2, num_scorebeliefs, bias=True)
@@ -352,7 +367,7 @@ class SimpleValueHead(nn.Module):
             dtype=torch.float32,
         ), persistent=False)
 
-    def forward(self, x_nlc, mask, mask_sum_hw, input_global):
+    def forward(self, x_nlc, mask, mask_sum_hw, score_parity):
         N, L, _ = x_nlc.shape
         H = W = self.pos_len
 
@@ -372,21 +387,27 @@ class SimpleValueHead(nn.Module):
             vmm = vmm.mean(dim=1)
         out_value, out_misc, out_moremisc = vmm.split([3, 10, 8], dim=-1)
 
-        # Score belief (unchanged)
-        outv1 = self.linear_v1(x_nlc)
-        if mask is not None:
-            outv1 = outv1 * mask.view(N, L, 1)
-        outv1 = F.silu(outv1)
-        outv1_nchw = outv1.permute(0, 2, 1).view(N, self.c_v1, H, W)
-        pooled = self.gpool(outv1_nchw, mask, mask_sum_hw)
-
+        # Score belief
         batch_size = N
-        s2_out, outsmix = self.linear_s2mix(pooled).split([self.c_sv2, self.num_scorebeliefs], dim=-1)
+        if self.simple_score_belief:
+            if mask is not None:
+                pooled_s = (x_nlc * mask.view(N, L, 1)).sum(dim=1) / mask_sum_hw.view(N, 1)
+            else:
+                pooled_s = x_nlc.mean(dim=1)
+            s2_out, outsmix = self.linear_s2mix(pooled_s).split([self.c_sv2, self.num_scorebeliefs], dim=-1)
+        else:
+            outv1 = self.linear_v1(x_nlc)
+            if mask is not None:
+                outv1 = outv1 * mask.view(N, L, 1)
+            outv1 = F.silu(outv1)
+            outv1_nchw = outv1.permute(0, 2, 1).view(N, self.c_v1, H, W)
+            pooled = self.gpool(outv1_nchw, mask, mask_sum_hw)
+            s2_out, outsmix = self.linear_s2mix(pooled).split([self.c_sv2, self.num_scorebeliefs], dim=-1)
         outsv2 = (
             s2_out.view(batch_size, 1, self.c_sv2)
             + self.linear_s2off(self.score_belief_offset_bias_vector.view(1, self.scorebelief_len, 1))
             + self.linear_s2par(
-                (self.score_belief_parity_vector.view(1, self.scorebelief_len) * input_global[:, -1:])
+                (self.score_belief_parity_vector.view(1, self.scorebelief_len) * score_parity)
                 .view(batch_size, self.scorebelief_len, 1)
             )
         )
@@ -453,10 +474,11 @@ class Model(nn.Module):
         self.policy_head = PolicyHead(self.c_trunk, pos_len)
 
         value_head_type = config.get("value_head_type", "full")
+        simple_score_belief = config.get("simple_score_belief", False)
         if value_head_type == "simple-linear":
-            self.value_head = SimpleValueHead(self.c_trunk, c_v1, c_sv2, num_scorebeliefs, pos_len)
+            self.value_head = SimpleValueHead(self.c_trunk, c_v1, c_sv2, num_scorebeliefs, pos_len, simple_score_belief)
         else:
-            self.value_head = ValueHead(self.c_trunk, c_v1, c_v2, c_sv2, num_scorebeliefs, pos_len)
+            self.value_head = ValueHead(self.c_trunk, c_v1, c_v2, c_sv2, num_scorebeliefs, pos_len, simple_score_belief)
 
         # Seki 动态权重的移动平均状态
         self.moving_unowned_proportion_sum = 0.0
@@ -525,7 +547,7 @@ class Model(nn.Module):
                 out_value, out_misc, out_moremisc,
                 out_ownership, out_scoring, out_futurepos, out_seki,
                 out_scorebelief,
-            ) = self.value_head(x, mask, mask_sum_hw, input_global)
+            ) = self.value_head(x, mask, mask_sum_hw, input_global[:, -1:])
 
         return (
             out_policy, out_value, out_misc, out_moremisc,
@@ -922,6 +944,7 @@ def main():
     parser.add_argument("-variance-time-loss-scale", type=float, default=1.0, help="Variance time loss coeff")
     parser.add_argument("-disable-optimistic-policy", action="store_true", help="Disable optimistic policy")
     parser.add_argument("-simple-value-head", action="store_true", help="Use simple linear value head")
+    parser.add_argument("-simple-score-belief", action="store_true", help="Use simple mean-pool score belief")
     parser.add_argument("-prefetch-batches", type=int, default=4, help="Prefetch queue depth (0=off, 2=recommended)")
     args = parser.parse_args()
 
@@ -972,6 +995,8 @@ def main():
     model_config = modelconfigs.config_of_name[args.model_kind].copy()
     if args.simple_value_head:
         model_config["value_head_type"] = "simple-linear"
+    if args.simple_score_belief:
+        model_config["simple_score_belief"] = True
     logging.info(f"Model config: {json.dumps(model_config, indent=2, default=str)}")
 
     pos_len = args.pos_len
