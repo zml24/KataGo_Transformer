@@ -133,50 +133,49 @@ class MuonOptimizer:
 
 @torch.compile
 def inv_quarter_sandwich(L, M, R):
-    """Newton-Schulz 迭代计算 L^{-1/4} @ M @ R^{-1/4}，固定 4 步。"""
+    """Newton-Schulz 迭代计算 L^{-1/4} @ M @ R^{-1/4}，固定 4 步，全 fp32。"""
     assert L.ndim == 2 and M.ndim == 2 and R.ndim == 2
     eps = 1e-4
-    Lc = L.bfloat16()
-    Mc = M.bfloat16()
-    Rc = R.bfloat16()
+    M = M.float()
 
-    m = Lc.size(-1)
-    n = Rc.size(-1)
-    I_L = torch.eye(m, device=L.device, dtype=torch.bfloat16)
-    I_R = torch.eye(n, device=L.device, dtype=torch.bfloat16)
+    m = L.size(-1)
+    n = R.size(-1)
+    I_L = torch.eye(m, device=L.device)
+    I_R = torch.eye(n, device=L.device)
 
     # Frobenius 范数归一化
-    tL = torch.sqrt((Lc * Lc.mT).sum())
-    tR = torch.sqrt((Rc * Rc.mT).sum())
-    Lc = Lc / tL + eps * I_L
-    Rc = Rc / tR + eps * I_R
+    tL = torch.sqrt((L * L.mT).sum())
+    tR = torch.sqrt((R * R.mT).sum())
+    L = L / tL + eps * I_L
+    R = R / tR + eps * I_R
 
     # 4 步 Newton-Schulz 迭代
     for a, b, c in _NS_COEFFS_R4_SCALED:
-        L2 = Lc @ Lc
-        WL = a * I_L + b * Lc + c * L2   # W_L = aI + bL + cL^2
+        L2 = L @ L
+        WL = a * I_L + b * L + c * L2
 
-        R2 = Rc @ Rc
-        WR = a * I_R + b * Rc + c * R2   # W_R = aI + bR + cR^2
+        R2 = R @ R
+        WR = a * I_R + b * R + c * R2
 
-        Mc = WL @ Mc @ WR                # s=1: M ← W_L M W_R
+        M = WL @ M @ WR
 
         # r=4: L ← L W_L^4, R ← R W_R^4
         WL4 = (WL @ WL) @ (WL @ WL)
         WR4 = (WR @ WR) @ (WR @ WR)
-        Lc = Lc @ WL4
-        Rc = Rc @ WR4
+        L = L @ WL4
+        R = R @ WR4
 
     # 反归一化: 乘回 tL^{-1/4}, tR^{-1/4}
-    Mc = Mc * (tL ** (-0.25)) * (tR ** (-0.25))
-    return Mc
+    M = M * (tL ** (-0.25)) * (tR ** (-0.25))
+    return M
 
 
 class ShampooOptimizer:
     """Shampoo 优化器：L/R 预条件矩阵的 EMA + 矩阵逆根。"""
 
-    def __init__(self, named_params, momentum, wd, beta2=0.999, device="cuda"):
+    def __init__(self, named_params, lr_multiplier, momentum, wd, beta2=0.999, device="cuda"):
         self.named_params = named_params  # {name: param}
+        self.lr_multiplier = lr_multiplier
         self.momentum = momentum
         self.wd = wd
         self.beta2 = beta2
@@ -199,6 +198,7 @@ class ShampooOptimizer:
 
     def step(self, base_lr):
         self.step_count += 1
+        shampoo_lr = base_lr * self.lr_multiplier
         bias_corr1 = 1 - self.momentum ** self.step_count   # 一阶矩偏差校正
         bias_corr2 = 1 - self.beta2 ** self.step_count      # 二阶矩偏差校正
         rms_sum = torch.tensor(0.0, device=self._device)
@@ -232,13 +232,13 @@ class ShampooOptimizer:
                     state["L"] / bias_corr2, momentum_2d_hat, state["R"] / bias_corr2,
                 )
                 # 累积 precond RMS
-                rms_sum += precond.norm() / precond.numel() ** 0.5
+                rms_sum += precond.norm() * self.lr_multiplier / precond.numel() ** 0.5
                 rms_cnt += 1
                 precond = precond.view(original_shape)
 
                 # 权重衰减 + 参数更新
                 p.mul_(1 - base_lr * self.wd)
-                p.add_(precond.to(p.dtype), alpha=-base_lr)
+                p.add_(precond.to(p.dtype), alpha=-shampoo_lr)
 
         self.last_precond_rms = (rms_sum / rms_cnt).item() if rms_cnt > 0 else 0.0
 
@@ -1082,6 +1082,7 @@ def main():
                         help="Muon update scale: moonlight=sqrt(max(m,n)), mup=sqrt(max(1,m/n))")
     parser.add_argument("-shampoo-scope", type=str, default="off", choices=["all", "blocks", "off"],
                         help="Shampoo scope: all=all 2D non-norm params, blocks=only blocks.* params, off=disabled")
+    parser.add_argument("-shampoo-lr-multiplier", type=float, default=1.0, help="Shampoo LR multiplier over base lr")
     parser.add_argument("-shampoo-momentum", type=float, default=0.9, help="Shampoo momentum beta")
     parser.add_argument("-shampoo-beta2", type=float, default=0.999, help="Shampoo L/R EMA coefficient")
     parser.add_argument("-init-std", type=float, default=0.02, help="Init std for weights (Megatron-LM style)")
@@ -1238,8 +1239,8 @@ def main():
         momentum=args.muon_momentum, wd=args.wd, scale_mode=args.muon_scale, device=device,
     ) if muon_params else None
     shampoo_opt = ShampooOptimizer(
-        shampoo_params, momentum=args.shampoo_momentum,
-        wd=args.wd, beta2=args.shampoo_beta2, device=device,
+        shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
+        momentum=args.shampoo_momentum, wd=args.wd, beta2=args.shampoo_beta2, device=device,
     ) if shampoo_params else None
     adam_opt = AdamOptimizer(
         adam_params, wd=args.wd, beta1=0.9, beta2=0.95, device=device,
