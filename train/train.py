@@ -42,7 +42,7 @@ _NS_COEFFS_R4_SCALED = (
     (3.7745392156862745, -9.830711636812923, 7.211935063687831),
     (1.7744313725490195, -0.5323686439402083, 0.05420935725061334),
     (1.4744509803921568, -0.5384714581368423, 0.10138210476839715),
-    (1.3786764705882353, -0.5094735805293277, 0.13074301029260285)，
+    (1.3786764705882353, -0.5094735805293277, 0.13074301029260285),
 )
 
 @torch.compile
@@ -189,6 +189,7 @@ class ShampooOptimizer:
         self.step_count += 1
         bias_corr1 = 1 - self.momentum ** self.step_count   # 一阶矩偏差校正
         bias_corr2 = 1 - self.beta2 ** self.step_count      # 二阶矩偏差校正
+        ratios = []
         with torch.no_grad():
             for name, p in self.named_params.items():
                 if p.grad is None:
@@ -217,11 +218,16 @@ class ShampooOptimizer:
                 precond = inv_quarter_sandwich(
                     state["L"] / bias_corr2, momentum_2d_hat, state["R"] / bias_corr2,
                 )
+                # 记录 precond RMS（用于诊断 match Adam RMS）
+                rms = precond.norm().item() / min(precond.size()) ** 0.5
+                ratios.append(rms)
                 precond = precond.view(original_shape)
 
                 # 权重衰减 + 参数更新
                 p.mul_(1 - base_lr * self.wd)
                 p.add_(precond.to(p.dtype), alpha=-base_lr)
+
+        self.last_precond_rms = sum(ratios) / len(ratios) if ratios else 0.0
 
     def state_dict(self):
         result = {name: {k: v.cpu() for k, v in s.items()} for name, s in self.states.items()}
@@ -484,9 +490,10 @@ class ValueHead(nn.Module):
                 )
             mix_log_weights = F.log_softmax(mix_logits, dim=1)
             out_scorebelief_logprobs = F.log_softmax(belief_logits, dim=1)
-            out_scorebelief_logprobs = torch.logsumexp(
-                out_scorebelief_logprobs + mix_log_weights.view(-1, 1, self.num_scorebeliefs), dim=2
-            )
+            with torch.amp.autocast(out_scorebelief_logprobs.device.type, enabled=False):
+                out_scorebelief_logprobs = torch.logsumexp(
+                    out_scorebelief_logprobs.float() + mix_log_weights.float().view(-1, 1, self.num_scorebeliefs), dim=2
+                )
 
         return (
             out_value, out_misc, out_moremisc,
@@ -597,22 +604,18 @@ class Model(nn.Module):
         # 最终归一化
         x = self.norm_final(x)
 
-        # 输出头在 fp32 下计算，保证数值稳定性（禁用 autocast 防止 linear 被降回 bf16）
-        x = x.float()
-        input_global = input_global.float()
-
-        with torch.amp.autocast(x.device.type, enabled=False):
-            out_policy = self.policy_head(x, mask, mask_sum_hw)
-            (
-                out_value, out_misc, out_moremisc,
-                out_ownership, out_scoring, out_futurepos, out_seki,
-                out_scorebelief,
-            ) = self.value_head(x, mask, mask_sum_hw, input_global[:, -1:])
-
-        return (
-            out_policy, out_value, out_misc, out_moremisc,
+        # 输出头（在 autocast 下运行，输出转 float 保证后续数值稳定）
+        out_policy = self.policy_head(x, mask, mask_sum_hw)
+        (
+            out_value, out_misc, out_moremisc,
             out_ownership, out_scoring, out_futurepos, out_seki,
             out_scorebelief,
+        ) = self.value_head(x, mask, mask_sum_hw, input_global[:, -1:])
+
+        return (
+            out_policy.float(), out_value.float(), out_misc.float(), out_moremisc.float(),
+            out_ownership.float(), out_scoring.float(), out_futurepos.float(), out_seki.float(),
+            out_scorebelief.float(),
         )
 
     def postprocess(self, outputs):
@@ -987,7 +990,7 @@ def main():
     parser.add_argument("-model-kind", type=str, default="b14c192h6tfrs-bng-silu", help="Model config name")
     parser.add_argument("-lr", type=float, default=3e-4, help="Peak learning rate")
     parser.add_argument("-wd", type=float, default=0.1, help="Weight decay")
-    parser.add_argument("-muon-scope", type=str, default="all", choices=["all", "blocks", "off"],
+    parser.add_argument("-muon-scope", type=str, default="off", choices=["all", "blocks", "off"],
                         help="Muon scope: all=all 2D non-norm params, blocks=only blocks.* params, off=pure AdamW")
     parser.add_argument("-muon-momentum", type=float, default=0.95, help="Muon momentum beta")
     parser.add_argument("-muon-lr-multiplier", type=float, default=0.2, help="Muon LR multiplier over base lr")
@@ -1232,6 +1235,7 @@ def main():
     running = {k: 0.0 for k in _metric_keys}
     running["count"] = 0
     running["grad_norm"] = 0.0
+    running["shampoo_precond_rms"] = 0.0
 
     def reset_running():
         for k in running:
@@ -1260,6 +1264,8 @@ def main():
                 tb_writer.add_scalar(f"train/{k}", running[k] / weight_sum, total_samples_trained)
             tb_writer.add_scalar("train/lr", scheduler.get_last_lr()[0], total_samples_trained)
             tb_writer.add_scalar("train/grad_norm", running["grad_norm"] / batch_count, total_samples_trained)
+            if shampoo_opt is not None:
+                tb_writer.add_scalar("train/shampoo_precond_rms", running["shampoo_precond_rms"] / batch_count, total_samples_trained)
 
     # 开始训练
     logging.info("=" * 60)
@@ -1337,6 +1343,8 @@ def main():
             for k in metrics:
                 running[k] += metrics[k]
             running["grad_norm"] += grad_norm.item()
+            if shampoo_opt is not None:
+                running["shampoo_precond_rms"] += shampoo_opt.last_precond_rms
             running["count"] += 1
 
             if global_step % args.print_every == 0:
