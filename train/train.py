@@ -16,8 +16,6 @@ import logging
 import json
 import glob
 import numpy as np
-from itertools import repeat
-from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -28,58 +26,226 @@ import data_processing_pytorch
 
 
 # ---------------------------------------------------------------------------
-# Muon optimizer helpers
+# Muon 优化器辅助
 # ---------------------------------------------------------------------------
-polar_express_coeffs = [
+# Newton-Schulz 迭代系数，用于矩阵正交化（zeropower）
+_POLAR_EXPRESS_COEFFS = [
     (8.156554524902461, -22.48329292557795, 15.878769915207462),
     (4.042929935166739, -2.808917465908714, 0.5000178451051316),
     (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
     (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+# Newton-Schulz 系数，用于矩阵逆 4 次根（Shampoo 预条件）
+_NS_COEFFS_R4_SCALED = (
+    (3.7745392156862745, -9.830711636812923, 7.211935063687831),
+    (1.7744313725490195, -0.5323686439402083, 0.05420935725061334),
+    (1.4744509803921568, -0.5384714581368423, 0.10138210476839715),
+    (1.3786764705882353, -0.5094735805293277, 0.13074301029260285)，
+)
+
 @torch.compile
-def zeropower_via_newtonschulz5(G, steps: int):
-    """Newton-Schulz iteration for matrix orthogonalization."""
+def polar_express(G):
+    """Newton-Schulz 迭代实现矩阵正交化，固定 5 步。"""
     assert G.ndim == 2
     X = G.bfloat16()
     if G.size(0) > G.size(1):
         X = X.mT
+
+    # 范数归一化
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-7)
-    for i in range(steps):
-        a, b, c = polar_express_coeffs[i]
+
+    # 5 步 Newton-Schulz 迭代
+    for a, b, c in _POLAR_EXPRESS_COEFFS:
         A = X @ X.mT
         B = b * A + c * A @ A
         X = a * X + B @ X
+
+    # 恢复转置
     if G.size(0) > G.size(1):
         X = X.mT
     return X
 
-def muon_update(grad, momentum_buf, beta=0.95, ns_steps=5, scale_mode="moonlight"):
-    """Muon update: momentum + Newton-Schulz orthogonalization."""
-    momentum_buf.mul_(beta).add_(grad)
-    update = momentum_buf
-    original_shape = update.shape
-    if update.ndim == 4:
-        update = update.view(update.size(0), -1)
-    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
-    if scale_mode == "moonlight":
-        update = update * max(update.size()) ** 0.5
-    else:  # mup
-        update = update * max(1, update.size(0) / update.size(1)) ** 0.5
-    if len(original_shape) == 4:
-        update = update.view(original_shape)
-    return update
+class MuonOptimizer:
+    """Muon 优化器：动量 + Newton-Schulz 正交化。"""
+
+    def __init__(self, named_params, lr_multiplier, momentum, wd, scale_mode="moonlight"):
+        self.named_params = named_params  # {name: param}
+        self.lr_multiplier = lr_multiplier
+        self.momentum = momentum
+        self.wd = wd
+        self.scale_mode = scale_mode
+        self.states = {name: self._init_state(p) for name, p in named_params.items()}
+
+    @staticmethod
+    def _init_state(p):
+        return {"momentum": torch.zeros_like(p)}
+
+    def step(self, base_lr):
+        muon_lr = base_lr * self.lr_multiplier
+        with torch.no_grad():
+            for name, p in self.named_params.items():
+                if p.grad is None:
+                    continue
+                assert p.grad.ndim in (2, 4), f"Muon 只支持 2D/4D 参数，got ndim={p.grad.ndim}"
+                state = self.states[name]
+                grad = p.grad
+                original_shape = grad.shape
+
+                # 动量累积
+                state["momentum"].mul_(self.momentum).add_(grad)
+                update = state["momentum"]
+                if update.ndim == 4:
+                    update = update.view(update.size(0), -1)
+
+                # Newton-Schulz 正交化 + 缩放
+                update = polar_express(update)
+                if self.scale_mode == "moonlight":
+                    update = update * max(update.size()) ** 0.5
+                else:  # mup
+                    update = update * max(1, update.size(0) / update.size(1)) ** 0.5
+                update = update.view(original_shape)
+
+                # 权重衰减 + 参数更新
+                p.mul_(1 - base_lr * self.wd)
+                p.add_(update.to(p.dtype), alpha=-muon_lr)
+
+    def state_dict(self):
+        return {name: {k: v.cpu() for k, v in s.items()} for name, s in self.states.items()}
+
+    def load_state_dict(self, saved, device):
+        for name, tensors in saved.items():
+            if name in self.states:
+                for k, v in tensors.items():
+                    self.states[name][k].copy_(v.to(device))
+
+
+@torch.compile
+def inv_quarter_sandwich(L, M, R):
+    """Newton-Schulz 迭代计算 L^{-1/4} @ M @ R^{-1/4}，固定 4 步。"""
+    assert L.ndim == 2 and M.ndim == 2 and R.ndim == 2
+    eps = 1e-4
+    Lc = L.bfloat16()
+    Mc = M.bfloat16()
+    Rc = R.bfloat16()
+
+    m = Lc.size(-1)
+    n = Rc.size(-1)
+    I_L = torch.eye(m, device=L.device, dtype=torch.bfloat16)
+    I_R = torch.eye(n, device=L.device, dtype=torch.bfloat16)
+
+    # Frobenius 范数归一化
+    tL = torch.sqrt((Lc * Lc.mT).sum())
+    tR = torch.sqrt((Rc * Rc.mT).sum())
+    Lc = Lc / tL + eps * I_L
+    Rc = Rc / tR + eps * I_R
+
+    # 4 步 Newton-Schulz 迭代
+    for a, b, c in _NS_COEFFS_R4_SCALED:
+        L2 = Lc @ Lc
+        WL = a * I_L + b * Lc + c * L2   # W_L = aI + bL + cL^2
+
+        R2 = Rc @ Rc
+        WR = a * I_R + b * Rc + c * R2   # W_R = aI + bR + cR^2
+
+        Mc = WL @ Mc @ WR                # s=1: M ← W_L M W_R
+
+        # r=4: L ← L W_L^4, R ← R W_R^4
+        WL4 = (WL @ WL) @ (WL @ WL)
+        WR4 = (WR @ WR) @ (WR @ WR)
+        Lc = Lc @ WL4
+        Rc = Rc @ WR4
+
+    # 反归一化: 乘回 tL^{-1/4}, tR^{-1/4}
+    Mc = Mc * (tL ** (-0.25)) * (tR ** (-0.25))
+    return Mc
+
+
+class ShampooOptimizer:
+    """Shampoo 优化器：L/R 预条件矩阵的 EMA + 矩阵逆根。"""
+
+    def __init__(self, named_params, momentum, wd, beta2=0.999, device="cuda"):
+        self.named_params = named_params  # {name: param}
+        self.momentum = momentum
+        self.wd = wd
+        self.beta2 = beta2
+        self.step_count = 0
+        self.states = {name: self._init_state(p, device) for name, p in named_params.items()}
+
+    @staticmethod
+    def _init_state(p, device):
+        if p.ndim >= 2:
+            m, n = p.shape[0], p.shape[1:].numel()
+        else:
+            m, n = p.shape[0], 1
+        return {
+            "momentum": torch.zeros_like(p),
+            "L": torch.zeros(m, m, dtype=torch.float32, device=device),
+            "R": torch.zeros(n, n, dtype=torch.float32, device=device),
+        }
+
+    def step(self, base_lr):
+        self.step_count += 1
+        bias_corr1 = 1 - self.momentum ** self.step_count   # 一阶矩偏差校正
+        bias_corr2 = 1 - self.beta2 ** self.step_count      # 二阶矩偏差校正
+        with torch.no_grad():
+            for name, p in self.named_params.items():
+                if p.grad is None:
+                    continue
+                assert p.grad.ndim in (2, 4), f"Shampoo 只支持 2D/4D 参数，got ndim={p.grad.ndim}"
+                state = self.states[name]
+                grad = p.grad
+                original_shape = grad.shape
+                if grad.ndim == 4:
+                    grad_2d = grad.view(grad.size(0), -1)
+                else:
+                    grad_2d = grad
+
+                # 一阶矩 EMA
+                state["momentum"].lerp_(grad, 1 - self.momentum)
+                momentum_2d = state["momentum"]
+                if momentum_2d.ndim == 4:
+                    momentum_2d = momentum_2d.view(momentum_2d.size(0), -1)
+                momentum_2d_hat = momentum_2d / bias_corr1
+
+                # 二阶矩 EMA（L/R 预条件矩阵）
+                state["L"].lerp_(grad_2d @ grad_2d.mT, 1 - self.beta2)
+                state["R"].lerp_(grad_2d.mT @ grad_2d, 1 - self.beta2)
+
+                # 预条件：L^{-1/4} @ m @ R^{-1/4}
+                precond = inv_quarter_sandwich(
+                    state["L"] / bias_corr2, momentum_2d_hat, state["R"] / bias_corr2,
+                )
+                precond = precond.view(original_shape)
+
+                # 权重衰减 + 参数更新
+                p.mul_(1 - base_lr * self.wd)
+                p.add_(precond.to(p.dtype), alpha=-base_lr)
+
+    def state_dict(self):
+        result = {name: {k: v.cpu() for k, v in s.items()} for name, s in self.states.items()}
+        result["__step_count__"] = self.step_count
+        return result
+
+    def load_state_dict(self, saved, device):
+        self.step_count = saved.get("__step_count__", 0)
+        for name, tensors in saved.items():
+            if name == "__step_count__":
+                continue
+            if name in self.states:
+                for k, v in tensors.items():
+                    self.states[name][k].copy_(v.to(device))
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# 常量
 # ---------------------------------------------------------------------------
 EXTRA_SCORE_DISTR_RADIUS = 60
 
 
 # ---------------------------------------------------------------------------
-# Helper functions
+# 辅助函数
 # ---------------------------------------------------------------------------
 class SoftPlusWithGradientFloor(torch.autograd.Function):
     @staticmethod
@@ -100,7 +266,6 @@ class SoftPlusWithGradientFloor(torch.autograd.Function):
 
 def cross_entropy(pred_logits, target_probs, dim):
     return -torch.sum(target_probs * F.log_softmax(pred_logits, dim=dim), dim=dim)
-
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +298,7 @@ def apply_rotary_emb(xq, xk, cos, sin):
 
 
 class RMSNormFP32(nn.Module):
-    """RMSNorm that always runs in float32 (disables autocast)."""
+    """始终在 float32 下运行的 RMSNorm（禁用 autocast）。"""
     def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.norm = nn.RMSNorm(dim, eps=eps)
@@ -144,7 +309,7 @@ class RMSNormFP32(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Transformer Block (NLC 格式, RoPE + GQA + SwiGLU + RMSNorm)
+# Transformer Block（NLC 格式，RoPE + GQA + SwiGLU + RMSNorm）
 # ---------------------------------------------------------------------------
 class TransformerBlock(nn.Module):
     def __init__(self, c_main: int, num_heads: int, num_kv_heads: int,
@@ -175,14 +340,14 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x, attn_mask=None):
         """
-        x: (N, L, C)   attn_mask: (N, 1, 1, L) additive mask, 0 or -inf
+        x: (N, L, C)   attn_mask: (N, 1, 1, L) 加性 mask，0 或 -inf
         """
         B, L, C = x.shape
-        xn = self.norm1(x)
+        x_normed = self.norm1(x)
 
-        q = self.q_proj(xn).view(B, L, self.num_heads, self.head_dim)
-        k = self.k_proj(xn).view(B, L, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(xn).view(B, L, self.num_kv_heads, self.head_dim)
+        q = self.q_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
+        k = self.k_proj(x_normed).view(B, L, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x_normed).view(B, L, self.num_kv_heads, self.head_dim)
 
         q, k = apply_rotary_emb(q, k, self.cos_cached, self.sin_cached)
 
@@ -201,22 +366,22 @@ class TransformerBlock(nn.Module):
         x = x + self.out_proj(attn_out)
 
         # SwiGLU FFN
-        xn = self.norm2(x)
-        x = x + self.ffn_w2(F.silu(self.ffn_w1(xn)) * self.ffn_wgate(xn))
+        x_normed = self.norm2(x)
+        x = x + self.ffn_w2(F.silu(self.ffn_w1(x_normed)) * self.ffn_wgate(x_normed))
         return x
 
 
 # ---------------------------------------------------------------------------
-# PolicyHead (NLC 输入)
+# PolicyHead（NLC 输入）
 # ---------------------------------------------------------------------------
 class PolicyHead(nn.Module):
-    """Per-position linear for board + global pool linear for pass."""
+    """逐位置投影（棋盘落子）+ 全局池化投影（pass）。"""
     def __init__(self, c_in, pos_len):
         super().__init__()
         self.pos_len = pos_len
         self.num_policy_outputs = 6
-        self.linear_board = nn.Linear(c_in, self.num_policy_outputs)
-        self.linear_pass = nn.Linear(c_in, self.num_policy_outputs)
+        self.linear_board = nn.Linear(c_in, self.num_policy_outputs, bias=False)
+        self.linear_pass = nn.Linear(c_in, self.num_policy_outputs, bias=False)
 
     def forward(self, x_nlc, mask, mask_sum_hw):
         N, L, _ = x_nlc.shape
@@ -231,7 +396,7 @@ class PolicyHead(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# ValueHead (NLC 输入, per-position linear + mean-pool linear)
+# ValueHead（NLC 输入，逐位置 + mean-pool 投影）
 # ---------------------------------------------------------------------------
 class ValueHead(nn.Module):
     def __init__(self, c_in, c_sv2, num_scorebeliefs, pos_len, score_mode="mixop"):
@@ -243,13 +408,13 @@ class ValueHead(nn.Module):
         self.c_sv2 = c_sv2
         self.score_mode = score_mode
 
-        # Per-position: ownership(1) + scoring(1) + futurepos(2) + seki(4)
-        self.linear_spatial = nn.Linear(c_in, 1 + 1 + 2 + 4, bias=False)
+        # 逐位置: ownership(1) + scoring(1) + futurepos(2) + seki(4)
+        # 全局（mean-pool）: value(3) + misc(10) + moremisc(8)
+        self.n_spatial = 1 + 1 + 2 + 4  # 8
+        self.n_global = 3 + 10 + 8      # 21
+        self.linear_sv = nn.Linear(c_in, self.n_spatial + self.n_global, bias=False)
 
-        # Global: value(3) + misc(10) + moremisc(8) via linear then mean-pool
-        self.linear_vmm = nn.Linear(c_in, 3 + 10 + 8)
-
-        # Score belief
+        # 分数信念头
         if score_mode == "simple":
             self.linear_s_simple = nn.Linear(c_in, self.scorebelief_len, bias=False)
         elif score_mode == "mix":
@@ -258,8 +423,6 @@ class ValueHead(nn.Module):
             self.linear_s_mix = nn.Linear(c_in, self.scorebelief_len * num_scorebeliefs + num_scorebeliefs, bias=False)
             self.linear_s2off = nn.Linear(1, num_scorebeliefs, bias=False)
             self.linear_s2par = nn.Linear(1, num_scorebeliefs, bias=False)
-        else:
-            raise ValueError(f"Unknown score_mode: {score_mode}")
 
         self.register_buffer("score_belief_offset_vector", torch.tensor(
             [(float(i - self.scorebelief_mid) + 0.5) for i in range(self.scorebelief_len)],
@@ -279,23 +442,25 @@ class ValueHead(nn.Module):
         N, L, _ = x_nlc.shape
         H = W = self.pos_len
 
-        # Per-position outputs directly from x_nlc
-        spatial = self.linear_spatial(x_nlc)  # (N, L, 8)
+        # 合并投影：逐位置特征 + 全局特征
+        spatial_global = self.linear_sv(x_nlc)  # (N, L, n_spatial + n_global)
+        spatial, global_feats = spatial_global.split([self.n_spatial, self.n_global], dim=-1)
+
+        # 逐位置输出：ownership / scoring / futurepos / seki
         if mask is not None:
             spatial = spatial * mask.view(N, L, 1)
-        spatial = spatial.permute(0, 2, 1).view(N, 8, H, W)
+        spatial = spatial.permute(0, 2, 1).view(N, self.n_spatial, H, W)
         out_ownership, out_scoring, out_futurepos, out_seki = spatial.split([1, 1, 2, 4], dim=1)
 
-        # Global features: linear then mean-pool
-        vmm = self.linear_vmm(x_nlc)  # (N, L, 21)
+        # 全局输出：mean-pool → value / misc / moremisc
         if mask is not None:
-            vmm = vmm * mask.view(N, L, 1)
-            vmm = vmm.sum(dim=1) / mask_sum_hw.view(N, 1)
+            global_feats = global_feats * mask.view(N, L, 1)
+            global_feats = global_feats.sum(dim=1) / mask_sum_hw.view(N, 1)
         else:
-            vmm = vmm.mean(dim=1)
-        out_value, out_misc, out_moremisc = vmm.split([3, 10, 8], dim=-1)
+            global_feats = global_feats.mean(dim=1)
+        out_value, out_misc, out_moremisc = global_feats.split([3, 10, 8], dim=-1)
 
-        # Score belief
+        # 分数信念：先 mean-pool 再投影
         if mask is not None:
             pooled_s = (x_nlc * mask.view(N, L, 1)).sum(dim=1) / mask_sum_hw.view(N, 1)
         else:
@@ -303,24 +468,24 @@ class ValueHead(nn.Module):
         if self.score_mode == "simple":
             out_scorebelief_logprobs = F.log_softmax(self.linear_s_simple(pooled_s), dim=1)
         elif self.score_mode in ("mix", "mixop"):
-            s_out = self.linear_s_mix(pooled_s)
-            outsv3, outsmix = s_out.split(
+            score_proj = self.linear_s_mix(pooled_s)
+            belief_logits, mix_logits = score_proj.split(
                 [self.scorebelief_len * self.num_scorebeliefs, self.num_scorebeliefs], dim=-1
             )
-            outsv3 = outsv3.view(N, self.scorebelief_len, self.num_scorebeliefs)
+            belief_logits = belief_logits.view(N, self.scorebelief_len, self.num_scorebeliefs)
             if self.score_mode == "mixop":
-                outsv3 = (
-                    outsv3
+                belief_logits = (
+                    belief_logits
                     + self.linear_s2off(self.score_belief_offset_bias_vector.view(1, self.scorebelief_len, 1))
                     + self.linear_s2par(
                         (self.score_belief_parity_vector.view(1, self.scorebelief_len) * score_parity)
                         .view(N, self.scorebelief_len, 1)
                     )
                 )
-            outsmix_logweights = F.log_softmax(outsmix, dim=1)
-            out_scorebelief_logprobs = F.log_softmax(outsv3, dim=1)
+            mix_log_weights = F.log_softmax(mix_logits, dim=1)
+            out_scorebelief_logprobs = F.log_softmax(belief_logits, dim=1)
             out_scorebelief_logprobs = torch.logsumexp(
-                out_scorebelief_logprobs + outsmix_logweights.view(-1, 1, self.num_scorebeliefs), dim=2
+                out_scorebelief_logprobs + mix_log_weights.view(-1, 1, self.num_scorebeliefs), dim=2
             )
 
         return (
@@ -347,14 +512,14 @@ class Model(nn.Module):
         ffn_dim = config.get("transformer_ffn_channels", self.c_trunk * 2)
         rope_theta = config.get("rope_theta", 100.0)
 
-        # Stem
+        # 输入编码（Stem）
         if config.get("initial_conv_1x1", False):
             self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=1, padding="same", bias=False)
         else:
             self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
         self.linear_global = nn.Linear(num_global_features, self.c_trunk, bias=False)
 
-        # Transformer blocks
+        # Transformer 块
         self.blocks = nn.ModuleList()
         for _ in config["block_kind"]:
             self.blocks.append(TransformerBlock(
@@ -366,10 +531,10 @@ class Model(nn.Module):
                 rope_theta=rope_theta,
             ))
 
-        # Trunk final norm
+        # Trunk 最终归一化
         self.norm_final = RMSNormFP32(self.c_trunk, eps=1e-6)
 
-        # Heads
+        # 输出头
         c_sv2 = config["sbv2_num_channels"]
         num_scorebeliefs = config["num_scorebeliefs"]
 
@@ -381,10 +546,10 @@ class Model(nn.Module):
         self.moving_unowned_proportion_weight = 0.0
 
     def initialize(self, init_std=0.02):
-        """Megatron-LM style initialization.
-        - All weights: normal(0, init_std)
-        - Output projections (out_proj, ffn_w2 in each block): normal(0, init_std / sqrt(2*N))
-        - All biases: zero
+        """Megatron-LM 风格初始化:
+        - 所有权重: normal(0, init_std)
+        - 输出投影 (out_proj, ffn_w2): normal(0, init_std / sqrt(2*N_blocks))
+        - 所有偏置: 零
         """
         num_blocks = len(self.blocks)
         output_std = init_std / math.sqrt(2.0 * num_blocks)
@@ -395,7 +560,7 @@ class Model(nn.Module):
                 if "norm" not in name:
                     nn.init.zeros_(p)
             else:
-                # Check if this is an output projection in a transformer block
+                # Transformer block 的输出投影使用更小的初始化标准差
                 if ".out_proj." in name or ".ffn_w2." in name:
                     nn.init.normal_(p, mean=0.0, std=output_std)
                 else:
@@ -410,29 +575,29 @@ class Model(nn.Module):
         H = W = self.pos_len
         L = H * W
 
-        # Mask
+        # 掩码：第 0 通道表示合法位置
         mask = input_spatial[:, 0:1, :, :].contiguous()  # (N, 1, H, W)
         mask_sum_hw = torch.sum(mask, dim=(2, 3), keepdim=True)  # (N, 1, 1, 1)
 
-        # Stem: NCHW -> NLC
+        # Stem: NCHW → NLC
         x_spatial = self.conv_spatial(input_spatial)         # (N, C, H, W)
         x_global = self.linear_global(input_global)          # (N, C)
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1) # (N, C, H, W)
         x = x.view(N, self.c_trunk, L).permute(0, 2, 1)     # (N, L, C)
 
-        # Attention mask: (N, 1, 1, L) additive
+        # 注意力掩码: (N, 1, 1, L) 加性
         mask_flat = mask.view(N, 1, 1, L)
         attn_mask = torch.zeros_like(mask_flat, dtype=x.dtype)
         attn_mask.masked_fill_(mask_flat == 0, float("-inf"))
 
-        # Trunk
+        # Trunk: 逐层 Transformer 前向
         for block in self.blocks:
             x = block(x, attn_mask=attn_mask)
 
-        # Final norm
+        # 最终归一化
         x = self.norm_final(x)
 
-        # Heads 在 fp32 下计算以保证数值稳定性（禁用 autocast 防止 linear 被降回 bf16）
+        # 输出头在 fp32 下计算，保证数值稳定性（禁用 autocast 防止 linear 被降回 bf16）
         x = x.float()
         input_global = input_global.float()
 
@@ -495,7 +660,7 @@ class Model(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Loss computation (aligned with metrics_pytorch.py)
+# 损失计算（对齐 metrics_pytorch.py）
 # ---------------------------------------------------------------------------
 def compute_loss(
     model, postprocessed, batch, pos_len, is_training,
@@ -529,13 +694,13 @@ def compute_loss(
     H = W = pos_len
     policymask = torch.cat([mask.view(N, H * W), mask.new_ones(N, 1)], dim=1)
 
-    # Targets
+    # 目标分布
     target_policy_player = target_policy_ncmove[:, 0, :]
     target_policy_player = target_policy_player / torch.sum(target_policy_player, dim=1, keepdim=True)
     target_policy_opponent = target_policy_ncmove[:, 1, :]
     target_policy_opponent = target_policy_opponent / torch.sum(target_policy_opponent, dim=1, keepdim=True)
 
-    # Soft policy
+    # 软策略目标（0.25 次幂平滑）
     target_policy_player_soft = (target_policy_player + 1e-7) * policymask
     target_policy_player_soft = torch.pow(target_policy_player_soft, 0.25)
     target_policy_player_soft = target_policy_player_soft / torch.sum(target_policy_player_soft, dim=1, keepdim=True)
@@ -569,12 +734,12 @@ def compute_loss(
     target_futurepos = target_value_nchw[:, 2:4, :, :]
     target_scoring = target_value_nchw[:, 4, :, :] / 120.0
 
-    # --- Policy loss scales (对齐 metrics_pytorch.py) ---
+    # --- 策略损失系数（对齐 metrics_pytorch.py）---
     policy_opt_loss_scale = 0.93
     long_policy_opt_loss_scale = 0.1
     short_policy_opt_loss_scale = 0.2
 
-    # --- Policy losses ---
+    # --- 策略损失 ---
     loss_policy_player = (global_weight * target_weight_policy_player * cross_entropy(
         policy_logits[:, 0, :], target_policy_player, dim=1
     )).sum()
@@ -591,7 +756,7 @@ def compute_loss(
         policy_logits[:, 3, :], target_policy_opponent_soft, dim=1
     )).sum()
 
-    # --- Optimistic policy losses ---
+    # --- 乐观策略损失 ---
     if disable_optimistic_policy:
         target_weight_longopt = target_weight_policy_player * 0.5
         loss_longoptimistic_policy = (global_weight * target_weight_longopt * cross_entropy(
@@ -602,7 +767,7 @@ def compute_loss(
             policy_logits[:, 5, :], target_policy_player, dim=1
         )).sum()
     else:
-        # Long-term optimistic policy
+        # 长期乐观策略
         win_squared = torch.square(
             target_global[:, 0] + 0.5 * target_global[:, 2]
         )
@@ -617,7 +782,7 @@ def compute_loss(
             policy_logits[:, 4, :], target_policy_player, dim=1
         )).sum()
 
-        # Short-term optimistic policy
+        # 短期乐观策略
         shortterm_value_actual = target_global[:, 12] - target_global[:, 13]
         shortterm_value_pred = torch.softmax(td_value_logits[:, 2, :].detach(), dim=1)
         shortterm_value_pred = shortterm_value_pred[:, 0] - shortterm_value_pred[:, 1]
@@ -636,7 +801,7 @@ def compute_loss(
             policy_logits[:, 5, :], target_policy_player, dim=1
         )).sum()
 
-    # --- Value losses ---
+    # --- 价值损失 ---
     loss_value = 1.20 * (global_weight * target_weight_value * cross_entropy(
         value_logits, target_value, dim=1
     )).sum()
@@ -654,26 +819,26 @@ def compute_loss(
         F.huber_loss(pred_td_score, target_td_score, reduction="none", delta=12.0), dim=1
     )).sum()
 
-    # --- Spatial losses ---
-    # Ownership
+    # --- 空间损失 ---
+    # 所有权
     pred_own_logits = torch.cat([ownership_pretanh, -ownership_pretanh], dim=1).view(N, 2, pos_area)
     target_own_probs = torch.stack([(1.0 + target_ownership) / 2.0, (1.0 - target_ownership) / 2.0], dim=1).view(N, 2, pos_area)
     loss_ownership = 1.5 * (global_weight * target_weight_ownership * (
         torch.sum(cross_entropy(pred_own_logits, target_own_probs, dim=1) * mask.view(N, pos_area), dim=1) / mask_sum_hw
     )).sum()
 
-    # Scoring
+    # 计分
     loss_scoring_raw = torch.sum(torch.square(pred_scoring.squeeze(1) - target_scoring) * mask, dim=(1, 2)) / mask_sum_hw
     loss_scoring = (global_weight * target_weight_scoring * 4.0 * (torch.sqrt(loss_scoring_raw * 0.5 + 1.0) - 1.0)).sum()
 
-    # Futurepos
+    # 未来落子位置
     fp_loss = torch.square(torch.tanh(futurepos_pretanh) - target_futurepos) * mask.unsqueeze(1)
     fp_weight = torch.tensor([1.0, 0.25], device=fp_loss.device).view(1, 2, 1, 1)
     loss_futurepos = 0.25 * (global_weight * target_weight_futurepos * (
         torch.sum(fp_loss * fp_weight, dim=(1, 2, 3)) / torch.sqrt(mask_sum_hw)
     )).sum()
 
-    # Seki (动态权重，对齐 metrics_pytorch.py)
+    # Seki（动态权重，对齐 metrics_pytorch.py）
     owned_target = torch.square(target_ownership)
     unowned_target = 1.0 - owned_target
 
@@ -701,7 +866,7 @@ def compute_loss(
     loss_neutral = torch.sum(cross_entropy(neutral_pred, neutral_target, dim=1) * mask, dim=(1, 2))
     loss_seki = (global_weight * seki_weight_scale * target_weight_ownership * (loss_sign + 0.5 * loss_neutral) / mask_sum_hw).sum()
 
-    # --- Score belief losses ---
+    # --- 分数信念损失 ---
     loss_scoremean = 0.0015 * (global_weight * target_weight_ownership * F.huber_loss(
         pred_scoremean, target_scoremean, reduction="none", delta=12.0
     )).sum()
@@ -716,11 +881,11 @@ def compute_loss(
         scorebelief_logits, target_score_distribution, dim=1
     )).sum()
 
-    # Score stdev reg
-    sb_probs = F.softmax(scorebelief_logits, dim=1)
-    sb_offset = model.value_head.score_belief_offset_vector.view(1, -1)
-    expected_score = torch.sum(sb_probs * sb_offset, dim=1, keepdim=True)
-    stdev_of_belief = torch.sqrt(0.001 + torch.sum(sb_probs * torch.square(sb_offset - expected_score), dim=1))
+    # 分数标准差正则化
+    score_belief_probs = F.softmax(scorebelief_logits, dim=1)
+    score_belief_offsets = model.value_head.score_belief_offset_vector.view(1, -1)
+    expected_score = torch.sum(score_belief_probs * score_belief_offsets, dim=1, keepdim=True)
+    stdev_of_belief = torch.sqrt(0.001 + torch.sum(score_belief_probs * torch.square(score_belief_offsets - expected_score), dim=1))
     loss_scorestdev = 0.001 * (global_weight * F.huber_loss(pred_scorestdev, stdev_of_belief, reduction="none", delta=10.0)).sum()
 
     loss_lead = 0.0060 * (global_weight * target_weight_lead * F.huber_loss(
@@ -731,7 +896,7 @@ def compute_loss(
         pred_variance_time, target_variance_time + 1e-5, reduction="none", delta=50.0
     )).sum()
 
-    # Shortterm error losses
+    # 短期误差损失
     td_val_pred_probs = torch.softmax(td_value_logits[:, 2, :], dim=1)
     predvalue = (td_val_pred_probs[:, 0] - td_val_pred_probs[:, 1]).detach()
     realvalue = target_td_value[:, 2, 0] - target_td_value[:, 2, 1]
@@ -747,7 +912,7 @@ def compute_loss(
         pred_shortterm_score_error, sqerror_s, reduction="none", delta=100.0
     )).sum()
 
-    # --- Total loss (对齐 metrics_pytorch.py 的 loss_sum，再除以 N 取 mean) ---
+    # --- 总损失（对齐 metrics_pytorch.py 的 loss_sum，除以 N 取 mean）---
     loss_sum = (
         loss_policy_player * policy_opt_loss_scale
         + loss_policy_opponent
@@ -774,7 +939,7 @@ def compute_loss(
         + loss_st_score_error
     ) / N
 
-    # Accuracy
+    # 准确率
     with torch.no_grad():
         policy_acc1 = (global_weight * target_weight_policy_player * (
             torch.argmax(policy_logits[:, 0, :], dim=1) == torch.argmax(target_policy_player, dim=1)
@@ -811,7 +976,7 @@ def compute_loss(
 
 
 # ---------------------------------------------------------------------------
-# Training loop
+# 训练主循环
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Minimal Transformer training for KataGo")
@@ -822,12 +987,16 @@ def main():
     parser.add_argument("-model-kind", type=str, default="b14c192h6tfrs-bng-silu", help="Model config name")
     parser.add_argument("-lr", type=float, default=3e-4, help="Peak learning rate")
     parser.add_argument("-wd", type=float, default=0.1, help="Weight decay")
-    parser.add_argument("-muon-lr-multiplier", type=float, default=0.2, help="Muon LR multiplier over base lr")
-    parser.add_argument("-muon-momentum", type=float, default=0.95, help="Muon momentum beta")
     parser.add_argument("-muon-scope", type=str, default="all", choices=["all", "blocks", "off"],
                         help="Muon scope: all=all 2D non-norm params, blocks=only blocks.* params, off=pure AdamW")
+    parser.add_argument("-muon-momentum", type=float, default=0.95, help="Muon momentum beta")
+    parser.add_argument("-muon-lr-multiplier", type=float, default=0.2, help="Muon LR multiplier over base lr")
     parser.add_argument("-muon-scale", type=str, default="moonlight", choices=["moonlight", "mup"],
                         help="Muon update scale: moonlight=sqrt(max(m,n)), mup=sqrt(max(1,m/n))")
+    parser.add_argument("-shampoo-scope", type=str, default="off", choices=["all", "blocks", "off"],
+                        help="Shampoo scope: all=all 2D non-norm params, blocks=only blocks.* params, off=disabled")
+    parser.add_argument("-shampoo-momentum", type=float, default=0.9, help="Shampoo momentum beta")
+    parser.add_argument("-shampoo-beta2", type=float, default=0.999, help="Shampoo L/R EMA coefficient")
     parser.add_argument("-init-std", type=float, default=0.02, help="Init std for weights (Megatron-LM style)")
     parser.add_argument("-max-training-samples", type=int, default=100000000, help="Total training samples")
     parser.add_argument("-save-every-samples", type=int, default=1000000, help="Save checkpoint every N samples")
@@ -845,15 +1014,19 @@ def main():
     parser.add_argument("-variance-time-loss-scale", type=float, default=1.0, help="Variance time loss coeff")
     parser.add_argument("-disable-optimistic-policy", action="store_true", help="Disable optimistic policy")
     parser.add_argument("-prefetch-batches", type=int, default=20, help="Prefetch queue depth (0=off, 2=recommended)")
-    parser.add_argument("-score-mode", type=str, default="mixop", choices=["mixop", "mix", "simple"],
+    parser.add_argument("-score-mode", type=str, default="simple", choices=["mixop", "mix", "simple"],
                         help="Score belief head mode: mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
     args = parser.parse_args()
+
+    # 互斥检查：muon 和 shampoo 不能同时启用
+    if args.muon_scope != "off" and args.shampoo_scope != "off":
+        parser.error("muon-scope and shampoo-scope cannot both be enabled. Set one to 'off'.")
 
     # 解析 td_value_loss_scales
     td_value_loss_scales = [float(x) for x in args.td_value_loss_scales.split(",")]
     assert len(td_value_loss_scales) == 3
 
-    # Logging
+    # 日志配置
     os.makedirs(args.traindir, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
@@ -875,7 +1048,7 @@ def main():
     if device.type == "cuda":
         logging.info(f"GPU: {torch.cuda.get_device_name()}")
 
-    # AMP settings
+    # AMP 设置
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -892,14 +1065,14 @@ def main():
         amp_dtype = torch.bfloat16
         use_amp = False  # CPU bf16 有兼容性问题，关闭 AMP
 
-    # Model config
+    # 模型配置
     model_config = modelconfigs.config_of_name[args.model_kind].copy()
     logging.info(f"Model config: {json.dumps(model_config, indent=2, default=str)}")
 
     pos_len = args.pos_len
     batch_size = args.batch_size
 
-    # Load or create model
+    # 加载或创建模型
     checkpoint_path = os.path.join(args.traindir, "checkpoint.ckpt")
     if os.path.exists(checkpoint_path):
         logging.info(f"Loading checkpoint: {checkpoint_path}")
@@ -936,13 +1109,14 @@ def main():
     else:
         compiled_model = model
 
-    # Parameter count
+    # 参数统计
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logging.info(f"Total params: {total_params:,}, Trainable: {trainable_params:,}")
 
-    # Optimizer: split into Muon params (all 2D+ non-norm) and AdamW params
-    muon_params = {}  # name -> param，用于 checkpoint 保存/恢复
+    # 优化器：将参数分为 Muon / Shampoo / AdamW 组
+    muon_params = {}   # name -> param
+    shampoo_params = {}  # name -> param
     decay_params = []
     no_decay_params = []
     for name, p in model.named_parameters():
@@ -954,10 +1128,15 @@ def main():
             muon_params[name] = p
         elif args.muon_scope == "blocks" and "blocks." in name:
             muon_params[name] = p
+        elif args.shampoo_scope == "all":
+            shampoo_params[name] = p
+        elif args.shampoo_scope == "blocks" and "blocks." in name:
+            shampoo_params[name] = p
         else:
             decay_params.append(p)
 
     logging.info(f"Muon params: {sum(p.numel() for p in muon_params.values()):,}, "
+                 f"Shampoo params: {sum(p.numel() for p in shampoo_params.values()):,}, "
                  f"AdamW decay: {sum(p.numel() for p in decay_params):,}, "
                  f"AdamW no-decay: {sum(p.numel() for p in no_decay_params):,}")
 
@@ -966,21 +1145,35 @@ def main():
         {"params": no_decay_params, "weight_decay": 0.0},
     ], lr=args.lr, betas=(0.9, 0.95))
 
-    # Muon momentum buffers
-    muon_bufs = {name: torch.zeros_like(p) for name, p in muon_params.items()}
+    # Muon / Shampoo 优化器实例
+    muon_opt = MuonOptimizer(
+        muon_params, lr_multiplier=args.muon_lr_multiplier,
+        momentum=args.muon_momentum, wd=args.wd, scale_mode=args.muon_scale,
+    ) if muon_params else None
+    shampoo_opt = ShampooOptimizer(
+        shampoo_params, momentum=args.shampoo_momentum,
+        wd=args.wd, beta2=args.shampoo_beta2, device=device,
+    ) if shampoo_params else None
 
-    # Load optimizer state if resuming
+    # 恢复优化器状态
     if os.path.exists(checkpoint_path):
         if "optimizer" in state:
             optimizer.load_state_dict(state["optimizer"])
             logging.info("Optimizer state loaded")
-        if "muon_bufs" in state:
+        if "muon_state" in state and muon_opt is not None:
+            muon_opt.load_state_dict(state["muon_state"], device)
+            logging.info("Muon state loaded")
+        elif "muon_bufs" in state and muon_opt is not None:
+            # 向后兼容：旧版 checkpoint 格式
             for k, v in state["muon_bufs"].items():
-                if k in muon_bufs:
-                    muon_bufs[k].copy_(v.to(device))
-            logging.info("Muon momentum buffers loaded")
+                if k in muon_opt.states:
+                    muon_opt.states[k]["momentum"].copy_(v.to(device))
+            logging.info("Muon momentum buffers loaded (legacy format)")
+        if "shampoo_state" in state and shampoo_opt is not None:
+            shampoo_opt.load_state_dict(state["shampoo_state"], device)
+            logging.info("Shampoo state loaded")
 
-    # LR scheduler: linear warmup then cosine decay
+    # 学习率调度：线性预热 + 余弦衰减
     warmup_steps = args.warmup_samples // batch_size
     total_steps = args.max_training_samples // batch_size
 
@@ -992,7 +1185,7 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch=global_step - 1 if global_step > 0 else -1)
 
-    # Data
+    # 数据目录
     train_dir = os.path.join(args.datadir, "train")
     val_dir = os.path.join(args.datadir, "val")
 
@@ -1006,7 +1199,7 @@ def main():
         tb_writer = None
         logging.info("TensorBoard not available")
 
-    # Save helper
+    # 保存 checkpoint
     def save_checkpoint():
         state_dict = {
             "model": model.state_dict(),
@@ -1016,14 +1209,17 @@ def main():
             "total_samples_trained": total_samples_trained,
             "moving_unowned_proportion_sum": model.moving_unowned_proportion_sum,
             "moving_unowned_proportion_weight": model.moving_unowned_proportion_weight,
-            "muon_bufs": {k: v.cpu() for k, v in muon_bufs.items()},
         }
+        if muon_opt is not None:
+            state_dict["muon_state"] = muon_opt.state_dict()
+        if shampoo_opt is not None:
+            state_dict["shampoo_state"] = shampoo_opt.state_dict()
         path = os.path.join(args.traindir, "checkpoint.ckpt")
         torch.save(state_dict, path + ".tmp")
         os.replace(path + ".tmp", path)
         logging.info(f"Saved checkpoint at step {global_step}, {total_samples_trained} samples")
 
-    # Metrics accumulation — all keys returned by compute_loss + count/grad_norm
+    # 指标累积 — compute_loss 返回的所有 key + count/grad_norm
     _metric_keys = [
         "loss", "p0loss", "p1loss", "p0softloss", "p1softloss",
         "p0lopt", "p0sopt",
@@ -1041,31 +1237,31 @@ def main():
         for k in running:
             running[k] = 0.0
 
-    # 需要除以 wsum 的指标（per-sample 指标）；其余除以 count（per-batch）
+    # 按 wsum 归一化的指标（per-sample）；其余按 count 归一化（per-batch）
     _per_sample_keys = [k for k in _metric_keys if k not in ("loss", "wsum")]
 
     def print_metrics(elapsed):
-        w = max(running["wsum"], 1e-10)
-        bs = max(running["count"], 1)
+        weight_sum = max(running["wsum"], 1e-10)
+        batch_count = max(running["count"], 1)
         logging.info(
             f"step={global_step}, samples={total_samples_trained}, "
             f"time={elapsed:.1f}s, "
             f"lr={scheduler.get_last_lr()[0]:.2e}, "
-            f"loss={running['loss'] / bs:.4f}, "
-            f"p0loss={running['p0loss'] / w:.4f}, "
-            f"vloss={running['vloss'] / w:.4f}, "
-            f"oloss={running['oloss'] / w:.4f}, "
-            f"skloss={running['skloss'] / w:.4f}, "
-            f"pacc1={running['pacc1'] / w:.4f}"
+            f"loss={running['loss'] / batch_count:.4f}, "
+            f"p0loss={running['p0loss'] / weight_sum:.4f}, "
+            f"vloss={running['vloss'] / weight_sum:.4f}, "
+            f"oloss={running['oloss'] / weight_sum:.4f}, "
+            f"skloss={running['skloss'] / weight_sum:.4f}, "
+            f"pacc1={running['pacc1'] / weight_sum:.4f}"
         )
         if tb_writer is not None:
-            tb_writer.add_scalar("train/loss", running["loss"] / bs, total_samples_trained)
+            tb_writer.add_scalar("train/loss", running["loss"] / batch_count, total_samples_trained)
             for k in _per_sample_keys:
-                tb_writer.add_scalar(f"train/{k}", running[k] / w, total_samples_trained)
+                tb_writer.add_scalar(f"train/{k}", running[k] / weight_sum, total_samples_trained)
             tb_writer.add_scalar("train/lr", scheduler.get_last_lr()[0], total_samples_trained)
-            tb_writer.add_scalar("train/grad_norm", running["grad_norm"] / bs, total_samples_trained)
+            tb_writer.add_scalar("train/grad_norm", running["grad_norm"] / batch_count, total_samples_trained)
 
-    # Training
+    # 开始训练
     logging.info("=" * 60)
     logging.info(f"Starting training: {total_samples_trained}/{args.max_training_samples} samples done")
     logging.info("=" * 60)
@@ -1073,13 +1269,13 @@ def main():
     last_save_samples = total_samples_trained
     last_val_samples = total_samples_trained
     reset_running()
-    t0 = time.perf_counter()
-    last_print_time = t0
+    time_start = time.perf_counter()
+    last_print_time = time_start
 
     while total_samples_trained < args.max_training_samples:
         model.train()
 
-        # Find training files
+        # 查找训练文件
         train_files = sorted(glob.glob(os.path.join(train_dir, "*.npz")))
         if not train_files:
             logging.warning(f"No training files found in {train_dir}, waiting...")
@@ -1109,7 +1305,7 @@ def main():
             with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
                 outputs = compiled_model(batch["binaryInputNCHW"], batch["globalInputNC"])
 
-            # Postprocess in fp32
+            # fp32 后处理
             postprocessed = model.postprocess(outputs)
             loss, metrics = compute_loss(
                 model, postprocessed, batch, pos_len,
@@ -1127,41 +1323,34 @@ def main():
             optimizer.step()
             scheduler.step()
 
-            # Muon step
-            if muon_params:
-                base_lr = scheduler.get_last_lr()[0]
-                muon_lr = base_lr * args.muon_lr_multiplier
-                with torch.no_grad():
-                    for name, p in muon_params.items():
-                        if p.grad is None:
-                            continue
-                        update = muon_update(p.grad, muon_bufs[name],
-                                            beta=args.muon_momentum,
-                                            scale_mode=args.muon_scale)
-                        p.mul_(1 - base_lr * args.wd)
-                        p.add_(update, alpha=-muon_lr)
+            # Muon / Shampoo 更新步
+            base_lr = scheduler.get_last_lr()[0]
+            if muon_opt is not None:
+                muon_opt.step(base_lr)
+            if shampoo_opt is not None:
+                shampoo_opt.step(base_lr)
 
             global_step += 1
             total_samples_trained += batch_size
 
-            # Accumulate
+            # 累积指标
             for k in metrics:
                 running[k] += metrics[k]
             running["grad_norm"] += grad_norm.item()
             running["count"] += 1
 
             if global_step % args.print_every == 0:
-                t1 = time.perf_counter()
-                print_metrics(t1 - last_print_time)
+                time_now = time.perf_counter()
+                print_metrics(time_now - last_print_time)
                 reset_running()
-                last_print_time = t1
+                last_print_time = time_now
 
-            # Save checkpoint
+            # 定期保存
             if total_samples_trained - last_save_samples >= args.save_every_samples:
                 save_checkpoint()
                 last_save_samples = total_samples_trained
 
-            # Validation
+            # 验证
             if total_samples_trained - last_val_samples >= args.val_every_samples:
                 last_val_samples = total_samples_trained
                 val_files = sorted(glob.glob(os.path.join(val_dir, "*.npz")))
@@ -1183,12 +1372,12 @@ def main():
                             model_config=model_config,
                             use_pin_memory=use_pin_memory,
                         )
-                        for vbatch in data_processing_pytorch.prefetch_generator(val_gen, args.prefetch_batches):
+                        for val_batch in data_processing_pytorch.prefetch_generator(val_gen, args.prefetch_batches):
                             with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
-                                outputs = model(vbatch["binaryInputNCHW"], vbatch["globalInputNC"])
+                                outputs = model(val_batch["binaryInputNCHW"], val_batch["globalInputNC"])
                             postprocessed = model.postprocess(outputs)
-                            _, m = compute_loss(
-                                model, postprocessed, vbatch, pos_len,
+                            _, batch_metrics = compute_loss(
+                                model, postprocessed, val_batch, pos_len,
                                 is_training=False,
                                 soft_policy_weight_scale=args.soft_policy_weight_scale,
                                 value_loss_scale=args.value_loss_scale,
@@ -1197,30 +1386,30 @@ def main():
                                 variance_time_loss_scale=args.variance_time_loss_scale,
                                 disable_optimistic_policy=args.disable_optimistic_policy,
                             )
-                            for k in m:
-                                val_metrics[k] += m[k]
+                            for k in batch_metrics:
+                                val_metrics[k] += batch_metrics[k]
                             val_metrics["count"] += 1
 
-                    w = max(val_metrics["wsum"], 1e-10)
-                    bs = max(val_metrics["count"], 1)
+                    weight_sum = max(val_metrics["wsum"], 1e-10)
+                    batch_count = max(val_metrics["count"], 1)
                     logging.info(
-                        f"  VAL [{total_samples_trained} samples]: loss={val_metrics['loss'] / bs:.4f}, "
-                        f"p0loss={val_metrics['p0loss'] / w:.4f}, "
-                        f"vloss={val_metrics['vloss'] / w:.4f}, "
-                        f"oloss={val_metrics['oloss'] / w:.4f}, "
-                        f"skloss={val_metrics['skloss'] / w:.4f}, "
-                        f"pacc1={val_metrics['pacc1'] / w:.4f}"
+                        f"  VAL [{total_samples_trained} samples]: loss={val_metrics['loss'] / batch_count:.4f}, "
+                        f"p0loss={val_metrics['p0loss'] / weight_sum:.4f}, "
+                        f"vloss={val_metrics['vloss'] / weight_sum:.4f}, "
+                        f"oloss={val_metrics['oloss'] / weight_sum:.4f}, "
+                        f"skloss={val_metrics['skloss'] / weight_sum:.4f}, "
+                        f"pacc1={val_metrics['pacc1'] / weight_sum:.4f}"
                     )
                     if tb_writer is not None:
-                        tb_writer.add_scalar("val/loss", val_metrics["loss"] / bs, total_samples_trained)
+                        tb_writer.add_scalar("val/loss", val_metrics["loss"] / batch_count, total_samples_trained)
                         for k in _per_sample_keys:
-                            tb_writer.add_scalar(f"val/{k}", val_metrics[k] / w, total_samples_trained)
+                            tb_writer.add_scalar(f"val/{k}", val_metrics[k] / weight_sum, total_samples_trained)
                     model.train()
 
             if total_samples_trained >= args.max_training_samples:
                 break
 
-    # Final save
+    # 最终保存
     save_checkpoint()
     logging.info(f"Training complete: {total_samples_trained} samples, {global_step} steps")
     if tb_writer is not None:
