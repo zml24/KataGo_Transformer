@@ -70,15 +70,13 @@ def polar_express(G):
 class MuonOptimizer:
     """Muon 优化器：动量 + Newton-Schulz 正交化。"""
 
-    def __init__(self, named_params, lr_multiplier, momentum, wd, scale_mode="moonlight", lr_mode="fixed", device="cuda"):
+    def __init__(self, named_params, lr_multiplier, momentum, wd, scale_mode="moonlight", device="cuda"):
         self.named_params = named_params  # {name: param}
         self.lr_multiplier = lr_multiplier
         self.momentum = momentum
         self.wd = wd
         self.scale_mode = scale_mode
-        self.lr_mode = lr_mode
         self._device = device
-        self.step_count = 0
         self.last_update_rms = 0.0
         self.states = {name: self._init_state(p) for name, p in named_params.items()}
 
@@ -86,18 +84,8 @@ class MuonOptimizer:
     def _init_state(p):
         return {"momentum": torch.zeros_like(p)}
 
-    def _get_lr_multiplier(self):
-        if self.lr_mode == "adam":
-            beta = self.momentum
-            step = self.step_count
-            # 模拟 Adam 一阶矩偏差校正的等效 lr 缩放
-            return ((1 - beta) * (1 + beta ** step) / (1 + beta) / (1 - beta ** step)) ** 0.5
-        return self.lr_multiplier
-
     def step(self, base_lr):
-        self.step_count += 1
-        lr_mult = self._get_lr_multiplier()
-        muon_lr = base_lr * lr_mult
+        muon_lr = base_lr * self.lr_multiplier
         rms_sum = torch.tensor(0.0, device=self._device)
         rms_cnt = 0
         with torch.no_grad():
@@ -124,7 +112,7 @@ class MuonOptimizer:
                 update = update.view(original_shape)
 
                 # 累积 update RMS
-                rms_sum += update.norm() * lr_mult / update.numel() ** 0.5
+                rms_sum += update.norm() * self.lr_multiplier / update.numel() ** 0.5
                 rms_cnt += 1
 
                 # 权重衰减 + 参数更新
@@ -134,15 +122,10 @@ class MuonOptimizer:
         self.last_update_rms = (rms_sum / rms_cnt).item() if rms_cnt > 0 else 0.0
 
     def state_dict(self):
-        result = {name: {k: v.cpu() for k, v in s.items()} for name, s in self.states.items()}
-        result["__step_count__"] = self.step_count
-        return result
+        return {name: {k: v.cpu() for k, v in s.items()} for name, s in self.states.items()}
 
     def load_state_dict(self, saved, device):
-        self.step_count = saved.get("__step_count__", 0)
         for name, tensors in saved.items():
-            if name == "__step_count__":
-                continue
             if name in self.states:
                 for k, v in tensors.items():
                     self.states[name][k].copy_(v.to(device))
@@ -190,13 +173,12 @@ def inv_quarter_sandwich(L, M, R):
 class ShampooOptimizer:
     """Shampoo 优化器：L/R 预条件矩阵的 EMA + 矩阵逆根。"""
 
-    def __init__(self, named_params, lr_multiplier, momentum, wd, beta2=0.999, lr_mode="fixed", device="cuda"):
+    def __init__(self, named_params, lr_multiplier, momentum, wd, beta2=0.999, device="cuda"):
         self.named_params = named_params  # {name: param}
         self.lr_multiplier = lr_multiplier
         self.momentum = momentum
         self.wd = wd
         self.beta2 = beta2
-        self.lr_mode = lr_mode
         self.step_count = 0
         self._device = device
         self.last_precond_rms = 0.0
@@ -214,18 +196,9 @@ class ShampooOptimizer:
             "R": torch.zeros(n, n, dtype=torch.float32, device=device),
         }
 
-    def _get_lr_multiplier(self):
-        if self.lr_mode == "adam":
-            beta = self.momentum
-            step = self.step_count
-            # 模拟 Adam 一阶矩偏差校正的等效 lr 缩放
-            return ((1 - beta) * (1 + beta ** step) / (1 + beta) / (1 - beta ** step)) ** 0.5
-        return self.lr_multiplier
-
     def step(self, base_lr):
         self.step_count += 1
-        lr_mult = self._get_lr_multiplier()
-        shampoo_lr = base_lr * lr_mult
+        shampoo_lr = base_lr * self.lr_multiplier
         bias_corr1 = 1 - self.momentum ** self.step_count   # 一阶矩偏差校正
         bias_corr2 = 1 - self.beta2 ** self.step_count      # 二阶矩偏差校正
         rms_sum = torch.tensor(0.0, device=self._device)
@@ -259,13 +232,8 @@ class ShampooOptimizer:
                     state["L"] / bias_corr2, momentum_2d_hat, state["R"] / bias_corr2,
                 )
 
-                # Grafting: 归一化到单位 RMS，用 lr_mult 控制步长
-                if self.lr_mode == "adam":
-                    precond_rms = precond.norm() / precond.numel() ** 0.5
-                    precond = precond / (precond_rms + 1e-8)
-
                 # 累积 precond RMS
-                rms_sum += precond.norm() * lr_mult / precond.numel() ** 0.5
+                rms_sum += precond.norm() * self.lr_multiplier / precond.numel() ** 0.5
                 rms_cnt += 1
                 precond = precond.view(original_shape)
 
@@ -1110,18 +1078,14 @@ def main():
     parser.add_argument("-muon-scope", type=str, default="off", choices=["all", "blocks", "off"],
                         help="Muon scope: all=all 2D non-norm params, blocks=only blocks.* params, off=pure AdamW")
     parser.add_argument("-muon-momentum", type=float, default=0.95, help="Muon momentum beta")
-    parser.add_argument("-muon-lr-multiplier", type=float, default=0.2, help="Muon LR multiplier over base lr (used when muon-lr-mode=fixed)")
-    parser.add_argument("-muon-lr-mode", type=str, default="fixed", choices=["fixed", "adam"],
-                        help="Muon LR multiplier mode: fixed=static multiplier, adam=adaptive based on momentum bias correction")
+    parser.add_argument("-muon-lr-multiplier", type=float, default=0.2, help="Muon LR multiplier over base lr")
     parser.add_argument("-muon-scale", type=str, default="moonlight", choices=["moonlight", "mup"],
                         help="Muon update scale: moonlight=sqrt(max(m,n)), mup=sqrt(max(1,m/n))")
     parser.add_argument("-shampoo-scope", type=str, default="off", choices=["all", "blocks", "off"],
                         help="Shampoo scope: all=all 2D non-norm params, blocks=only blocks.* params, off=disabled")
-    parser.add_argument("-shampoo-lr-multiplier", type=float, default=30.0, help="Shampoo LR multiplier over base lr (used when shampoo-lr-mode=fixed)")
-    parser.add_argument("-shampoo-lr-mode", type=str, default="fixed", choices=["fixed", "adam"],
-                        help="Shampoo LR mode: fixed=static multiplier, adam=grafting with adaptive lr from momentum bias correction")
+    parser.add_argument("-shampoo-lr-multiplier", type=float, default=30.0, help="Shampoo LR multiplier over base lr")
     parser.add_argument("-shampoo-momentum", type=float, default=0.9, help="Shampoo momentum beta")
-    parser.add_argument("-shampoo-beta2", type=float, default=0.999, help="Shampoo L/R EMA coefficient")
+    parser.add_argument("-shampoo-beta2", type=float, default=0.95, help="Shampoo L/R EMA coefficient")
     parser.add_argument("-init-std", type=float, default=0.02, help="Init std for weights (Megatron-LM style)")
     parser.add_argument("-max-training-samples", type=int, default=100000000, help="Total training samples")
     parser.add_argument("-save-every-samples", type=int, default=1000000, help="Save checkpoint every N samples")
@@ -1273,13 +1237,11 @@ def main():
     # 独立优化器实例
     muon_opt = MuonOptimizer(
         muon_params, lr_multiplier=args.muon_lr_multiplier,
-        momentum=args.muon_momentum, wd=args.wd, scale_mode=args.muon_scale,
-        lr_mode=args.muon_lr_mode, device=device,
+        momentum=args.muon_momentum, wd=args.wd, scale_mode=args.muon_scale, device=device,
     ) if muon_params else None
     shampoo_opt = ShampooOptimizer(
         shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
-        momentum=args.shampoo_momentum, wd=args.wd, beta2=args.shampoo_beta2,
-        lr_mode=args.shampoo_lr_mode, device=device,
+        momentum=args.shampoo_momentum, wd=args.wd, beta2=args.shampoo_beta2, device=device,
     ) if shampoo_params else None
     adam_opt = AdamOptimizer(
         adam_params, wd=args.wd, beta1=0.9, beta2=0.95, device=device,
