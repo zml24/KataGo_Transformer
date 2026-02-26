@@ -5,7 +5,7 @@
 - 早期融合 H,W 为序列维度，trunk 全程 NLC
 - 1x1 Conv 全部替换为 Linear
 - 使用 torch.amp + bf16
-- AdamW 优化器
+- AdamW + Muon 优化器（Muon 用于 trunk 权重，AdamW 用于其余参数）
 """
 import sys
 import os
@@ -16,6 +16,7 @@ import logging
 import json
 import glob
 import numpy as np
+from itertools import repeat
 from typing import Dict, List, Optional
 
 import torch
@@ -24,6 +25,52 @@ import torch.nn.functional as F
 
 import modelconfigs
 import data_processing_pytorch
+
+
+# ---------------------------------------------------------------------------
+# Muon optimizer helpers
+# ---------------------------------------------------------------------------
+polar_express_coeffs = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
+]
+
+@torch.compile
+def zeropower_via_newtonschulz5(G, steps: int):
+    """Newton-Schulz iteration for matrix orthogonalization."""
+    assert G.ndim == 2
+    X = G.bfloat16()
+    if G.size(0) > G.size(1):
+        X = X.mT
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-7)
+    for i in range(steps):
+        a, b, c = polar_express_coeffs[i]
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.mT
+    return X
+
+def muon_update(grad, momentum_buf, beta=0.95, ns_steps=5, scale_mode="moonlight"):
+    """Muon update: momentum + Newton-Schulz orthogonalization."""
+    momentum_buf.mul_(beta).add_(grad)
+    update = momentum_buf
+    original_shape = update.shape
+    if update.ndim == 4:
+        update = update.view(update.size(0), -1)
+    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+    if scale_mode == "moonlight":
+        update = update * max(update.size()) ** 0.5
+    else:  # mup
+        update = update * max(1, update.size(0) / update.size(1)) ** 0.5
+    if len(original_shape) == 4:
+        update = update.view(original_shape)
+    return update
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -187,7 +234,7 @@ class PolicyHead(nn.Module):
 # ValueHead (NLC 输入, per-position linear + mean-pool linear)
 # ---------------------------------------------------------------------------
 class ValueHead(nn.Module):
-    def __init__(self, c_in, c_sv2, num_scorebeliefs, pos_len, score_mode="full"):
+    def __init__(self, c_in, c_sv2, num_scorebeliefs, pos_len, score_mode="mixop"):
         super().__init__()
         self.pos_len = pos_len
         self.scorebelief_mid = pos_len * pos_len + EXTRA_SCORE_DISTR_RADIUS
@@ -204,24 +251,21 @@ class ValueHead(nn.Module):
 
         # Score belief
         if score_mode == "simple":
-            self.linear_s_simple = nn.Linear(c_in, self.scorebelief_len, bias=True)
+            self.linear_s_simple = nn.Linear(c_in, self.scorebelief_len, bias=False)
         elif score_mode == "mix":
-            self.linear_s_mix = nn.Linear(c_in, self.scorebelief_len * num_scorebeliefs + num_scorebeliefs, bias=True)
+            self.linear_s_mix = nn.Linear(c_in, self.scorebelief_len * num_scorebeliefs + num_scorebeliefs, bias=False)
         elif score_mode == "mixop":
-            self.linear_s_mix = nn.Linear(c_in, self.scorebelief_len * num_scorebeliefs + num_scorebeliefs, bias=True)
+            self.linear_s_mix = nn.Linear(c_in, self.scorebelief_len * num_scorebeliefs + num_scorebeliefs, bias=False)
             self.linear_s2off = nn.Linear(1, num_scorebeliefs, bias=False)
             self.linear_s2par = nn.Linear(1, num_scorebeliefs, bias=False)
-        else:  # full
-            self.linear_s2mix = nn.Linear(c_in, c_sv2 + num_scorebeliefs, bias=True)
-            self.linear_s2off = nn.Linear(1, c_sv2, bias=False)
-            self.linear_s2par = nn.Linear(1, c_sv2, bias=False)
-            self.linear_s3 = nn.Linear(c_sv2, num_scorebeliefs, bias=True)
+        else:
+            raise ValueError(f"Unknown score_mode: {score_mode}")
 
         self.register_buffer("score_belief_offset_vector", torch.tensor(
             [(float(i - self.scorebelief_mid) + 0.5) for i in range(self.scorebelief_len)],
             dtype=torch.float32,
         ), persistent=False)
-        if score_mode in ("full", "mixop"):
+        if score_mode == "mixop":
             self.register_buffer("score_belief_offset_bias_vector", torch.tensor(
                 [0.05 * (float(i - self.scorebelief_mid) + 0.5) for i in range(self.scorebelief_len)],
                 dtype=torch.float32,
@@ -278,24 +322,6 @@ class ValueHead(nn.Module):
             out_scorebelief_logprobs = torch.logsumexp(
                 out_scorebelief_logprobs + outsmix_logweights.view(-1, 1, self.num_scorebeliefs), dim=2
             )
-        else:  # full
-            batch_size = N
-            s2_out, outsmix = self.linear_s2mix(pooled_s).split([self.c_sv2, self.num_scorebeliefs], dim=-1)
-            outsv2 = (
-                s2_out.view(batch_size, 1, self.c_sv2)
-                + self.linear_s2off(self.score_belief_offset_bias_vector.view(1, self.scorebelief_len, 1))
-                + self.linear_s2par(
-                    (self.score_belief_parity_vector.view(1, self.scorebelief_len) * score_parity)
-                    .view(batch_size, self.scorebelief_len, 1)
-                )
-            )
-            outsv2 = F.silu(outsv2)
-            outsv3 = self.linear_s3(outsv2)
-            outsmix_logweights = F.log_softmax(outsmix, dim=1)
-            out_scorebelief_logprobs = F.log_softmax(outsv3, dim=1)
-            out_scorebelief_logprobs = torch.logsumexp(
-                out_scorebelief_logprobs + outsmix_logweights.view(-1, 1, self.num_scorebeliefs), dim=2
-            )
 
         return (
             out_value, out_misc, out_moremisc,
@@ -308,7 +334,7 @@ class ValueHead(nn.Module):
 # Model 主体
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
-    def __init__(self, config: dict, pos_len: int, score_mode: str = "full"):
+    def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop"):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
@@ -796,6 +822,12 @@ def main():
     parser.add_argument("-model-kind", type=str, default="b14c192h6tfrs-bng-silu", help="Model config name")
     parser.add_argument("-lr", type=float, default=3e-4, help="Peak learning rate")
     parser.add_argument("-wd", type=float, default=0.1, help="Weight decay")
+    parser.add_argument("-muon-lr-multiplier", type=float, default=0.2, help="Muon LR multiplier over base lr")
+    parser.add_argument("-muon-momentum", type=float, default=0.95, help="Muon momentum beta")
+    parser.add_argument("-muon-scope", type=str, default="all", choices=["all", "blocks", "off"],
+                        help="Muon scope: all=all 2D non-norm params, blocks=only blocks.* params, off=pure AdamW")
+    parser.add_argument("-muon-scale", type=str, default="moonlight", choices=["moonlight", "mup"],
+                        help="Muon update scale: moonlight=sqrt(max(m,n)), mup=sqrt(max(1,m/n))")
     parser.add_argument("-init-std", type=float, default=0.02, help="Init std for weights (Megatron-LM style)")
     parser.add_argument("-max-training-samples", type=int, default=100000000, help="Total training samples")
     parser.add_argument("-save-every-samples", type=int, default=1000000, help="Save checkpoint every N samples")
@@ -813,8 +845,8 @@ def main():
     parser.add_argument("-variance-time-loss-scale", type=float, default=1.0, help="Variance time loss coeff")
     parser.add_argument("-disable-optimistic-policy", action="store_true", help="Disable optimistic policy")
     parser.add_argument("-prefetch-batches", type=int, default=20, help="Prefetch queue depth (0=off, 2=recommended)")
-    parser.add_argument("-score-mode", type=str, default="full", choices=["full", "mixop", "mix", "simple"],
-                        help="Score belief head mode: full=original, mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
+    parser.add_argument("-score-mode", type=str, default="mixop", choices=["mixop", "mix", "simple"],
+                        help="Score belief head mode: mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
     args = parser.parse_args()
 
     # 解析 td_value_loss_scales
@@ -909,7 +941,8 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logging.info(f"Total params: {total_params:,}, Trainable: {trainable_params:,}")
 
-    # Optimizer: bias and norm parameters have no weight decay
+    # Optimizer: split into Muon params (all 2D+ non-norm) and AdamW params
+    muon_params = {}  # name -> param，用于 checkpoint 保存/恢复
     decay_params = []
     no_decay_params = []
     for name, p in model.named_parameters():
@@ -917,18 +950,35 @@ def main():
             continue
         if p.dim() < 2 or "norm" in name:
             no_decay_params.append(p)
+        elif args.muon_scope == "all":
+            muon_params[name] = p
+        elif args.muon_scope == "blocks" and "blocks." in name:
+            muon_params[name] = p
         else:
             decay_params.append(p)
+
+    logging.info(f"Muon params: {sum(p.numel() for p in muon_params.values()):,}, "
+                 f"AdamW decay: {sum(p.numel() for p in decay_params):,}, "
+                 f"AdamW no-decay: {sum(p.numel() for p in no_decay_params):,}")
+
     optimizer = torch.optim.AdamW([
         {"params": decay_params, "weight_decay": args.wd},
         {"params": no_decay_params, "weight_decay": 0.0},
     ], lr=args.lr, betas=(0.9, 0.95))
+
+    # Muon momentum buffers
+    muon_bufs = {name: torch.zeros_like(p) for name, p in muon_params.items()}
 
     # Load optimizer state if resuming
     if os.path.exists(checkpoint_path):
         if "optimizer" in state:
             optimizer.load_state_dict(state["optimizer"])
             logging.info("Optimizer state loaded")
+        if "muon_bufs" in state:
+            for k, v in state["muon_bufs"].items():
+                if k in muon_bufs:
+                    muon_bufs[k].copy_(v.to(device))
+            logging.info("Muon momentum buffers loaded")
 
     # LR scheduler: linear warmup then cosine decay
     warmup_steps = args.warmup_samples // batch_size
@@ -966,6 +1016,7 @@ def main():
             "total_samples_trained": total_samples_trained,
             "moving_unowned_proportion_sum": model.moving_unowned_proportion_sum,
             "moving_unowned_proportion_weight": model.moving_unowned_proportion_weight,
+            "muon_bufs": {k: v.cpu() for k, v in muon_bufs.items()},
         }
         path = os.path.join(args.traindir, "checkpoint.ckpt")
         torch.save(state_dict, path + ".tmp")
@@ -1052,7 +1103,8 @@ def main():
             use_pin_memory=use_pin_memory,
         )
         for batch in data_processing_pytorch.prefetch_generator(train_gen, args.prefetch_batches):
-            optimizer.zero_grad(set_to_none=True)
+            for p in model.parameters():
+                p.grad = None
 
             with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
                 outputs = compiled_model(batch["binaryInputNCHW"], batch["globalInputNC"])
@@ -1074,6 +1126,20 @@ def main():
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
+
+            # Muon step
+            if muon_params:
+                base_lr = scheduler.get_last_lr()[0]
+                muon_lr = base_lr * args.muon_lr_multiplier
+                with torch.no_grad():
+                    for name, p in muon_params.items():
+                        if p.grad is None:
+                            continue
+                        update = muon_update(p.grad, muon_bufs[name],
+                                            beta=args.muon_momentum,
+                                            scale_mode=args.muon_scale)
+                        p.mul_(1 - base_lr * args.wd)
+                        p.add_(update, alpha=-muon_lr)
 
             global_step += 1
             total_samples_trained += batch_size
