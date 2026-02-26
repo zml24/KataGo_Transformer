@@ -70,12 +70,14 @@ def polar_express(G):
 class MuonOptimizer:
     """Muon 优化器：动量 + Newton-Schulz 正交化。"""
 
-    def __init__(self, named_params, lr_multiplier, momentum, wd, scale_mode="moonlight"):
+    def __init__(self, named_params, lr_multiplier, momentum, wd, scale_mode="moonlight", device="cuda"):
         self.named_params = named_params  # {name: param}
         self.lr_multiplier = lr_multiplier
         self.momentum = momentum
         self.wd = wd
         self.scale_mode = scale_mode
+        self._device = device
+        self.last_update_rms = 0.0
         self.states = {name: self._init_state(p) for name, p in named_params.items()}
 
     @staticmethod
@@ -84,6 +86,8 @@ class MuonOptimizer:
 
     def step(self, base_lr):
         muon_lr = base_lr * self.lr_multiplier
+        rms_sum = torch.tensor(0.0, device=self._device)
+        rms_cnt = 0
         with torch.no_grad():
             for name, p in self.named_params.items():
                 if p.grad is None:
@@ -107,9 +111,15 @@ class MuonOptimizer:
                     update = update * max(1, update.size(0) / update.size(1)) ** 0.5
                 update = update.view(original_shape)
 
+                # 累积 update RMS
+                rms_sum += update.norm() * self.lr_multiplier / update.numel() ** 0.5
+                rms_cnt += 1
+
                 # 权重衰减 + 参数更新
                 p.mul_(1 - base_lr * self.wd)
                 p.add_(update.to(p.dtype), alpha=-muon_lr)
+
+        self.last_update_rms = (rms_sum / rms_cnt).item() if rms_cnt > 0 else 0.0
 
     def state_dict(self):
         return {name: {k: v.cpu() for k, v in s.items()} for name, s in self.states.items()}
@@ -171,6 +181,8 @@ class ShampooOptimizer:
         self.wd = wd
         self.beta2 = beta2
         self.step_count = 0
+        self._device = device
+        self.last_precond_rms = 0.0
         self.states = {name: self._init_state(p, device) for name, p in named_params.items()}
 
     @staticmethod
@@ -189,7 +201,8 @@ class ShampooOptimizer:
         self.step_count += 1
         bias_corr1 = 1 - self.momentum ** self.step_count   # 一阶矩偏差校正
         bias_corr2 = 1 - self.beta2 ** self.step_count      # 二阶矩偏差校正
-        ratios = []
+        rms_sum = torch.tensor(0.0, device=self._device)
+        rms_cnt = 0
         with torch.no_grad():
             for name, p in self.named_params.items():
                 if p.grad is None:
@@ -218,16 +231,87 @@ class ShampooOptimizer:
                 precond = inv_quarter_sandwich(
                     state["L"] / bias_corr2, momentum_2d_hat, state["R"] / bias_corr2,
                 )
-                # 记录 precond RMS（用于诊断 match Adam RMS）
-                rms = precond.norm().item() / min(precond.size()) ** 0.5
-                ratios.append(rms)
+                # 累积 precond RMS
+                rms_sum += precond.norm() / precond.numel() ** 0.5
+                rms_cnt += 1
                 precond = precond.view(original_shape)
 
                 # 权重衰减 + 参数更新
                 p.mul_(1 - base_lr * self.wd)
                 p.add_(precond.to(p.dtype), alpha=-base_lr)
 
-        self.last_precond_rms = sum(ratios) / len(ratios) if ratios else 0.0
+        self.last_precond_rms = (rms_sum / rms_cnt).item() if rms_cnt > 0 else 0.0
+
+    def state_dict(self):
+        result = {name: {k: v.cpu() for k, v in s.items()} for name, s in self.states.items()}
+        result["__step_count__"] = self.step_count
+        return result
+
+    def load_state_dict(self, saved, device):
+        self.step_count = saved.get("__step_count__", 0)
+        for name, tensors in saved.items():
+            if name == "__step_count__":
+                continue
+            if name in self.states:
+                for k, v in tensors.items():
+                    self.states[name][k].copy_(v.to(device))
+
+
+class AdamOptimizer:
+    """独立 Adam 优化器（AdamW 风格解耦权重衰减），跟踪 update RMS。"""
+
+    def __init__(self, named_params, wd, beta1=0.9, beta2=0.95, eps=1e-8, device="cuda"):
+        self.named_params = named_params  # {name: param}
+        self.wd = wd
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.step_count = 0
+        self._device = device
+        self.last_update_rms = 0.0
+        self.states = {name: self._init_state(p) for name, p in named_params.items()}
+
+    @staticmethod
+    def _init_state(p):
+        return {
+            "m": torch.zeros_like(p),
+            "v": torch.zeros_like(p),
+        }
+
+    def step(self, base_lr):
+        self.step_count += 1
+        bias_corr1 = 1 - self.beta1 ** self.step_count
+        bias_corr2 = 1 - self.beta2 ** self.step_count
+        rms_sum = torch.tensor(0.0, device=self._device)
+        rms_cnt = 0
+        with torch.no_grad():
+            for name, p in self.named_params.items():
+                if p.grad is None:
+                    continue
+                state = self.states[name]
+                grad = p.grad
+
+                # 一阶矩 EMA
+                state["m"].lerp_(grad, 1 - self.beta1)
+                # 二阶矩 EMA
+                state["v"].lerp_(grad * grad, 1 - self.beta2)
+
+                # 偏差校正
+                m_hat = state["m"] / bias_corr1
+                v_hat = state["v"] / bias_corr2
+
+                # Adam update
+                update = m_hat / (v_hat.sqrt() + self.eps)
+
+                # 累积 update RMS（全 tensor 操作，避免 CUDA 同步）
+                rms_sum += update.norm() / update.numel() ** 0.5
+                rms_cnt += 1
+
+                # 权重衰减 + 参数更新
+                p.mul_(1 - base_lr * self.wd)
+                p.add_(update, alpha=-base_lr)
+
+        self.last_update_rms = (rms_sum / rms_cnt).item() if rms_cnt > 0 else 0.0
 
     def state_dict(self):
         result = {name: {k: v.cpu() for k, v in s.items()} for name, s in self.states.items()}
@@ -1117,10 +1201,10 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logging.info(f"Total params: {total_params:,}, Trainable: {trainable_params:,}")
 
-    # 优化器：将参数分为 Muon / Shampoo / AdamW 组
+    # 优化器：将参数分为 Muon / Shampoo / Adam 组
     muon_params = {}   # name -> param
     shampoo_params = {}  # name -> param
-    decay_params = []
+    adam_params = {}   # name -> param (2D+ with weight decay)
     no_decay_params = []
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -1136,27 +1220,30 @@ def main():
         elif args.shampoo_scope == "blocks" and "blocks." in name:
             shampoo_params[name] = p
         else:
-            decay_params.append(p)
+            adam_params[name] = p
 
     logging.info(f"Muon params: {sum(p.numel() for p in muon_params.values()):,}, "
                  f"Shampoo params: {sum(p.numel() for p in shampoo_params.values()):,}, "
-                 f"AdamW decay: {sum(p.numel() for p in decay_params):,}, "
+                 f"Adam decay: {sum(p.numel() for p in adam_params.values()):,}, "
                  f"AdamW no-decay: {sum(p.numel() for p in no_decay_params):,}")
 
+    # torch.optim.AdamW 仅处理 no_decay 参数（1D bias/norm）
     optimizer = torch.optim.AdamW([
-        {"params": decay_params, "weight_decay": args.wd},
         {"params": no_decay_params, "weight_decay": 0.0},
     ], lr=args.lr, betas=(0.9, 0.95))
 
-    # Muon / Shampoo 优化器实例
+    # 独立优化器实例
     muon_opt = MuonOptimizer(
         muon_params, lr_multiplier=args.muon_lr_multiplier,
-        momentum=args.muon_momentum, wd=args.wd, scale_mode=args.muon_scale,
+        momentum=args.muon_momentum, wd=args.wd, scale_mode=args.muon_scale, device=device,
     ) if muon_params else None
     shampoo_opt = ShampooOptimizer(
         shampoo_params, momentum=args.shampoo_momentum,
         wd=args.wd, beta2=args.shampoo_beta2, device=device,
     ) if shampoo_params else None
+    adam_opt = AdamOptimizer(
+        adam_params, wd=args.wd, beta1=0.9, beta2=0.95, device=device,
+    ) if adam_params else None
 
     # 恢复优化器状态
     if os.path.exists(checkpoint_path):
@@ -1175,6 +1262,9 @@ def main():
         if "shampoo_state" in state and shampoo_opt is not None:
             shampoo_opt.load_state_dict(state["shampoo_state"], device)
             logging.info("Shampoo state loaded")
+        if "adam_state" in state and adam_opt is not None:
+            adam_opt.load_state_dict(state["adam_state"], device)
+            logging.info("Adam state loaded")
 
     # 学习率调度：线性预热 + 余弦衰减
     warmup_steps = args.warmup_samples // batch_size
@@ -1217,6 +1307,8 @@ def main():
             state_dict["muon_state"] = muon_opt.state_dict()
         if shampoo_opt is not None:
             state_dict["shampoo_state"] = shampoo_opt.state_dict()
+        if adam_opt is not None:
+            state_dict["adam_state"] = adam_opt.state_dict()
         path = os.path.join(args.traindir, "checkpoint.ckpt")
         torch.save(state_dict, path + ".tmp")
         os.replace(path + ".tmp", path)
@@ -1235,7 +1327,9 @@ def main():
     running = {k: 0.0 for k in _metric_keys}
     running["count"] = 0
     running["grad_norm"] = 0.0
+    running["muon_update_rms"] = 0.0
     running["shampoo_precond_rms"] = 0.0
+    running["adam_update_rms"] = 0.0
 
     def reset_running():
         for k in running:
@@ -1264,8 +1358,12 @@ def main():
                 tb_writer.add_scalar(f"train/{k}", running[k] / weight_sum, total_samples_trained)
             tb_writer.add_scalar("train/lr", scheduler.get_last_lr()[0], total_samples_trained)
             tb_writer.add_scalar("train/grad_norm", running["grad_norm"] / batch_count, total_samples_trained)
+            if muon_opt is not None:
+                tb_writer.add_scalar("train/muon_update_rms", running["muon_update_rms"] / batch_count, total_samples_trained)
             if shampoo_opt is not None:
                 tb_writer.add_scalar("train/shampoo_precond_rms", running["shampoo_precond_rms"] / batch_count, total_samples_trained)
+            if adam_opt is not None:
+                tb_writer.add_scalar("train/adam_update_rms", running["adam_update_rms"] / batch_count, total_samples_trained)
 
     # 开始训练
     logging.info("=" * 60)
@@ -1329,12 +1427,14 @@ def main():
             optimizer.step()
             scheduler.step()
 
-            # Muon / Shampoo 更新步
+            # Muon / Shampoo / Adam 更新步
             base_lr = scheduler.get_last_lr()[0]
             if muon_opt is not None:
                 muon_opt.step(base_lr)
             if shampoo_opt is not None:
                 shampoo_opt.step(base_lr)
+            if adam_opt is not None:
+                adam_opt.step(base_lr)
 
             global_step += 1
             total_samples_trained += batch_size
@@ -1343,8 +1443,12 @@ def main():
             for k in metrics:
                 running[k] += metrics[k]
             running["grad_norm"] += grad_norm.item()
+            if muon_opt is not None:
+                running["muon_update_rms"] += muon_opt.last_update_rms
             if shampoo_opt is not None:
                 running["shampoo_precond_rms"] += shampoo_opt.last_precond_rms
+            if adam_opt is not None:
+                running["adam_update_rms"] += adam_opt.last_update_rms
             running["count"] += 1
 
             if global_step % args.print_every == 0:
