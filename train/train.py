@@ -159,24 +159,6 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class KataValueHeadGPool(nn.Module):
-    def forward(self, x, mask, mask_sum_hw):
-        """x: (N,C,H,W), mask: (N,1,H,W), mask_sum_hw: (N,1,1,1) -> (N,3C)"""
-        x_fp32 = x.to(torch.float32)
-        if mask is not None:
-            sqrt_offset = torch.sqrt(mask_sum_hw) - 14.0
-            layer_mean = torch.sum(x_fp32, dim=(2, 3), keepdim=True) / mask_sum_hw
-        else:
-            sqrt_offset = (x.shape[2] * x.shape[3]) ** 0.5 - 14.0
-            layer_mean = torch.mean(x_fp32, dim=(2, 3), keepdim=True)
-        out = torch.cat([
-            layer_mean,
-            layer_mean * (sqrt_offset / 10.0),
-            layer_mean * (sqrt_offset * sqrt_offset / 100.0 - 0.1),
-        ], dim=1)
-        return out.squeeze(-1).squeeze(-1)  # (N, 3C)
-
-
 # ---------------------------------------------------------------------------
 # PolicyHead (NLC 输入)
 # ---------------------------------------------------------------------------
@@ -202,140 +184,17 @@ class PolicyHead(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# ValueHead (NLC 输入, 1x1 conv -> Linear)
+# ValueHead (NLC 输入, per-position linear + mean-pool linear)
 # ---------------------------------------------------------------------------
 class ValueHead(nn.Module):
-    def __init__(self, c_in, c_v1, c_v2, c_sv2, num_scorebeliefs, pos_len, simple_score_belief=False):
+    def __init__(self, c_in, c_sv2, num_scorebeliefs, pos_len, score_mode="full"):
         super().__init__()
         self.pos_len = pos_len
         self.scorebelief_mid = pos_len * pos_len + EXTRA_SCORE_DISTR_RADIUS
         self.scorebelief_len = self.scorebelief_mid * 2
         self.num_scorebeliefs = num_scorebeliefs
         self.c_sv2 = c_sv2
-        self.c_v1 = c_v1
-        self.simple_score_belief = simple_score_belief
-
-        # 空间 -> 通道 (替代 conv1)
-        self.linear_v1 = nn.Linear(c_in, c_v1, bias=True)
-        self.gpool = KataValueHeadGPool()
-
-        self.linear2 = nn.Linear(3 * c_v1, c_v2, bias=True)
-
-        # 合并 linear_value (c_v2→3) + linear_misc (c_v2→10) + linear_moremisc (c_v2→8)
-        self.linear_vmm = nn.Linear(c_v2, 3 + 10 + 8, bias=True)
-
-        # 合并 linear_ownership (c_v1→1) + linear_scoring (c_v1→1)
-        self.linear_os = nn.Linear(c_v1, 2, bias=False)
-        # 合并 linear_futurepos (c_in→2) + linear_seki (c_in→4)
-        self.linear_fs = nn.Linear(c_in, 2 + 4, bias=False)
-
-        # Score belief
-        if simple_score_belief:
-            self.linear_s2mix = nn.Linear(c_in, c_sv2 + num_scorebeliefs, bias=True)
-        else:
-            # 合并 linear_s2 (3*c_v1→c_sv2) + linear_smix (3*c_v1→num_scorebeliefs)
-            self.linear_s2mix = nn.Linear(3 * c_v1, c_sv2 + num_scorebeliefs, bias=True)
-        self.linear_s2off = nn.Linear(1, c_sv2, bias=False)
-        self.linear_s2par = nn.Linear(1, c_sv2, bias=False)
-        self.linear_s3 = nn.Linear(c_sv2, num_scorebeliefs, bias=True)
-
-        self.register_buffer("score_belief_offset_vector", torch.tensor(
-            [(float(i - self.scorebelief_mid) + 0.5) for i in range(self.scorebelief_len)],
-            dtype=torch.float32,
-        ), persistent=False)
-        self.register_buffer("score_belief_offset_bias_vector", torch.tensor(
-            [0.05 * (float(i - self.scorebelief_mid) + 0.5) for i in range(self.scorebelief_len)],
-            dtype=torch.float32,
-        ), persistent=False)
-        self.register_buffer("score_belief_parity_vector", torch.tensor(
-            [0.5 - float((i - self.scorebelief_mid) % 2) for i in range(self.scorebelief_len)],
-            dtype=torch.float32,
-        ), persistent=False)
-
-    def forward(self, x_nlc, mask, mask_sum_hw, score_parity):
-        """
-        x_nlc: (N,L,C) 经过 final norm + act
-        mask: (N,1,H,W) or None
-        score_parity: (N, 1) input_global 的最后一个特征
-        """
-        N, L, _ = x_nlc.shape
-        H = W = self.pos_len
-
-        outv1 = self.linear_v1(x_nlc)  # (N, L, c_v1)
-        if mask is not None:
-            outv1 = outv1 * mask.view(N, L, 1)
-        outv1 = F.silu(outv1)
-
-        # Global pool
-        outv1_nchw = outv1.permute(0, 2, 1).view(N, self.c_v1, H, W)
-        pooled = self.gpool(outv1_nchw, mask, mask_sum_hw)  # (N, 3*c_v1)
-
-        outv2 = F.silu(self.linear2(pooled))
-
-        out_value, out_misc, out_moremisc = self.linear_vmm(outv2).split([3, 10, 8], dim=-1)
-
-        # 空间输出
-        out_ownership, out_scoring = self.linear_os(outv1).split([1, 1], dim=-1)
-        out_futurepos, out_seki = self.linear_fs(x_nlc).split([2, 4], dim=-1)
-
-        if mask is not None:
-            mask_nlc = mask.view(N, L, 1)
-            out_ownership = out_ownership * mask_nlc
-            out_scoring = out_scoring * mask_nlc
-            out_futurepos = out_futurepos * mask_nlc
-            out_seki = out_seki * mask_nlc
-
-        # 转回 NCHW 格式以匹配 loss 计算的期望
-        out_ownership = out_ownership.permute(0, 2, 1).view(N, 1, H, W)
-        out_scoring = out_scoring.permute(0, 2, 1).view(N, 1, H, W)
-        out_futurepos = out_futurepos.permute(0, 2, 1).view(N, 2, H, W)
-        out_seki = out_seki.permute(0, 2, 1).view(N, 4, H, W)
-
-        # Score belief
-        batch_size = N
-        if self.simple_score_belief:
-            if mask is not None:
-                pooled_s = (x_nlc * mask.view(N, L, 1)).sum(dim=1) / mask_sum_hw.view(N, 1)
-            else:
-                pooled_s = x_nlc.mean(dim=1)
-            s2_out, outsmix = self.linear_s2mix(pooled_s).split([self.c_sv2, self.num_scorebeliefs], dim=-1)
-        else:
-            s2_out, outsmix = self.linear_s2mix(pooled).split([self.c_sv2, self.num_scorebeliefs], dim=-1)
-        outsv2 = (
-            s2_out.view(batch_size, 1, self.c_sv2)
-            + self.linear_s2off(self.score_belief_offset_bias_vector.view(1, self.scorebelief_len, 1))
-            + self.linear_s2par(
-                (self.score_belief_parity_vector.view(1, self.scorebelief_len) * score_parity)
-                .view(batch_size, self.scorebelief_len, 1)
-            )
-        )
-        outsv2 = F.silu(outsv2)
-        outsv3 = self.linear_s3(outsv2)
-        outsmix_logweights = F.log_softmax(outsmix, dim=1)
-        out_scorebelief_logprobs = F.log_softmax(outsv3, dim=1)
-        out_scorebelief_logprobs = torch.logsumexp(
-            out_scorebelief_logprobs + outsmix_logweights.view(-1, 1, self.num_scorebeliefs), dim=2
-        )
-
-        return (
-            out_value, out_misc, out_moremisc,
-            out_ownership, out_scoring, out_futurepos, out_seki,
-            out_scorebelief_logprobs,
-        )
-
-
-class SimpleValueHead(nn.Module):
-    """Simplified value head: per-position linear for ownership/scoring,
-    mean-pool linear for global features. Score belief unchanged."""
-    def __init__(self, c_in, c_v1, c_sv2, num_scorebeliefs, pos_len, simple_score_belief=False):
-        super().__init__()
-        self.pos_len = pos_len
-        self.scorebelief_mid = pos_len * pos_len + EXTRA_SCORE_DISTR_RADIUS
-        self.scorebelief_len = self.scorebelief_mid * 2
-        self.num_scorebeliefs = num_scorebeliefs
-        self.c_v1 = c_v1
-        self.c_sv2 = c_sv2
-        self.simple_score_belief = simple_score_belief
+        self.score_mode = score_mode
 
         # Per-position: ownership(1) + scoring(1) + futurepos(2) + seki(4)
         self.linear_spatial = nn.Linear(c_in, 1 + 1 + 2 + 4, bias=False)
@@ -344,28 +203,33 @@ class SimpleValueHead(nn.Module):
         self.linear_vmm = nn.Linear(c_in, 3 + 10 + 8)
 
         # Score belief
-        if simple_score_belief:
+        if score_mode == "simple":
+            self.linear_s_simple = nn.Linear(c_in, self.scorebelief_len, bias=True)
+        elif score_mode == "mix":
+            self.linear_s_mix = nn.Linear(c_in, self.scorebelief_len * num_scorebeliefs + num_scorebeliefs, bias=True)
+        elif score_mode == "mixop":
+            self.linear_s_mix = nn.Linear(c_in, self.scorebelief_len * num_scorebeliefs + num_scorebeliefs, bias=True)
+            self.linear_s2off = nn.Linear(1, num_scorebeliefs, bias=False)
+            self.linear_s2par = nn.Linear(1, num_scorebeliefs, bias=False)
+        else:  # full
             self.linear_s2mix = nn.Linear(c_in, c_sv2 + num_scorebeliefs, bias=True)
-        else:
-            self.linear_v1 = nn.Linear(c_in, c_v1, bias=True)
-            self.gpool = KataValueHeadGPool()
-            self.linear_s2mix = nn.Linear(3 * c_v1, c_sv2 + num_scorebeliefs, bias=True)
-        self.linear_s2off = nn.Linear(1, c_sv2, bias=False)
-        self.linear_s2par = nn.Linear(1, c_sv2, bias=False)
-        self.linear_s3 = nn.Linear(c_sv2, num_scorebeliefs, bias=True)
+            self.linear_s2off = nn.Linear(1, c_sv2, bias=False)
+            self.linear_s2par = nn.Linear(1, c_sv2, bias=False)
+            self.linear_s3 = nn.Linear(c_sv2, num_scorebeliefs, bias=True)
 
         self.register_buffer("score_belief_offset_vector", torch.tensor(
             [(float(i - self.scorebelief_mid) + 0.5) for i in range(self.scorebelief_len)],
             dtype=torch.float32,
         ), persistent=False)
-        self.register_buffer("score_belief_offset_bias_vector", torch.tensor(
-            [0.05 * (float(i - self.scorebelief_mid) + 0.5) for i in range(self.scorebelief_len)],
-            dtype=torch.float32,
-        ), persistent=False)
-        self.register_buffer("score_belief_parity_vector", torch.tensor(
-            [0.5 - float((i - self.scorebelief_mid) % 2) for i in range(self.scorebelief_len)],
-            dtype=torch.float32,
-        ), persistent=False)
+        if score_mode in ("full", "mixop"):
+            self.register_buffer("score_belief_offset_bias_vector", torch.tensor(
+                [0.05 * (float(i - self.scorebelief_mid) + 0.5) for i in range(self.scorebelief_len)],
+                dtype=torch.float32,
+            ), persistent=False)
+            self.register_buffer("score_belief_parity_vector", torch.tensor(
+                [0.5 - float((i - self.scorebelief_mid) % 2) for i in range(self.scorebelief_len)],
+                dtype=torch.float32,
+            ), persistent=False)
 
     def forward(self, x_nlc, mask, mask_sum_hw, score_parity):
         N, L, _ = x_nlc.shape
@@ -388,36 +252,50 @@ class SimpleValueHead(nn.Module):
         out_value, out_misc, out_moremisc = vmm.split([3, 10, 8], dim=-1)
 
         # Score belief
-        batch_size = N
-        if self.simple_score_belief:
-            if mask is not None:
-                pooled_s = (x_nlc * mask.view(N, L, 1)).sum(dim=1) / mask_sum_hw.view(N, 1)
-            else:
-                pooled_s = x_nlc.mean(dim=1)
-            s2_out, outsmix = self.linear_s2mix(pooled_s).split([self.c_sv2, self.num_scorebeliefs], dim=-1)
+        if mask is not None:
+            pooled_s = (x_nlc * mask.view(N, L, 1)).sum(dim=1) / mask_sum_hw.view(N, 1)
         else:
-            outv1 = self.linear_v1(x_nlc)
-            if mask is not None:
-                outv1 = outv1 * mask.view(N, L, 1)
-            outv1 = F.silu(outv1)
-            outv1_nchw = outv1.permute(0, 2, 1).view(N, self.c_v1, H, W)
-            pooled = self.gpool(outv1_nchw, mask, mask_sum_hw)
-            s2_out, outsmix = self.linear_s2mix(pooled).split([self.c_sv2, self.num_scorebeliefs], dim=-1)
-        outsv2 = (
-            s2_out.view(batch_size, 1, self.c_sv2)
-            + self.linear_s2off(self.score_belief_offset_bias_vector.view(1, self.scorebelief_len, 1))
-            + self.linear_s2par(
-                (self.score_belief_parity_vector.view(1, self.scorebelief_len) * score_parity)
-                .view(batch_size, self.scorebelief_len, 1)
+            pooled_s = x_nlc.mean(dim=1)
+        if self.score_mode == "simple":
+            out_scorebelief_logprobs = F.log_softmax(self.linear_s_simple(pooled_s), dim=1)
+        elif self.score_mode in ("mix", "mixop"):
+            s_out = self.linear_s_mix(pooled_s)
+            outsv3, outsmix = s_out.split(
+                [self.scorebelief_len * self.num_scorebeliefs, self.num_scorebeliefs], dim=-1
             )
-        )
-        outsv2 = F.silu(outsv2)
-        outsv3 = self.linear_s3(outsv2)
-        outsmix_logweights = F.log_softmax(outsmix, dim=1)
-        out_scorebelief_logprobs = F.log_softmax(outsv3, dim=1)
-        out_scorebelief_logprobs = torch.logsumexp(
-            out_scorebelief_logprobs + outsmix_logweights.view(-1, 1, self.num_scorebeliefs), dim=2
-        )
+            outsv3 = outsv3.view(N, self.scorebelief_len, self.num_scorebeliefs)
+            if self.score_mode == "mixop":
+                outsv3 = (
+                    outsv3
+                    + self.linear_s2off(self.score_belief_offset_bias_vector.view(1, self.scorebelief_len, 1))
+                    + self.linear_s2par(
+                        (self.score_belief_parity_vector.view(1, self.scorebelief_len) * score_parity)
+                        .view(N, self.scorebelief_len, 1)
+                    )
+                )
+            outsmix_logweights = F.log_softmax(outsmix, dim=1)
+            out_scorebelief_logprobs = F.log_softmax(outsv3, dim=1)
+            out_scorebelief_logprobs = torch.logsumexp(
+                out_scorebelief_logprobs + outsmix_logweights.view(-1, 1, self.num_scorebeliefs), dim=2
+            )
+        else:  # full
+            batch_size = N
+            s2_out, outsmix = self.linear_s2mix(pooled_s).split([self.c_sv2, self.num_scorebeliefs], dim=-1)
+            outsv2 = (
+                s2_out.view(batch_size, 1, self.c_sv2)
+                + self.linear_s2off(self.score_belief_offset_bias_vector.view(1, self.scorebelief_len, 1))
+                + self.linear_s2par(
+                    (self.score_belief_parity_vector.view(1, self.scorebelief_len) * score_parity)
+                    .view(batch_size, self.scorebelief_len, 1)
+                )
+            )
+            outsv2 = F.silu(outsv2)
+            outsv3 = self.linear_s3(outsv2)
+            outsmix_logweights = F.log_softmax(outsmix, dim=1)
+            out_scorebelief_logprobs = F.log_softmax(outsv3, dim=1)
+            out_scorebelief_logprobs = torch.logsumexp(
+                out_scorebelief_logprobs + outsmix_logweights.view(-1, 1, self.num_scorebeliefs), dim=2
+            )
 
         return (
             out_value, out_misc, out_moremisc,
@@ -430,7 +308,7 @@ class SimpleValueHead(nn.Module):
 # Model 主体
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
-    def __init__(self, config: dict, pos_len: int):
+    def __init__(self, config: dict, pos_len: int, score_mode: str = "full"):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
@@ -462,23 +340,15 @@ class Model(nn.Module):
                 rope_theta=rope_theta,
             ))
 
-        # Trunk final norm + act
+        # Trunk final norm
         self.norm_final = RMSNormFP32(self.c_trunk, eps=1e-6)
 
         # Heads
-        c_v1 = config["v1_num_channels"]
-        c_v2 = config["v2_size"]
         c_sv2 = config["sbv2_num_channels"]
         num_scorebeliefs = config["num_scorebeliefs"]
 
         self.policy_head = PolicyHead(self.c_trunk, pos_len)
-
-        value_head_type = config.get("value_head_type", "full")
-        simple_score_belief = config.get("simple_score_belief", False)
-        if value_head_type == "simple-linear":
-            self.value_head = SimpleValueHead(self.c_trunk, c_v1, c_sv2, num_scorebeliefs, pos_len, simple_score_belief)
-        else:
-            self.value_head = ValueHead(self.c_trunk, c_v1, c_v2, c_sv2, num_scorebeliefs, pos_len, simple_score_belief)
+        self.value_head = ValueHead(self.c_trunk, c_sv2, num_scorebeliefs, pos_len, score_mode=score_mode)
 
         # Seki 动态权重的移动平均状态
         self.moving_unowned_proportion_sum = 0.0
@@ -533,9 +403,8 @@ class Model(nn.Module):
         for block in self.blocks:
             x = block(x, attn_mask=attn_mask)
 
-        # Final norm + act
+        # Final norm
         x = self.norm_final(x)
-        x = F.silu(x)
 
         # Heads 在 fp32 下计算以保证数值稳定性（禁用 autocast 防止 linear 被降回 bf16）
         x = x.float()
@@ -943,9 +812,9 @@ def main():
     parser.add_argument("-seki-loss-scale", type=float, default=1.0, help="Seki loss coeff")
     parser.add_argument("-variance-time-loss-scale", type=float, default=1.0, help="Variance time loss coeff")
     parser.add_argument("-disable-optimistic-policy", action="store_true", help="Disable optimistic policy")
-    parser.add_argument("-simple-value-head", action="store_true", help="Use simple linear value head")
-    parser.add_argument("-simple-score-belief", action="store_true", help="Use simple mean-pool score belief")
-    parser.add_argument("-prefetch-batches", type=int, default=4, help="Prefetch queue depth (0=off, 2=recommended)")
+    parser.add_argument("-prefetch-batches", type=int, default=20, help="Prefetch queue depth (0=off, 2=recommended)")
+    parser.add_argument("-score-mode", type=str, default="full", choices=["full", "mixop", "mix", "simple"],
+                        help="Score belief head mode: full=original, mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
     args = parser.parse_args()
 
     # 解析 td_value_loss_scales
@@ -993,10 +862,6 @@ def main():
 
     # Model config
     model_config = modelconfigs.config_of_name[args.model_kind].copy()
-    if args.simple_value_head:
-        model_config["value_head_type"] = "simple-linear"
-    if args.simple_score_belief:
-        model_config["simple_score_belief"] = True
     logging.info(f"Model config: {json.dumps(model_config, indent=2, default=str)}")
 
     pos_len = args.pos_len
@@ -1008,7 +873,7 @@ def main():
         logging.info(f"Loading checkpoint: {checkpoint_path}")
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         model_config = state.get("config", model_config)
-        model = Model(model_config, pos_len)
+        model = Model(model_config, pos_len, score_mode=args.score_mode)
         model.load_state_dict(state["model"])
         model.moving_unowned_proportion_sum = state.get("moving_unowned_proportion_sum", 0.0)
         model.moving_unowned_proportion_weight = state.get("moving_unowned_proportion_weight", 0.0)
@@ -1019,13 +884,13 @@ def main():
         logging.info(f"Loading initial checkpoint: {args.initial_checkpoint}")
         state = torch.load(args.initial_checkpoint, map_location="cpu", weights_only=False)
         model_config = state.get("config", model_config)
-        model = Model(model_config, pos_len)
+        model = Model(model_config, pos_len, score_mode=args.score_mode)
         model.load_state_dict(state["model"])
         global_step = 0
         total_samples_trained = 0
     else:
         logging.info("Creating new model")
-        model = Model(model_config, pos_len)
+        model = Model(model_config, pos_len, score_mode=args.score_mode)
         model.initialize(init_std=args.init_std)
         logging.info(f"Initialized weights with std={args.init_std}, output_std={args.init_std / math.sqrt(2.0 * len(model.blocks)):.6f}")
         global_step = 0
