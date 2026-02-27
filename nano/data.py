@@ -119,14 +119,20 @@ def read_npz_training_data(
             (npz_file, binaryInputNCHW, globalInputNC, policyTargetsNCMove, globalTargetsNC, scoreDistrN, valueTargetsNCHW, metadataInputNC, qValueTargetsNCMove) = future.result()
 
             num_samples = binaryInputNCHW.shape[0]
-            num_whole_steps = num_samples // (batch_size * world_size)
+            is_symmetry_all = (symmetry_type == "all")
+            if is_symmetry_all:
+                assert batch_size % 8 == 0, "batch_size must be divisible by 8 when symmetry_type='all'"
+                read_batch_size = batch_size // 8
+            else:
+                read_batch_size = batch_size
+            num_whole_steps = num_samples // (read_batch_size * world_size)
 
             if next_file is not None:
                 future = executor.submit(load_npz_file, next_file)
 
             for n in range(num_whole_steps):
-                start = (n * world_size + rank) * batch_size
-                end = start + batch_size
+                start = (n * world_size + rank) * read_batch_size
+                end = start + read_batch_size
 
                 if use_pin_memory:
                     batch_binaryInputNCHW = torch.from_numpy(binaryInputNCHW[start:end]).pin_memory().to(device, non_blocking=True).float()
@@ -157,27 +163,52 @@ def read_npz_training_data(
                     )
 
                 if symmetry_type is not None and symmetry_type != "" and symmetry_type != "none":
-                    allowed_symms = []
-                    if symmetry_type == "xyt":
-                        allowed_symms = [0, 1, 2, 3, 4, 5, 6, 7]
-                    elif symmetry_type == "x":
-                        allowed_symms = [0, 5]
-                    elif symmetry_type == "xy":
-                        allowed_symms = [0, 2, 5, 7]
-                    elif symmetry_type == "x+y":
-                        allowed_symms = [0, 2]
-                    elif symmetry_type == "t":
-                        allowed_symms = [0, 4]
+                    if is_symmetry_all:
+                        # Apply all 8 symmetries to each sample, expanding read_batch_size -> batch_size
+                        sym_binary_parts = []
+                        sym_policy_parts = []
+                        sym_value_parts = []
+                        if include_qvalues:
+                            sym_qvalue_parts = []
+                        for symm in range(8):
+                            sym_binary_parts.append(apply_symmetry(batch_binaryInputNCHW, symm))
+                            sym_policy_parts.append(apply_symmetry_policy(batch_policyTargetsNCMove, symm, pos_len))
+                            sym_value_parts.append(apply_symmetry(batch_valueTargetsNCHW, symm))
+                            if include_qvalues:
+                                sym_qvalue_parts.append(apply_symmetry_policy(batch_qValueTargetsNCMove, symm, pos_len))
+                        batch_binaryInputNCHW = torch.cat(sym_binary_parts, dim=0)
+                        batch_policyTargetsNCMove = torch.cat(sym_policy_parts, dim=0)
+                        batch_valueTargetsNCHW = torch.cat(sym_value_parts, dim=0)
+                        if include_qvalues:
+                            batch_qValueTargetsNCMove = torch.cat(sym_qvalue_parts, dim=0)
+                        # Non-spatial tensors: repeat 8 times to match
+                        batch_globalInputNC = batch_globalInputNC.repeat(8, 1)
+                        batch_globalTargetsNC = batch_globalTargetsNC.repeat(8, 1)
+                        batch_scoreDistrN = batch_scoreDistrN.repeat(8, 1)
+                        if include_meta:
+                            batch_metadataInputNC = batch_metadataInputNC.repeat(8, 1)
                     else:
-                        assert False, f"Unknown data symmetry type {symmetry_type}"
+                        allowed_symms = []
+                        if symmetry_type == "xyt":
+                            allowed_symms = [0, 1, 2, 3, 4, 5, 6, 7]
+                        elif symmetry_type == "x":
+                            allowed_symms = [0, 5]
+                        elif symmetry_type == "xy":
+                            allowed_symms = [0, 2, 5, 7]
+                        elif symmetry_type == "x+y":
+                            allowed_symms = [0, 2]
+                        elif symmetry_type == "t":
+                            allowed_symms = [0, 4]
+                        else:
+                            assert False, f"Unknown data symmetry type {symmetry_type}"
 
-                    symm = allowed_symms[int(rand.integers(0, len(allowed_symms)))]
+                        symm = allowed_symms[int(rand.integers(0, len(allowed_symms)))]
 
-                    batch_binaryInputNCHW = apply_symmetry(batch_binaryInputNCHW, symm)
-                    batch_policyTargetsNCMove = apply_symmetry_policy(batch_policyTargetsNCMove, symm, pos_len)
-                    batch_valueTargetsNCHW = apply_symmetry(batch_valueTargetsNCHW, symm)
-                    if include_qvalues:
-                        batch_qValueTargetsNCMove = apply_symmetry_policy(batch_qValueTargetsNCMove, symm, pos_len)
+                        batch_binaryInputNCHW = apply_symmetry(batch_binaryInputNCHW, symm)
+                        batch_policyTargetsNCMove = apply_symmetry_policy(batch_policyTargetsNCMove, symm, pos_len)
+                        batch_valueTargetsNCHW = apply_symmetry(batch_valueTargetsNCHW, symm)
+                        if include_qvalues:
+                            batch_qValueTargetsNCMove = apply_symmetry_policy(batch_qValueTargetsNCMove, symm, pos_len)
 
                 batch_binaryInputNCHW = batch_binaryInputNCHW.contiguous()
                 batch_policyTargetsNCMove = batch_policyTargetsNCMove.contiguous()

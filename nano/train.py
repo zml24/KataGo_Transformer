@@ -620,7 +620,9 @@ if __name__ == "__main__":
     parser.add_argument("--init-std", type=float, default=0.02, help="Init std for weights (Megatron-LM style)")
     parser.add_argument("--max-training-samples", type=int, default=100000000, help="Total training samples")
     parser.add_argument("--save-every-samples", type=int, default=1000000, help="Save checkpoint every N samples")
-    parser.add_argument("--symmetry-type", type=str, default="xyt", help="Data symmetry type")
+    parser.add_argument("--symmetry-type", type=str, default="xyt",
+                        help="Data symmetry type (none/x/xy/x+y/t/xyt/all). "
+                             "'all' applies all 8 symmetries per sample, requires batch-size divisible by 8")
     parser.add_argument("--print-every", type=int, default=100, help="Print every N optimizer steps")
     parser.add_argument("--val-every-samples", type=int, default=1000000, help="Run validation every N samples")
     parser.add_argument("--warmup-samples", type=int, default=2000000, help="LR warmup samples")
@@ -647,6 +649,8 @@ if __name__ == "__main__":
         parser.error("--print-every must be >= 1")
     if args.muon_scope != "off" and args.shampoo_scope != "off":
         parser.error("muon-scope and shampoo-scope cannot both be enabled. Set one to 'off'.")
+    if args.symmetry_type == "all" and args.batch_size % 8 != 0:
+        parser.error("--batch-size must be divisible by 8 when --symmetry-type is 'all'")
 
     # Parse multi-gpus
     multi_gpu_device_ids = []
