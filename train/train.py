@@ -769,8 +769,6 @@ class Model(nn.Module):
 # ---------------------------------------------------------------------------
 # 损失计算（对齐 metrics_pytorch.py）
 # ---------------------------------------------------------------------------
-_FP_WEIGHT_CACHE = {}
-
 def compute_loss(
     model, postprocessed, batch, pos_len, is_training,
     soft_policy_weight_scale=8.0,
@@ -779,7 +777,6 @@ def compute_loss(
     seki_loss_scale=1.0,
     variance_time_loss_scale=1.0,
     disable_optimistic_policy=False,
-    _seki_weight_scale=None,
 ):
     (
         policy_logits, value_logits, td_value_logits, pred_td_score,
@@ -943,9 +940,7 @@ def compute_loss(
 
     # 未来落子位置
     fp_loss = torch.square(torch.tanh(futurepos_pretanh) - target_futurepos) * mask.unsqueeze(1)
-    if fp_loss.device not in _FP_WEIGHT_CACHE:
-        _FP_WEIGHT_CACHE[fp_loss.device] = torch.tensor([1.0, 0.25], device=fp_loss.device).view(1, 2, 1, 1)
-    fp_weight = _FP_WEIGHT_CACHE[fp_loss.device]
+    fp_weight = torch.tensor([1.0, 0.25], device=fp_loss.device).view(1, 2, 1, 1)
     loss_futurepos = 0.25 * (global_weight * target_weight_futurepos * (
         torch.sum(fp_loss * fp_weight, dim=(1, 2, 3)) / torch.sqrt(mask_sum_hw)
     )).sum()
@@ -957,13 +952,12 @@ def compute_loss(
     if is_training:
         unowned_proportion = torch.sum(unowned_target * mask, dim=(1, 2)) / (1.0 + mask_sum_hw)
         unowned_proportion = torch.mean(unowned_proportion * target_weight_ownership)
-        # seki_weight_scale 由调用方提供（通过 _seki_weight_scale 参数），
-        # 移动平均更新在训练循环中完成以避免 torch.compile graph break
-    else:
-        unowned_proportion = None
-
-    if _seki_weight_scale is not None:
-        seki_weight_scale = _seki_weight_scale
+        model.moving_unowned_proportion_sum *= 0.998
+        model.moving_unowned_proportion_weight *= 0.998
+        model.moving_unowned_proportion_sum += unowned_proportion.item()
+        model.moving_unowned_proportion_weight += 1.0
+        moving_unowned_proportion = model.moving_unowned_proportion_sum / model.moving_unowned_proportion_weight
+        seki_weight_scale = 8.0 * 0.005 / (0.005 + moving_unowned_proportion)
     else:
         seki_weight_scale = 7.0
 
@@ -1059,41 +1053,33 @@ def compute_loss(
         ).float()).sum()
 
     return loss_sum, {
-        "loss": loss_sum.detach(),
-        "p0loss": loss_policy_player.detach(),
-        "p1loss": loss_policy_opponent.detach(),
-        "p0softloss": loss_policy_player_soft.detach(),
-        "p1softloss": loss_policy_opponent_soft.detach(),
-        "p0lopt": loss_longoptimistic_policy.detach(),
-        "p0sopt": loss_shortoptimistic_policy.detach(),
-        "vloss": loss_value.detach(),
-        "tdvloss1": loss_td_value1.detach(),
-        "tdvloss2": loss_td_value2.detach(),
-        "tdvloss3": loss_td_value3.detach(),
-        "tdsloss": loss_td_score.detach(),
-        "oloss": loss_ownership.detach(),
-        "sloss": loss_scoring.detach(),
-        "fploss": loss_futurepos.detach(),
-        "skloss": loss_seki.detach(),
-        "smloss": loss_scoremean.detach(),
-        "sbcdfloss": loss_sb_cdf.detach(),
-        "sbpdfloss": loss_sb_pdf.detach(),
-        "sdregloss": loss_scorestdev.detach(),
-        "leadloss": loss_lead.detach(),
-        "vtimeloss": loss_variance_time.detach(),
-        "evstloss": loss_st_value_error.detach(),
-        "esstloss": loss_st_score_error.detach(),
-        "pacc1": policy_acc1.detach(),
-        "wsum": global_weight.sum().detach(),
-        "_unowned_proportion": unowned_proportion.detach() if unowned_proportion is not None else None,
+        "loss": loss_sum.item(),
+        "p0loss": loss_policy_player.item(),
+        "p1loss": loss_policy_opponent.item(),
+        "p0softloss": loss_policy_player_soft.item(),
+        "p1softloss": loss_policy_opponent_soft.item(),
+        "p0lopt": loss_longoptimistic_policy.item(),
+        "p0sopt": loss_shortoptimistic_policy.item(),
+        "vloss": loss_value.item(),
+        "tdvloss1": loss_td_value1.item(),
+        "tdvloss2": loss_td_value2.item(),
+        "tdvloss3": loss_td_value3.item(),
+        "tdsloss": loss_td_score.item(),
+        "oloss": loss_ownership.item(),
+        "sloss": loss_scoring.item(),
+        "fploss": loss_futurepos.item(),
+        "skloss": loss_seki.item(),
+        "smloss": loss_scoremean.item(),
+        "sbcdfloss": loss_sb_cdf.item(),
+        "sbpdfloss": loss_sb_pdf.item(),
+        "sdregloss": loss_scorestdev.item(),
+        "leadloss": loss_lead.item(),
+        "vtimeloss": loss_variance_time.item(),
+        "evstloss": loss_st_value_error.item(),
+        "esstloss": loss_st_score_error.item(),
+        "pacc1": policy_acc1.item(),
+        "wsum": global_weight.sum().item(),
     }
-
-
-def detensorify_metrics(metrics):
-    ret = {}
-    for key, val in metrics.items():
-        ret[key] = val.cpu().item() if isinstance(val, torch.Tensor) else val
-    return ret
 
 
 def estimate_forward_flops(config, pos_len):
@@ -1268,9 +1254,6 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         model.load_state_dict(state["model"])
         model.moving_unowned_proportion_sum = state.get("moving_unowned_proportion_sum", 0.0)
         model.moving_unowned_proportion_weight = state.get("moving_unowned_proportion_weight", 0.0)
-        cached_up = state.get("cached_unowned_proportion", None)
-        if cached_up is not None:
-            model._cached_unowned_proportion = cached_up
         global_step = state.get("global_step", 0)
         total_samples_trained = state.get("total_samples_trained", global_step * batch_size)
         logging.info(f"Resumed from step {global_step}, {total_samples_trained} samples")
@@ -1295,10 +1278,8 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     # torch.compile (MPS 后端不支持 inductor，自动关闭)
     if not args.no_compile and device.type != "mps":
         compiled_model = torch.compile(model, mode="default")
-        compiled_compute_loss = torch.compile(compute_loss, mode="default")
     else:
         compiled_model = model
-        compiled_compute_loss = compute_loss
 
     # DDP 包装
     if world_size > 1:
@@ -1421,7 +1402,6 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             "total_samples_trained": total_samples_trained,
             "moving_unowned_proportion_sum": model.moving_unowned_proportion_sum,
             "moving_unowned_proportion_weight": model.moving_unowned_proportion_weight,
-            "cached_unowned_proportion": getattr(model, '_cached_unowned_proportion', None),
         }
         if muon_opt is not None:
             state_dict["muon_state"] = muon_opt.state_dict()
@@ -1540,17 +1520,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
 
             # fp32 后处理
             postprocessed = model.postprocess(outputs)
-
-            # 计算 seki_weight_scale（移动平均逻辑在训练循环中完成，避免 torch.compile graph break）
-            if hasattr(model, '_cached_unowned_proportion'):
-                model.moving_unowned_proportion_sum *= 0.998
-                model.moving_unowned_proportion_weight *= 0.998
-                model.moving_unowned_proportion_sum += model._cached_unowned_proportion
-                model.moving_unowned_proportion_weight += 1.0
-            moving_unowned_proportion = model.moving_unowned_proportion_sum / max(model.moving_unowned_proportion_weight, 1e-10)
-            cur_seki_weight_scale = 8.0 * 0.005 / (0.005 + moving_unowned_proportion)
-
-            loss, metrics = compiled_compute_loss(
+            loss, metrics = compute_loss(
                 model, postprocessed, batch, pos_len,
                 is_training=True,
                 soft_policy_weight_scale=args.soft_policy_weight_scale,
@@ -1559,7 +1529,6 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                 seki_loss_scale=args.seki_loss_scale,
                 variance_time_loss_scale=args.variance_time_loss_scale,
                 disable_optimistic_policy=args.disable_optimistic_policy,
-                _seki_weight_scale=cur_seki_weight_scale,
             )
 
             loss.backward()
@@ -1578,14 +1547,6 @@ def main(rank, world_size, args, multi_gpu_device_ids):
 
             global_step += 1
             total_samples_trained += batch_size * world_size
-
-            # GPU→CPU 同步：在 backward + optimizer step 之后才转换
-            metrics = detensorify_metrics(metrics)
-
-            # 将 unowned_proportion 缓存为 float，用于下一步的移动平均更新
-            unowned_prop = metrics.pop("_unowned_proportion", None)
-            if unowned_prop is not None:
-                model._cached_unowned_proportion = unowned_prop
 
             # 累积指标
             for k in metrics:
@@ -1646,8 +1607,6 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                                 variance_time_loss_scale=args.variance_time_loss_scale,
                                 disable_optimistic_policy=args.disable_optimistic_policy,
                             )
-                            batch_metrics = detensorify_metrics(batch_metrics)
-                            batch_metrics.pop("_unowned_proportion", None)
                             for k in batch_metrics:
                                 val_metrics[k] += batch_metrics[k]
                             val_metrics["count"] += 1
