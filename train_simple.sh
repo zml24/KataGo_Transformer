@@ -1,3 +1,7 @@
+# 多卡 DDP 训练：取消下面 MULTI_GPUS 的注释，batch-size 为 per-GPU
+# MULTI_GPUS="-multi-gpus 0,1"
+MULTI_GPUS=""
+
 python3 -u train/train.py \
   -traindir data/train/base_adam_lr2e-4 \
   -datadir data/shuffleddata/kata1_trainingdata_25q4_2601 \
@@ -11,4 +15,5 @@ python3 -u train/train.py \
   -save-every-samples 1000000 \
   -val-every-samples 1000000 \
   -warmup-samples 2000000 \
-  -enable-history-matrices
+  -enable-history-matrices \
+  ${MULTI_GPUS}

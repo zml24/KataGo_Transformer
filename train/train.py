@@ -20,9 +20,27 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed
+import torch.multiprocessing
+from torch.nn.parallel import DistributedDataParallel
+import atexit
 
 import modelconfigs
 import data_processing_pytorch
+
+
+# ---------------------------------------------------------------------------
+# DDP 辅助
+# ---------------------------------------------------------------------------
+def multiprocessing_setup(rank: int, world_size: int, master_port: int):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = f'{master_port}'
+    logging.info(f"Running torch.distributed.init_process_group, rank={rank}, world_size={world_size}")
+    torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
+    logging.info(f"Returned from init_process_group, rank={rank}")
+
+def multiprocessing_cleanup():
+    torch.distributed.destroy_process_group()
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +249,7 @@ class ShampooOptimizer:
                 precond = inv_quarter_sandwich(
                     state["L"] / bias_corr2, momentum_2d_hat, state["R"] / bias_corr2,
                 )
+                precond = precond * (precond.size(0) * precond.size(1)) ** 0.25
 
                 # 累积 precond RMS
                 rms_sum += precond.norm() * self.lr_multiplier / precond.numel() ** 0.5
@@ -1066,69 +1085,43 @@ def compute_loss(
 # ---------------------------------------------------------------------------
 # 训练主循环
 # ---------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(description="Minimal Transformer training for KataGo")
-    parser.add_argument("-traindir", required=True, help="Training output directory")
-    parser.add_argument("-datadir", required=True, help="Data directory with train/ and val/ subdirs")
-    parser.add_argument("-pos-len", type=int, default=19, help="Board size")
-    parser.add_argument("-batch-size", type=int, default=256, help="Batch size")
-    parser.add_argument("-model-kind", type=str, default="b14c192h6tfrs-bng-silu", help="Model config name")
-    parser.add_argument("-lr", type=float, default=3e-4, help="Peak learning rate")
-    parser.add_argument("-wd", type=float, default=0.1, help="Weight decay")
-    parser.add_argument("-muon-scope", type=str, default="off", choices=["all", "blocks", "off"],
-                        help="Muon scope: all=all 2D non-norm params, blocks=only blocks.* params, off=pure AdamW")
-    parser.add_argument("-muon-momentum", type=float, default=0.95, help="Muon momentum beta")
-    parser.add_argument("-muon-lr-multiplier", type=float, default=0.2, help="Muon LR multiplier over base lr")
-    parser.add_argument("-muon-scale", type=str, default="moonlight", choices=["moonlight", "mup"],
-                        help="Muon update scale: moonlight=sqrt(max(m,n)), mup=sqrt(max(1,m/n))")
-    parser.add_argument("-shampoo-scope", type=str, default="off", choices=["all", "blocks", "off"],
-                        help="Shampoo scope: all=all 2D non-norm params, blocks=only blocks.* params, off=disabled")
-    parser.add_argument("-shampoo-lr-multiplier", type=float, default=30.0, help="Shampoo LR multiplier over base lr")
-    parser.add_argument("-shampoo-momentum", type=float, default=0.9, help="Shampoo momentum beta")
-    parser.add_argument("-shampoo-beta2", type=float, default=0.95, help="Shampoo L/R EMA coefficient")
-    parser.add_argument("-init-std", type=float, default=0.02, help="Init std for weights (Megatron-LM style)")
-    parser.add_argument("-max-training-samples", type=int, default=100000000, help="Total training samples")
-    parser.add_argument("-save-every-samples", type=int, default=1000000, help="Save checkpoint every N samples")
-    parser.add_argument("-symmetry-type", type=str, default="xyt", help="Data symmetry type")
-    parser.add_argument("-print-every", type=int, default=100, help="Print every N batches")
-    parser.add_argument("-val-every-samples", type=int, default=1000000, help="Run validation every N samples")
-    parser.add_argument("-warmup-samples", type=int, default=2000000, help="LR warmup samples")
-    parser.add_argument("-enable-history-matrices", action="store_true", help="Enable history matrices (for Go)")
-    parser.add_argument("-initial-checkpoint", type=str, default=None, help="Initial checkpoint to load from")
-    parser.add_argument("-no-compile", action="store_true", help="Disable torch.compile")
-    parser.add_argument("-soft-policy-weight-scale", type=float, default=8.0, help="Soft policy loss coeff")
-    parser.add_argument("-value-loss-scale", type=float, default=0.6, help="Value loss coeff")
-    parser.add_argument("-td-value-loss-scales", type=str, default="0.6,0.6,0.6", help="TD value loss coeffs")
-    parser.add_argument("-seki-loss-scale", type=float, default=1.0, help="Seki loss coeff")
-    parser.add_argument("-variance-time-loss-scale", type=float, default=1.0, help="Variance time loss coeff")
-    parser.add_argument("-disable-optimistic-policy", action="store_true", help="Disable optimistic policy")
-    parser.add_argument("-prefetch-batches", type=int, default=20, help="Prefetch queue depth (0=off, 2=recommended)")
-    parser.add_argument("-score-mode", type=str, default="simple", choices=["mixop", "mix", "simple"],
-                        help="Score belief head mode: mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
-    args = parser.parse_args()
-
-    # 互斥检查：muon 和 shampoo 不能同时启用
-    if args.muon_scope != "off" and args.shampoo_scope != "off":
-        parser.error("muon-scope and shampoo-scope cannot both be enabled. Set one to 'off'.")
-
+def main(rank, world_size, args, multi_gpu_device_ids):
     # 解析 td_value_loss_scales
     td_value_loss_scales = [float(x) for x in args.td_value_loss_scales.split(",")]
     assert len(td_value_loss_scales) == 3
 
     # 日志配置
     os.makedirs(args.traindir, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(message)s",
-        handlers=[
-            logging.FileHandler(os.path.join(args.traindir, "train.log"), mode="a"),
-            logging.StreamHandler(),
-        ],
-    )
+    logging.root.handlers = []
+    if rank == 0:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(message)s",
+            handlers=[
+                logging.FileHandler(os.path.join(args.traindir, f"train{rank}.log"), mode="a"),
+                logging.StreamHandler(),
+            ],
+        )
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(message)s",
+            handlers=[
+                logging.FileHandler(os.path.join(args.traindir, f"train{rank}.log"), mode="a"),
+            ],
+        )
     logging.info(f"Args: {vars(args)}")
 
+    # DDP 初始化
+    if world_size > 1:
+        multiprocessing_setup(rank, world_size, args.master_port)
+        atexit.register(multiprocessing_cleanup)
+
+    # 设备选择
     if torch.cuda.is_available():
-        device = torch.device("cuda")
+        my_gpu_id = multi_gpu_device_ids[rank]
+        torch.cuda.set_device(my_gpu_id)
+        device = torch.device("cuda", my_gpu_id)
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
@@ -1197,6 +1190,12 @@ def main():
         compiled_model = torch.compile(model, mode="default")
     else:
         compiled_model = model
+
+    # DDP 包装
+    if world_size > 1:
+        ddp_model = DistributedDataParallel(compiled_model, device_ids=[device])
+    else:
+        ddp_model = compiled_model
 
     # 参数统计
     total_params = sum(p.numel() for p in model.parameters())
@@ -1284,15 +1283,16 @@ def main():
     train_dir = os.path.join(args.datadir, "train")
     val_dir = os.path.join(args.datadir, "val")
 
-    # TensorBoard
-    try:
-        from torch.utils.tensorboard import SummaryWriter
-        tb_dir = os.path.join(args.traindir, "tb_logs")
-        tb_writer = SummaryWriter(log_dir=tb_dir)
-        logging.info(f"TensorBoard: {tb_dir}")
-    except ImportError:
-        tb_writer = None
-        logging.info("TensorBoard not available")
+    # TensorBoard（仅 rank 0）
+    tb_writer = None
+    if rank == 0:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_dir = os.path.join(args.traindir, "tb_logs")
+            tb_writer = SummaryWriter(log_dir=tb_dir)
+            logging.info(f"TensorBoard: {tb_dir}")
+        except ImportError:
+            logging.info("TensorBoard not available")
 
     # 保存 checkpoint
     def save_checkpoint():
@@ -1394,8 +1394,8 @@ def main():
         train_gen = data_processing_pytorch.read_npz_training_data(
             train_files,
             batch_size=batch_size,
-            world_size=1,
-            rank=0,
+            world_size=world_size,
+            rank=rank,
             pos_len=pos_len,
             device=device,
             symmetry_type=args.symmetry_type,
@@ -1409,7 +1409,7 @@ def main():
                 p.grad = None
 
             with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
-                outputs = compiled_model(batch["binaryInputNCHW"], batch["globalInputNC"])
+                outputs = ddp_model(batch["binaryInputNCHW"], batch["globalInputNC"])
 
             # fp32 后处理
             postprocessed = model.postprocess(outputs)
@@ -1439,7 +1439,7 @@ def main():
                 adam_opt.step(base_lr)
 
             global_step += 1
-            total_samples_trained += batch_size
+            total_samples_trained += batch_size * world_size
 
             # 累积指标
             for k in metrics:
@@ -1453,19 +1453,19 @@ def main():
                 running["adam_update_rms"] += adam_opt.last_update_rms
             running["count"] += 1
 
-            if global_step % args.print_every == 0:
+            if rank == 0 and global_step % args.print_every == 0:
                 time_now = time.perf_counter()
                 print_metrics(time_now - last_print_time)
                 reset_running()
                 last_print_time = time_now
 
-            # 定期保存
-            if total_samples_trained - last_save_samples >= args.save_every_samples:
+            # 定期保存（仅 rank 0）
+            if rank == 0 and total_samples_trained - last_save_samples >= args.save_every_samples:
                 save_checkpoint()
                 last_save_samples = total_samples_trained
 
-            # 验证
-            if total_samples_trained - last_val_samples >= args.val_every_samples:
+            # 验证（仅 rank 0）
+            if rank == 0 and total_samples_trained - last_val_samples >= args.val_every_samples:
                 last_val_samples = total_samples_trained
                 val_files = sorted(glob.glob(os.path.join(val_dir, "*.npz")))
                 if val_files:
@@ -1523,12 +1523,78 @@ def main():
             if total_samples_trained >= args.max_training_samples:
                 break
 
-    # 最终保存
-    save_checkpoint()
+    # 最终保存（仅 rank 0）
+    if rank == 0:
+        save_checkpoint()
     logging.info(f"Training complete: {total_samples_trained} samples, {global_step} steps")
     if tb_writer is not None:
         tb_writer.close()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Minimal Transformer training for KataGo")
+    parser.add_argument("-traindir", required=True, help="Training output directory")
+    parser.add_argument("-datadir", required=True, help="Data directory with train/ and val/ subdirs")
+    parser.add_argument("-pos-len", type=int, default=19, help="Board size")
+    parser.add_argument("-batch-size", type=int, default=256, help="Per-GPU batch size")
+    parser.add_argument("-model-kind", type=str, default="b14c192h6tfrs-bng-silu", help="Model config name")
+    parser.add_argument("-lr", type=float, default=3e-4, help="Peak learning rate")
+    parser.add_argument("-wd", type=float, default=0.1, help="Weight decay")
+    parser.add_argument("-muon-scope", type=str, default="off", choices=["all", "blocks", "off"],
+                        help="Muon scope: all=all 2D non-norm params, blocks=only blocks.* params, off=pure AdamW")
+    parser.add_argument("-muon-momentum", type=float, default=0.95, help="Muon momentum beta")
+    parser.add_argument("-muon-lr-multiplier", type=float, default=0.2, help="Muon LR multiplier over base lr")
+    parser.add_argument("-muon-scale", type=str, default="moonlight", choices=["moonlight", "mup"],
+                        help="Muon update scale: moonlight=sqrt(max(m,n)), mup=sqrt(max(1,m/n))")
+    parser.add_argument("-shampoo-scope", type=str, default="off", choices=["all", "blocks", "off"],
+                        help="Shampoo scope: all=all 2D non-norm params, blocks=only blocks.* params, off=disabled")
+    parser.add_argument("-shampoo-lr-multiplier", type=float, default=2.0, help="Shampoo LR multiplier over base lr")
+    parser.add_argument("-shampoo-momentum", type=float, default=0.9, help="Shampoo momentum beta")
+    parser.add_argument("-shampoo-beta2", type=float, default=0.95, help="Shampoo L/R EMA coefficient")
+    parser.add_argument("-init-std", type=float, default=0.02, help="Init std for weights (Megatron-LM style)")
+    parser.add_argument("-max-training-samples", type=int, default=100000000, help="Total training samples")
+    parser.add_argument("-save-every-samples", type=int, default=1000000, help="Save checkpoint every N samples")
+    parser.add_argument("-symmetry-type", type=str, default="xyt", help="Data symmetry type")
+    parser.add_argument("-print-every", type=int, default=100, help="Print every N batches")
+    parser.add_argument("-val-every-samples", type=int, default=1000000, help="Run validation every N samples")
+    parser.add_argument("-warmup-samples", type=int, default=2000000, help="LR warmup samples")
+    parser.add_argument("-enable-history-matrices", action="store_true", help="Enable history matrices (for Go)")
+    parser.add_argument("-initial-checkpoint", type=str, default=None, help="Initial checkpoint to load from")
+    parser.add_argument("-no-compile", action="store_true", help="Disable torch.compile")
+    parser.add_argument("-soft-policy-weight-scale", type=float, default=8.0, help="Soft policy loss coeff")
+    parser.add_argument("-value-loss-scale", type=float, default=0.6, help="Value loss coeff")
+    parser.add_argument("-td-value-loss-scales", type=str, default="0.6,0.6,0.6", help="TD value loss coeffs")
+    parser.add_argument("-seki-loss-scale", type=float, default=1.0, help="Seki loss coeff")
+    parser.add_argument("-variance-time-loss-scale", type=float, default=1.0, help="Variance time loss coeff")
+    parser.add_argument("-disable-optimistic-policy", action="store_true", help="Disable optimistic policy")
+    parser.add_argument("-multi-gpus", type=str, default=None, help="Comma-separated GPU device ids for DDP (e.g. 0,1,2,3)")
+    parser.add_argument("-master-port", type=int, default=23456, help="Localhost port for DDP communication")
+    parser.add_argument("-prefetch-batches", type=int, default=20, help="Prefetch queue depth (0=off, 2=recommended)")
+    parser.add_argument("-score-mode", type=str, default="simple", choices=["mixop", "mix", "simple"],
+                        help="Score belief head mode: mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
+    args = parser.parse_args()
+
+    # 互斥检查：muon 和 shampoo 不能同时启用
+    if args.muon_scope != "off" and args.shampoo_scope != "off":
+        parser.error("muon-scope and shampoo-scope cannot both be enabled. Set one to 'off'.")
+
+    # 解析 multi-gpus
+    multi_gpu_device_ids = []
+    if args.multi_gpus is not None:
+        for piece in args.multi_gpus.split(","):
+            piece = piece.strip()
+            multi_gpu_device_ids.append(int(piece))
+    else:
+        multi_gpu_device_ids = [0]
+
+    num_gpus_used = len(multi_gpu_device_ids)
+
+    if num_gpus_used > 1:
+        torch.multiprocessing.set_start_method("spawn")
+        torch.multiprocessing.spawn(
+            main,
+            nprocs=num_gpus_used,
+            args=(num_gpus_used, args, multi_gpu_device_ids),
+        )
+    else:
+        main(0, 1, args, multi_gpu_device_ids)
