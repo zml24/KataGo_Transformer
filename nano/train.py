@@ -28,6 +28,7 @@ import configs
 import data as data_processing
 from model import Model
 from optimizers import MuonOptimizer, ShampooOptimizer
+from zero import ZeROAdamW, ZeROMuon, ZeROShampoo
 from losses import compute_loss, postprocess_and_loss_core, _METRIC_KEYS, estimate_forward_flops, get_gpu_peak_tflops
 
 
@@ -38,7 +39,7 @@ def multiprocessing_setup(rank: int, world_size: int, master_port: int):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = f'{master_port}'
     logging.info(f"Running torch.distributed.init_process_group, rank={rank}, world_size={world_size}")
-    torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size, timeout=timedelta(seconds=120))
+    torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size, timeout=timedelta(seconds=600))
     logging.info(f"Returned from init_process_group, rank={rank}")
 
 def multiprocessing_cleanup():
@@ -79,6 +80,14 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     if world_size > 1:
         multiprocessing_setup(rank, world_size, args.master_port)
         atexit.register(multiprocessing_cleanup)
+
+    # Random seed
+    if args.seed is not None:
+        seed = args.seed + rank  # different seed per rank for data diversity
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
 
     # Device selection
     if torch.cuda.is_available():
@@ -190,12 +199,12 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     muon_params = {}
     shampoo_params = {}
     adam_params = {}
-    no_decay_params = []
+    no_decay_params = {}
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
         if p.dim() < 2 or "norm" in name:
-            no_decay_params.append(p)
+            no_decay_params[name] = p
         elif args.muon_scope == "all":
             muon_params[name] = p
         elif args.muon_scope == "blocks" and "blocks." in name:
@@ -210,7 +219,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     logging.info(f"Muon params: {sum(p.numel() for p in muon_params.values()):,}, "
                  f"Shampoo params: {sum(p.numel() for p in shampoo_params.values()):,}, "
                  f"Adam decay: {sum(p.numel() for p in adam_params.values()):,}, "
-                 f"AdamW no-decay: {sum(p.numel() for p in no_decay_params):,}")
+                 f"AdamW no-decay: {sum(p.numel() for p in no_decay_params.values()):,}")
 
     # FLOPs estimation
     forward_flops = estimate_forward_flops(model_config, pos_len)
@@ -220,39 +229,88 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     if gpu_peak_tflops > 0:
         logging.info(f"GPU BF16 peak: {gpu_peak_tflops:.1f} TFLOPS")
 
-    # torch.optim.AdamW for no_decay params (1D bias/norm) + adam_params (2D with decay)
-    adam_param_groups = [
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
-    if adam_params:
-        adam_param_groups.append({"params": list(adam_params.values()), "weight_decay": args.wd})
-    optimizer = torch.optim.AdamW(adam_param_groups, lr=args.lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
-
-    # Independent optimizer instances
-    muon_opt = MuonOptimizer(
-        muon_params, lr_multiplier=args.muon_lr_multiplier,
-        momentum=args.muon_momentum, wd=args.wd, scale_mode=args.muon_scale, device=device,
-    ) if muon_params else None
-    shampoo_opt = ShampooOptimizer(
-        shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
-        momentum=args.shampoo_momentum, wd=args.wd, beta2=args.shampoo_beta2, device=device,
-    ) if shampoo_params else None
+    # Optimizers: ZeRO Stage 1 when multi-GPU, plain otherwise
+    if world_size > 1:
+        zero_adam = ZeROAdamW(
+            adam_params, no_decay_params, lr=args.lr, betas=(0.9, 0.95),
+            wd=args.wd, device=device, rank=rank, world_size=world_size,
+        )
+        inner_optimizer = zero_adam.optimizer
+        muon_opt = ZeROMuon(
+            muon_params, lr_multiplier=args.muon_lr_multiplier,
+            momentum=args.muon_momentum, wd=args.wd, scale_mode=args.muon_scale,
+            device=device, rank=rank, world_size=world_size,
+        ) if muon_params else None
+        shampoo_opt = ZeROShampoo(
+            shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
+            momentum=args.shampoo_momentum, wd=args.wd, beta2=args.shampoo_beta2,
+            device=device, rank=rank, world_size=world_size,
+        ) if shampoo_params else None
+    else:
+        zero_adam = None
+        adam_param_groups = [
+            {"params": list(no_decay_params.values()), "weight_decay": 0.0},
+        ]
+        if adam_params:
+            adam_param_groups.append({"params": list(adam_params.values()), "weight_decay": args.wd})
+        inner_optimizer = torch.optim.AdamW(adam_param_groups, lr=args.lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
+        muon_opt = MuonOptimizer(
+            muon_params, lr_multiplier=args.muon_lr_multiplier,
+            momentum=args.muon_momentum, wd=args.wd, scale_mode=args.muon_scale, device=device,
+        ) if muon_params else None
+        shampoo_opt = ShampooOptimizer(
+            shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
+            momentum=args.shampoo_momentum, wd=args.wd, beta2=args.shampoo_beta2, device=device,
+        ) if shampoo_params else None
 
     # Restore optimizer state
+    is_zero = zero_adam is not None
     if os.path.exists(checkpoint_path):
+        # Assert training mode consistency — no switching ZeRO/non-ZeRO or optimizer config on resume
+        if "training_mode" in state:
+            saved_mode = state["training_mode"]
+            assert saved_mode["zero"] == is_zero, (
+                f"Cannot switch between ZeRO and non-ZeRO mode on resume. "
+                f"Checkpoint: zero={saved_mode['zero']}, current: zero={is_zero}"
+            )
+            assert saved_mode["has_muon"] == (muon_opt is not None), (
+                f"Cannot change optimizer config (Muon) on resume. "
+                f"Checkpoint: has_muon={saved_mode['has_muon']}, current: has_muon={muon_opt is not None}"
+            )
+            assert saved_mode["has_shampoo"] == (shampoo_opt is not None), (
+                f"Cannot change optimizer config (Shampoo) on resume. "
+                f"Checkpoint: has_shampoo={saved_mode['has_shampoo']}, current: has_shampoo={shampoo_opt is not None}"
+            )
+        else:
+            # Legacy checkpoint (pre-ZeRO): assume non-ZeRO
+            assert not is_zero, (
+                "Cannot resume a legacy (non-ZeRO) checkpoint in ZeRO mode. "
+                "Start fresh or re-run with single GPU."
+            )
+
         if "optimizer" in state:
-            optimizer.load_state_dict(state["optimizer"])
+            if is_zero:
+                zero_adam.load_state_distributed(state["optimizer"], device)
+            else:
+                inner_optimizer.load_state_dict(state["optimizer"])
             logging.info("Optimizer state loaded")
         if "muon_state" in state and muon_opt is not None:
-            muon_opt.load_state_dict(state["muon_state"], device)
+            if is_zero:
+                muon_opt.load_state_distributed(state["muon_state"], device)
+            else:
+                muon_opt.load_state_dict(state["muon_state"], device)
             logging.info("Muon state loaded")
         elif "muon_bufs" in state and muon_opt is not None:
+            # Legacy Muon format (momentum-only)
             for k, v in state["muon_bufs"].items():
                 if k in muon_opt.states:
                     muon_opt.states[k]["momentum"].copy_(v.to(device))
             logging.info("Muon momentum buffers loaded (legacy format)")
         if "shampoo_state" in state and shampoo_opt is not None:
-            shampoo_opt.load_state_dict(state["shampoo_state"], device)
+            if is_zero:
+                shampoo_opt.load_state_distributed(state["shampoo_state"], device)
+            else:
+                shampoo_opt.load_state_dict(state["shampoo_state"], device)
             logging.info("Shampoo state loaded")
     # LR schedule: linear warmup + cosine decay
     grad_accum_steps = args.grad_accum_steps
@@ -275,7 +333,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch=global_step - 1 if global_step > 0 else -1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(inner_optimizer, lr_lambda, last_epoch=global_step - 1 if global_step > 0 else -1)
 
     # Data directories
     train_dir = os.path.join(args.datadir, "train")
@@ -292,26 +350,52 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         except ImportError:
             logging.info("TensorBoard not available")
 
-    # Save checkpoint
+    # Save checkpoint (all ranks must call when ZeRO is active — gather is collective)
     def save_checkpoint():
-        state_dict = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "config": model_config,
-            "global_step": global_step,
-            "total_samples_trained": total_samples_trained,
-            "samples_per_step": samples_per_step,
-            "moving_unowned_proportion_sum": model.moving_unowned_proportion_sum,
-            "moving_unowned_proportion_weight": model.moving_unowned_proportion_weight,
-        }
-        if muon_opt is not None:
-            state_dict["muon_state"] = muon_opt.state_dict()
-        if shampoo_opt is not None:
-            state_dict["shampoo_state"] = shampoo_opt.state_dict()
-        path = os.path.join(args.traindir, "checkpoint.ckpt")
-        torch.save(state_dict, path + ".tmp")
-        os.replace(path + ".tmp", path)
-        logging.info(f"Saved checkpoint at step {global_step}, {total_samples_trained} samples")
+        # Gather optimizer states (collective operations)
+        if zero_adam is not None:
+            adam_state_gathered = zero_adam.gather_state_for_save()
+        else:
+            adam_state_gathered = None
+
+        if muon_opt is not None and zero_adam is not None:
+            muon_state_gathered = muon_opt.gather_state_for_save()
+        else:
+            muon_state_gathered = None
+
+        if shampoo_opt is not None and zero_adam is not None:
+            shampoo_state_gathered = shampoo_opt.gather_state_for_save()
+        else:
+            shampoo_state_gathered = None
+
+        # Only rank 0 writes the file
+        if rank == 0:
+            state_dict = {
+                "model": model.state_dict(),
+                "config": model_config,
+                "global_step": global_step,
+                "total_samples_trained": total_samples_trained,
+                "samples_per_step": samples_per_step,
+                "moving_unowned_proportion_sum": model.moving_unowned_proportion_sum,
+                "moving_unowned_proportion_weight": model.moving_unowned_proportion_weight,
+                "training_mode": {
+                    "zero": zero_adam is not None,
+                    "has_muon": muon_opt is not None,
+                    "has_shampoo": shampoo_opt is not None,
+                },
+            }
+            if zero_adam is not None:
+                state_dict["optimizer"] = adam_state_gathered  # name-based format
+            else:
+                state_dict["optimizer"] = inner_optimizer.state_dict()  # standard format
+            if muon_opt is not None:
+                state_dict["muon_state"] = muon_state_gathered if muon_state_gathered is not None else muon_opt.state_dict()
+            if shampoo_opt is not None:
+                state_dict["shampoo_state"] = shampoo_state_gathered if shampoo_state_gathered is not None else shampoo_opt.state_dict()
+            path = os.path.join(args.traindir, "checkpoint.ckpt")
+            torch.save(state_dict, path + ".tmp")
+            os.replace(path + ".tmp", path)
+            logging.info(f"Saved checkpoint at step {global_step}, {total_samples_trained} samples")
 
     # Metrics accumulation
     _metric_keys = [
@@ -419,6 +503,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             enable_history_matrices=args.enable_history_matrices,
             model_config=model_config,
             use_pin_memory=use_pin_memory,
+            seed=args.seed + rank if args.seed is not None else None,
         )
         for batch in data_processing.prefetch_generator(train_gen, args.prefetch_batches):
             # Clear gradients at the start of each accumulation cycle
@@ -480,11 +565,14 @@ def main(rank, world_size, args, multi_gpu_device_ids):
 
                 # Gradient clipping + optimizer step
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                if zero_adam is not None:
+                    zero_adam.step()        # includes broadcast sync
+                else:
+                    inner_optimizer.step()
                 scheduler.step()
-
-                # Muon / Shampoo / Adam update
                 base_lr = scheduler.get_last_lr()[0]
+
+                # Muon / Shampoo update (use same LR as AdamW for this step)
                 if muon_opt is not None:
                     muon_opt.step(base_lr)
                 if shampoo_opt is not None:
@@ -518,76 +606,78 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                         last_print_time = time_now
                     reset_running()
 
-                # Periodic save (rank 0 only)
-                if rank == 0 and total_samples_trained - last_save_samples >= args.save_every_samples:
+                # Periodic save (all ranks call save_checkpoint for ZeRO gather)
+                if total_samples_trained - last_save_samples >= args.save_every_samples:
                     t_save_start = time.perf_counter()
                     save_checkpoint()
-                    last_save_samples = total_samples_trained
                     last_print_time += time.perf_counter() - t_save_start
+                    last_save_samples = total_samples_trained
 
-                # Validation (rank 0 only)
-                if rank == 0 and total_samples_trained - last_val_samples >= args.val_every_samples:
-                    t_val_start = time.perf_counter()
-                    last_val_samples = total_samples_trained
-                    val_files = sorted(glob.glob(os.path.join(val_dir, "*.npz")))
-                    if val_files:
-                        model.eval()
-                        val_metrics = {k: 0.0 for k in _metric_keys}
-                        val_metrics["count"] = 0
-                        with torch.no_grad():
-                            val_gen = data_processing.read_npz_training_data(
-                                val_files[:3],
-                                batch_size=batch_size,
-                                world_size=1,
-                                rank=0,
-                                pos_len=pos_len,
-                                device=device,
-                                symmetry_type=None,
-                                include_meta=False,
-                                enable_history_matrices=args.enable_history_matrices,
-                                model_config=model_config,
-                                use_pin_memory=use_pin_memory,
-                            )
-                            for val_batch in data_processing.prefetch_generator(val_gen, args.prefetch_batches):
-                                with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
-                                    outputs = model(val_batch["binaryInputNCHW"], val_batch["globalInputNC"])
-                                _, batch_metrics = compute_loss(
-                                    model, outputs, val_batch, pos_len,
-                                    is_training=False,
-                                    soft_policy_weight_scale=args.soft_policy_weight_scale,
-                                    value_loss_scale=args.value_loss_scale,
-                                    td_value_loss_scales=td_value_loss_scales,
-                                    seki_loss_scale=args.seki_loss_scale,
-                                    variance_time_loss_scale=args.variance_time_loss_scale,
-                                    disable_optimistic_policy=args.disable_optimistic_policy,
+                # Validation (rank 0 validates, all ranks sync)
+                if total_samples_trained - last_val_samples >= args.val_every_samples:
+                    if rank == 0:
+                        t_val_start = time.perf_counter()
+                        val_files = sorted(glob.glob(os.path.join(val_dir, "*.npz")))
+                        if val_files:
+                            model.eval()
+                            val_metrics = {k: 0.0 for k in _metric_keys}
+                            val_metrics["count"] = 0
+                            with torch.no_grad():
+                                val_gen = data_processing.read_npz_training_data(
+                                    val_files[:3],
+                                    batch_size=batch_size,
+                                    world_size=1,
+                                    rank=0,
+                                    pos_len=pos_len,
+                                    device=device,
+                                    symmetry_type=None,
+                                    include_meta=False,
+                                    enable_history_matrices=args.enable_history_matrices,
+                                    model_config=model_config,
+                                    use_pin_memory=use_pin_memory,
                                 )
-                                for k in batch_metrics:
-                                    val_metrics[k] += batch_metrics[k]
-                                val_metrics["count"] += 1
+                                for val_batch in data_processing.prefetch_generator(val_gen, args.prefetch_batches):
+                                    with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
+                                        outputs = model(val_batch["binaryInputNCHW"], val_batch["globalInputNC"])
+                                    _, batch_metrics = compute_loss(
+                                        model, outputs, val_batch, pos_len,
+                                        is_training=False,
+                                        soft_policy_weight_scale=args.soft_policy_weight_scale,
+                                        value_loss_scale=args.value_loss_scale,
+                                        td_value_loss_scales=td_value_loss_scales,
+                                        seki_loss_scale=args.seki_loss_scale,
+                                        variance_time_loss_scale=args.variance_time_loss_scale,
+                                        disable_optimistic_policy=args.disable_optimistic_policy,
+                                    )
+                                    for k in batch_metrics:
+                                        val_metrics[k] += batch_metrics[k]
+                                    val_metrics["count"] += 1
 
-                        weight_sum = max(val_metrics["wsum"], 1e-10)
-                        batch_count = max(val_metrics["count"], 1)
-                        logging.info(
-                            f"  VAL [{total_samples_trained} samples]: loss={val_metrics['loss'] / batch_count:.4f}, "
-                            f"p0loss={val_metrics['p0loss'] / weight_sum:.4f}, "
-                            f"vloss={val_metrics['vloss'] / weight_sum:.4f}, "
-                            f"oloss={val_metrics['oloss'] / weight_sum:.4f}, "
-                            f"skloss={val_metrics['skloss'] / weight_sum:.4f}, "
-                            f"pacc1={val_metrics['pacc1'] / weight_sum:.4f}"
-                        )
-                        if tb_writer is not None:
-                            tb_writer.add_scalar("val/loss", val_metrics["loss"] / batch_count, total_samples_trained)
-                            for k in _per_sample_keys:
-                                tb_writer.add_scalar(f"val/{k}", val_metrics[k] / weight_sum, total_samples_trained)
-                        model.train()
-                    last_print_time += time.perf_counter() - t_val_start
+                            weight_sum = max(val_metrics["wsum"], 1e-10)
+                            batch_count = max(val_metrics["count"], 1)
+                            logging.info(
+                                f"  VAL [{total_samples_trained} samples]: loss={val_metrics['loss'] / batch_count:.4f}, "
+                                f"p0loss={val_metrics['p0loss'] / weight_sum:.4f}, "
+                                f"vloss={val_metrics['vloss'] / weight_sum:.4f}, "
+                                f"oloss={val_metrics['oloss'] / weight_sum:.4f}, "
+                                f"skloss={val_metrics['skloss'] / weight_sum:.4f}, "
+                                f"pacc1={val_metrics['pacc1'] / weight_sum:.4f}"
+                            )
+                            if tb_writer is not None:
+                                tb_writer.add_scalar("val/loss", val_metrics["loss"] / batch_count, total_samples_trained)
+                                for k in _per_sample_keys:
+                                    tb_writer.add_scalar(f"val/{k}", val_metrics[k] / weight_sum, total_samples_trained)
+                            model.train()
+                        last_print_time += time.perf_counter() - t_val_start
+                    if world_size > 1:
+                        torch.distributed.barrier()
+                    last_val_samples = total_samples_trained
 
                 if total_samples_trained >= args.max_training_samples:
                     break
 
-    # Final save (rank 0 only)
-    if rank == 0:
-        save_checkpoint()
+    # Final save (all ranks call for ZeRO gather; only rank 0 writes)
+    save_checkpoint()
     logging.info(f"Training complete: {total_samples_trained} samples, {global_step} steps")
     if tb_writer is not None:
         tb_writer.close()
@@ -600,7 +690,7 @@ if __name__ == "__main__":
     parser.add_argument("--pos-len", type=int, default=19, help="Board size")
     parser.add_argument("--batch-size", type=int, default=256, help="Per-GPU micro batch size")
     parser.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps")
-    parser.add_argument("--model-kind", type=str, default="b14c192", help="Model config preset name")
+    parser.add_argument("--model-kind", type=str, default="b12c192", help="Model config preset name")
     parser.add_argument("--num-layers", type=int, default=None, help="Number of transformer layers (overrides --model-kind)")
     parser.add_argument("--hidden-size", type=int, default=192, help="Hidden dimension")
     parser.add_argument("--num-heads", type=int, default=6, help="Number of attention heads")
@@ -640,6 +730,7 @@ if __name__ == "__main__":
     parser.add_argument("--prefetch-batches", type=int, default=20, help="Prefetch queue depth (0=off)")
     parser.add_argument("--score-mode", type=str, default="simple", choices=["mixop", "mix", "simple"],
                         help="Score belief head mode: mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     args = parser.parse_args()
 
     # Validation

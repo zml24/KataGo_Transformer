@@ -58,8 +58,12 @@ def read_npz_training_data(
     enable_history_matrices: bool,
     model_config: configs.ModelConfig,
     use_pin_memory: bool = False,
+    seed=None,
 ):
-    rand = np.random.default_rng(seed=list(os.urandom(12)))
+    if seed is not None:
+        rand = np.random.default_rng(seed=seed)
+    else:
+        rand = np.random.default_rng(seed=list(os.urandom(12)))
     num_bin_features = configs.get_num_bin_input_features(model_config)
     num_global_features = configs.get_num_global_input_features(model_config)
     if enable_history_matrices:
