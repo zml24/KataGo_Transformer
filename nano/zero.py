@@ -74,19 +74,54 @@ def _coalesced_broadcast(partitions, rank, world_size):
         params = list(partitions[src_rank].values())
         if not params:
             continue
-        if rank == src_rank:
-            flat = torch.cat([p.data.reshape(-1) for p in params])
-        else:
-            total_numel = sum(p.numel() for p in params)
-            flat = torch.empty(total_numel, dtype=params[0].dtype, device=params[0].device)
-        dist.broadcast(flat, src=src_rank)
-        if rank != src_rank:
-            # Unpack back into param tensors
-            offset = 0
-            for p in params:
-                numel = p.numel()
-                p.data.copy_(flat[offset:offset + numel].reshape(p.shape))
-                offset += numel
+        # Group by (device, dtype) to avoid implicit dtype promotion in torch.cat.
+        buckets = {}
+        for p in params:
+            key = (p.device, p.dtype)
+            if key not in buckets:
+                buckets[key] = []
+            buckets[key].append(p)
+
+        for (dev, dtype), bucket in buckets.items():
+            if rank == src_rank:
+                with torch.no_grad():
+                    flat = torch.cat([p.detach().reshape(-1) for p in bucket], dim=0).contiguous()
+            else:
+                total_numel = sum(p.numel() for p in bucket)
+                flat = torch.empty(total_numel, dtype=dtype, device=dev)
+            dist.broadcast(flat, src=src_rank)
+            if rank != src_rank:
+                # Unpack back into param tensors.
+                with torch.no_grad():
+                    offset = 0
+                    for p in bucket:
+                        numel = p.numel()
+                        p.copy_(flat[offset:offset + numel].reshape_as(p))
+                        offset += numel
+
+
+def sync_zero_params(optimizers, rank, world_size):
+    """Sync parameters once for multiple ZeRO optimizer wrappers.
+
+    Args:
+        optimizers: iterable of ZeRO optimizer wrappers (None entries allowed).
+        rank: local rank.
+        world_size: total number of ranks.
+    """
+    merged = [{} for _ in range(world_size)]
+    for opt in optimizers:
+        if opt is None:
+            continue
+        parts = opt.partitions
+        if len(parts) != world_size:
+            raise ValueError("Inconsistent world_size across ZeRO optimizers")
+        for r in range(world_size):
+            for name, p in parts[r].items():
+                if name in merged[r]:
+                    raise ValueError(f"Parameter '{name}' appears in multiple ZeRO optimizers on rank {r}")
+                merged[r][name] = p
+
+    _coalesced_broadcast(merged, rank, world_size)
 
 
 # ---------------------------------------------------------------------------
@@ -148,10 +183,14 @@ class ZeROAdamW:
         """Expose internal optimizer for LR scheduler."""
         return self._optimizer
 
-    def step(self):
-        """Run optimizer step on local partition, then broadcast all params."""
+    def step(self, sync=True):
+        """Run optimizer step on local partition.
+
+        If sync=True (default), broadcast updated params immediately.
+        """
         self._optimizer.step()
-        _coalesced_broadcast(self.partitions, self.rank, self.world_size)
+        if sync:
+            _coalesced_broadcast(self.partitions, self.rank, self.world_size)
 
     def gather_state_for_save(self):
         """Collective operation: gather optimizer state to rank 0 as name-based dict.
@@ -238,14 +277,15 @@ class ZeROMuon:
             f"cost {my_cost/max(total_cost,1)*100:.1f}%"
         )
 
-    def step(self, base_lr):
+    def step(self, base_lr, sync=True):
         if self._local_opt is not None:
             self._local_opt.step(base_lr)
             self.last_update_rms = self._local_opt.last_update_rms
         else:
             self.last_update_rms = 0.0
 
-        _coalesced_broadcast(self.partitions, self.rank, self.world_size)
+        if sync:
+            _coalesced_broadcast(self.partitions, self.rank, self.world_size)
 
         # Weighted all-reduce: global_rms = sqrt(sum(rms_i^2 * numel_i) / sum(numel_i))
         dev = next(iter(self._all_params.values())).device
@@ -310,14 +350,15 @@ class ZeROShampoo:
             f"cost {my_cost/max(total_cost,1)*100:.1f}%"
         )
 
-    def step(self, base_lr):
+    def step(self, base_lr, sync=True):
         if self._local_opt is not None:
             self._local_opt.step(base_lr)
             self.last_precond_rms = self._local_opt.last_precond_rms
         else:
             self.last_precond_rms = 0.0
 
-        _coalesced_broadcast(self.partitions, self.rank, self.world_size)
+        if sync:
+            _coalesced_broadcast(self.partitions, self.rank, self.world_size)
 
         # Weighted all-reduce: global_rms = sqrt(sum(rms_i^2 * numel_i) / sum(numel_i))
         dev = next(iter(self._all_params.values())).device

@@ -28,7 +28,7 @@ import configs
 import data as data_processing
 from model import Model
 from optimizers import MuonOptimizer, ShampooOptimizer
-from zero import ZeROAdamW, ZeROMuon, ZeROShampoo
+from zero import ZeROAdamW, ZeROMuon, ZeROShampoo, sync_zero_params
 from losses import compute_loss, postprocess_and_loss_core, _METRIC_KEYS, estimate_forward_flops, get_gpu_peak_tflops
 
 
@@ -566,7 +566,8 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                 # Gradient clipping + optimizer step
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 if zero_adam is not None:
-                    zero_adam.step()        # includes broadcast sync
+                    # Defer ZeRO param sync and do one coalesced sync after all optimizers step.
+                    zero_adam.step(sync=False)
                 else:
                     inner_optimizer.step()
                 scheduler.step()
@@ -574,9 +575,18 @@ def main(rank, world_size, args, multi_gpu_device_ids):
 
                 # Muon / Shampoo update (use same LR as AdamW for this step)
                 if muon_opt is not None:
-                    muon_opt.step(base_lr)
+                    if zero_adam is not None:
+                        muon_opt.step(base_lr, sync=False)
+                    else:
+                        muon_opt.step(base_lr)
                 if shampoo_opt is not None:
-                    shampoo_opt.step(base_lr)
+                    if zero_adam is not None:
+                        shampoo_opt.step(base_lr, sync=False)
+                    else:
+                        shampoo_opt.step(base_lr)
+                if zero_adam is not None:
+                    # Sync Adam + Muon/Shampoo owned parameters in a single collective pass.
+                    sync_zero_params([zero_adam, muon_opt, shampoo_opt], rank=rank, world_size=world_size)
                 global_step += 1
                 total_samples_trained += batch_size * world_size * grad_accum_steps
 
