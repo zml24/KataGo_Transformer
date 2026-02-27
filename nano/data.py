@@ -69,29 +69,41 @@ def read_npz_training_data(
 
     def load_npz_file(npz_file):
         with np.load(npz_file) as npz:
-            binaryInputNCHWPacked = npz["binaryInputNCHWPacked"]
+            is_preprocessed = "binaryInputNCHW" in npz
+
+            if is_preprocessed:
+                # Preprocessed format: already unpacked uint8 NCHW
+                binaryInputNCHW = npz["binaryInputNCHW"]
+                stored_pos_len = int(npz["pos_len"]) if "pos_len" in npz else None
+                if stored_pos_len is not None:
+                    assert stored_pos_len == pos_len, \
+                        f"pos_len mismatch: file has {stored_pos_len}, expected {pos_len}"
+                assert binaryInputNCHW.shape[2] == pos_len and binaryInputNCHW.shape[3] == pos_len, \
+                    f"Spatial dims {binaryInputNCHW.shape[2:]}, expected ({pos_len}, {pos_len})"
+            else:
+                # Original format: packed bits, need unpackbits
+                binaryInputNCHWPacked = npz["binaryInputNCHWPacked"]
+                binaryInputNCHW = np.unpackbits(binaryInputNCHWPacked, axis=2)
+                assert len(binaryInputNCHW.shape) == 3
+                assert binaryInputNCHW.shape[2] == ((pos_len * pos_len + 7) // 8) * 8
+                binaryInputNCHW = binaryInputNCHW[:, :, :pos_len * pos_len]
+                binaryInputNCHW = np.reshape(binaryInputNCHW, (
+                    binaryInputNCHW.shape[0], binaryInputNCHW.shape[1], pos_len, pos_len
+                ))  # uint8, no float32 conversion here
+
             globalInputNC = npz["globalInputNC"]
-            policyTargetsNCMove = npz["policyTargetsNCMove"].astype(np.float32)
+            policyTargetsNCMove = npz["policyTargetsNCMove"]
             globalTargetsNC = npz["globalTargetsNC"]
-            scoreDistrN = npz["scoreDistrN"].astype(np.float32)
-            valueTargetsNCHW = npz["valueTargetsNCHW"].astype(np.float32)
+            scoreDistrN = npz["scoreDistrN"]
+            valueTargetsNCHW = npz["valueTargetsNCHW"]
             if include_meta:
-                metadataInputNC = npz["metadataInputNC"].astype(np.float32)
+                metadataInputNC = npz["metadataInputNC"]
             else:
                 metadataInputNC = None
             if include_qvalues:
-                qValueTargetsNCMove = npz["qValueTargetsNCMove"].astype(np.float32)
+                qValueTargetsNCMove = npz["qValueTargetsNCMove"]
             else:
                 qValueTargetsNCMove = None
-        del npz
-
-        binaryInputNCHW = np.unpackbits(binaryInputNCHWPacked, axis=2)
-        assert len(binaryInputNCHW.shape) == 3
-        assert binaryInputNCHW.shape[2] == ((pos_len * pos_len + 7) // 8) * 8
-        binaryInputNCHW = binaryInputNCHW[:, :, :pos_len * pos_len]
-        binaryInputNCHW = np.reshape(binaryInputNCHW, (
-            binaryInputNCHW.shape[0], binaryInputNCHW.shape[1], pos_len, pos_len
-        )).astype(np.float32)
 
         assert binaryInputNCHW.shape[1] == num_bin_features
         assert globalInputNC.shape[1] == num_global_features
@@ -117,27 +129,27 @@ def read_npz_training_data(
                 end = start + batch_size
 
                 if use_pin_memory:
-                    batch_binaryInputNCHW = torch.from_numpy(binaryInputNCHW[start:end]).pin_memory().to(device, non_blocking=True)
-                    batch_globalInputNC = torch.from_numpy(globalInputNC[start:end]).pin_memory().to(device, non_blocking=True)
-                    batch_policyTargetsNCMove = torch.from_numpy(policyTargetsNCMove[start:end]).pin_memory().to(device, non_blocking=True)
-                    batch_globalTargetsNC = torch.from_numpy(globalTargetsNC[start:end]).pin_memory().to(device, non_blocking=True)
-                    batch_scoreDistrN = torch.from_numpy(scoreDistrN[start:end]).pin_memory().to(device, non_blocking=True)
-                    batch_valueTargetsNCHW = torch.from_numpy(valueTargetsNCHW[start:end]).pin_memory().to(device, non_blocking=True)
+                    batch_binaryInputNCHW = torch.from_numpy(binaryInputNCHW[start:end]).pin_memory().to(device, non_blocking=True).float()
+                    batch_globalInputNC = torch.from_numpy(globalInputNC[start:end]).pin_memory().to(device, non_blocking=True).float()
+                    batch_policyTargetsNCMove = torch.from_numpy(policyTargetsNCMove[start:end]).pin_memory().to(device, non_blocking=True).float()
+                    batch_globalTargetsNC = torch.from_numpy(globalTargetsNC[start:end]).pin_memory().to(device, non_blocking=True).float()
+                    batch_scoreDistrN = torch.from_numpy(scoreDistrN[start:end]).pin_memory().to(device, non_blocking=True).float()
+                    batch_valueTargetsNCHW = torch.from_numpy(valueTargetsNCHW[start:end]).pin_memory().to(device, non_blocking=True).float()
                     if include_meta:
-                        batch_metadataInputNC = torch.from_numpy(metadataInputNC[start:end]).pin_memory().to(device, non_blocking=True)
+                        batch_metadataInputNC = torch.from_numpy(metadataInputNC[start:end]).pin_memory().to(device, non_blocking=True).float()
                     if include_qvalues:
-                        batch_qValueTargetsNCMove = torch.from_numpy(qValueTargetsNCMove[start:end]).pin_memory().to(device, non_blocking=True)
+                        batch_qValueTargetsNCMove = torch.from_numpy(qValueTargetsNCMove[start:end]).pin_memory().to(device, non_blocking=True).float()
                 else:
-                    batch_binaryInputNCHW = torch.from_numpy(binaryInputNCHW[start:end]).to(device)
-                    batch_globalInputNC = torch.from_numpy(globalInputNC[start:end]).to(device)
-                    batch_policyTargetsNCMove = torch.from_numpy(policyTargetsNCMove[start:end]).to(device)
-                    batch_globalTargetsNC = torch.from_numpy(globalTargetsNC[start:end]).to(device)
-                    batch_scoreDistrN = torch.from_numpy(scoreDistrN[start:end]).to(device)
-                    batch_valueTargetsNCHW = torch.from_numpy(valueTargetsNCHW[start:end]).to(device)
+                    batch_binaryInputNCHW = torch.from_numpy(binaryInputNCHW[start:end]).to(device).float()
+                    batch_globalInputNC = torch.from_numpy(globalInputNC[start:end]).to(device).float()
+                    batch_policyTargetsNCMove = torch.from_numpy(policyTargetsNCMove[start:end]).to(device).float()
+                    batch_globalTargetsNC = torch.from_numpy(globalTargetsNC[start:end]).to(device).float()
+                    batch_scoreDistrN = torch.from_numpy(scoreDistrN[start:end]).to(device).float()
+                    batch_valueTargetsNCHW = torch.from_numpy(valueTargetsNCHW[start:end]).to(device).float()
                     if include_meta:
-                        batch_metadataInputNC = torch.from_numpy(metadataInputNC[start:end]).to(device)
+                        batch_metadataInputNC = torch.from_numpy(metadataInputNC[start:end]).to(device).float()
                     if include_qvalues:
-                        batch_qValueTargetsNCMove = torch.from_numpy(qValueTargetsNCMove[start:end]).to(device)
+                        batch_qValueTargetsNCMove = torch.from_numpy(qValueTargetsNCMove[start:end]).to(device).float()
 
                 if enable_history_matrices:
                     (batch_binaryInputNCHW, batch_globalInputNC) = apply_history_matrices(
