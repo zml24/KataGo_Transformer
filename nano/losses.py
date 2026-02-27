@@ -384,28 +384,22 @@ def compute_loss(
 def estimate_forward_flops(config, pos_len):
     """Estimate forward-pass FLOPs for a single sample."""
     S = pos_len * pos_len
-    D = config["trunk_num_channels"]
-    num_heads = config.get("transformer_heads", 4)
-    num_kv_heads = config.get("transformer_kv_heads", num_heads)
-    head_dim = D // num_heads
-    D_kv = num_kv_heads * head_dim
-    FF = config.get("transformer_ffn_channels", D * 2)
-    num_blocks = len(config["block_kind"])
+    D = config["hidden_size"]
+    FF = config["ffn_dim"]
+    num_blocks = config["num_layers"]
 
-    # Per TransformerBlock
-    attn_proj = 2 * S * (D * D + 2 * D * D_kv)
+    # Per TransformerBlock (MHA: Q/K/V all have dimension D)
+    attn_proj = 2 * S * D * D * 4  # Q, K, V, Out projections
     attn_scores = 2 * S * S * D
     attn_values = 2 * S * S * D
-    out_proj = 2 * S * D * D
-    ffn = 3 * 2 * S * D * FF
-    block_flops = attn_proj + attn_scores + attn_values + out_proj + ffn
+    ffn = 3 * 2 * S * D * FF  # SwiGLU: w1, wgate, w2
+    block_flops = attn_proj + attn_scores + attn_values + ffn
     trunk_flops = block_flops * num_blocks
 
-    # Input layer
+    # Input layer (3x3 conv)
     num_bin_features = get_num_bin_input_features(config)
     num_global_features = get_num_global_input_features(config)
-    K = 1 if config.get("initial_conv_1x1", False) else 3
-    conv_flops = 2 * num_bin_features * D * K * K * S
+    conv_flops = 2 * num_bin_features * D * 9 * S
     global_flops = 2 * num_global_features * D
 
     # Output heads

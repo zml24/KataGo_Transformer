@@ -8,7 +8,7 @@ python3 -u train.py \
     --datadir ../data/shuffleddata/kata1_trainingdata_25q4_2601 \
     --pos-len 19 \
     --batch-size 1024 \
-    --model-kind b12c768h12tfrs \
+    --model-kind b12c768 \
     --lr 2e-4 \
     --max-training-samples 300000000 \
     --symmetry-type xyt \

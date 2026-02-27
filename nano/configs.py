@@ -1,4 +1,4 @@
-"""Transformer-only model configurations for KataGo nano training."""
+"""Minimal transformer model configurations for KataGo nano training."""
 
 from typing import Dict, Any
 
@@ -29,137 +29,66 @@ def get_num_global_input_features(config: ModelConfig):
         assert False
 
 
+def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebeliefs=8, version=15):
+    """Create a model config from minimal parameters.
+
+    Args:
+        num_layers: Number of transformer blocks.
+        hidden_size: Hidden dimension (trunk channels).
+        num_heads: Number of attention heads.
+        ffn_dim: SwiGLU FFN intermediate dimension. Default: hidden_size * 8 // 3.
+        num_scorebeliefs: Number of score belief mixtures. Default: 8.
+        version: Data format version. Default: 15.
+    """
+    if ffn_dim is None:
+        ffn_dim = hidden_size * 8 // 3
+    return {
+        "version": version,
+        "num_layers": num_layers,
+        "hidden_size": hidden_size,
+        "num_heads": num_heads,
+        "ffn_dim": ffn_dim,
+        "num_scorebeliefs": num_scorebeliefs,
+    }
+
+
+def migrate_config(old: ModelConfig) -> ModelConfig:
+    """Convert old-format config (with trunk_num_channels etc.) to new minimal format."""
+    if "hidden_size" in old:
+        return old
+    return make_config(
+        num_layers=len(old["block_kind"]),
+        hidden_size=old["trunk_num_channels"],
+        num_heads=old["transformer_heads"],
+        ffn_dim=old.get("transformer_ffn_channels", old["trunk_num_channels"] * 8 // 3),
+        num_scorebeliefs=old.get("num_scorebeliefs", 8),
+        version=old.get("version", 15),
+    )
+
+
 # ---------------------------------------------------------------------------
-# Transformer configs (RoPE + SwiGLU)
+# Predefined model configs
 # ---------------------------------------------------------------------------
 
 # ~1.3M params — tiny, for debugging
-b11c96h3tfrs = {
-    "version": 15,
-    "norm_kind": "fixup",
-    "bnorm_epsilon": 1e-4,
-    "bnorm_running_avg_momentum": 0.001,
-    "initial_conv_1x1": False,
-    "trunk_num_channels": 96,
-    "mid_num_channels": 96,
-    "gpool_num_channels": 32,
-    "transformer_ffn_channels": 256,
-    "transformer_heads": 3,
-    "transformer_kv_heads": 3,
-    "use_attention_pool": False,
-    "num_attention_pool_heads": 4,
-    "block_kind": [["rconv%d" % (i+1), "transformerropesg"] for i in range(11)],
-    "p1_num_channels": 32,
-    "g1_num_channels": 32,
-    "v1_num_channels": 32,
-    "sbv2_num_channels": 48,
-    "num_scorebeliefs": 4,
-    "v2_size": 64,
-}
+b11c96 = make_config(11, 96, 3, ffn_dim=256, num_scorebeliefs=4)
 
 # ~6M params
-b14c192h6tfrs = {
-    "version": 15,
-    "norm_kind": "fixup",
-    "bnorm_epsilon": 1e-4,
-    "bnorm_running_avg_momentum": 0.001,
-    "initial_conv_1x1": False,
-    "trunk_num_channels": 192,
-    "mid_num_channels": 192,
-    "gpool_num_channels": 32,
-    "transformer_ffn_channels": 512,
-    "transformer_heads": 6,
-    "transformer_kv_heads": 6,
-    "use_attention_pool": False,
-    "num_attention_pool_heads": 4,
-    "block_kind": [["rconv%d" % (i+1), "transformerropesg"] for i in range(14)],
-    "p1_num_channels": 32,
-    "g1_num_channels": 32,
-    "v1_num_channels": 32,
-    "sbv2_num_channels": 80,
-    "num_scorebeliefs": 8,
-    "v2_size": 96,
-}
+b14c192 = make_config(14, 192, 6, ffn_dim=512)
 
 # ~20M params
-b12c384h12tfrs = {
-    "version": 15,
-    "norm_kind": "fixup",
-    "bnorm_epsilon": 1e-4,
-    "bnorm_running_avg_momentum": 0.001,
-    "initial_conv_1x1": False,
-    "trunk_num_channels": 384,
-    "mid_num_channels": 384,
-    "gpool_num_channels": 64,
-    "transformer_ffn_channels": 1024,
-    "transformer_heads": 12,
-    "transformer_kv_heads": 12,
-    "use_attention_pool": False,
-    "num_attention_pool_heads": 4,
-    "block_kind": [["rconv%d" % (i+1), "transformerropesg"] for i in range(12)],
-    "p1_num_channels": 48,
-    "g1_num_channels": 48,
-    "v1_num_channels": 96,
-    "sbv2_num_channels": 112,
-    "num_scorebeliefs": 8,
-    "v2_size": 128,
-}
+b12c384 = make_config(12, 384, 12, ffn_dim=1024)
 
-# ~85M params — train_simple.sh default
-b12c768h12tfrs = {
-    "version": 15,
-    "norm_kind": "fixup",
-    "bnorm_epsilon": 1e-4,
-    "bnorm_running_avg_momentum": 0.001,
-    "initial_conv_1x1": False,
-    "trunk_num_channels": 768,
-    "mid_num_channels": 768,
-    "gpool_num_channels": 128,
-    "transformer_ffn_channels": 2048,
-    "transformer_heads": 12,
-    "transformer_kv_heads": 12,
-    "use_attention_pool": False,
-    "num_attention_pool_heads": 4,
-    "block_kind": [["rconv%d" % (i+1), "transformerropesg"] for i in range(12)],
-    "p1_num_channels": 64,
-    "g1_num_channels": 64,
-    "v1_num_channels": 128,
-    "sbv2_num_channels": 128,
-    "num_scorebeliefs": 8,
-    "v2_size": 144,
-}
+# ~85M params
+b12c768 = make_config(12, 768, 12, ffn_dim=2048)
 
 # ~300M params
-b24c1024h16tfrs = {
-    "version": 15,
-    "norm_kind": "fixup",
-    "bnorm_epsilon": 1e-4,
-    "bnorm_running_avg_momentum": 0.001,
-    "initial_conv_1x1": False,
-    "trunk_num_channels": 1024,
-    "mid_num_channels": 1024,
-    "gpool_num_channels": 128,
-    "transformer_ffn_channels": 3072,
-    "transformer_heads": 16,
-    "transformer_kv_heads": 16,
-    "use_attention_pool": False,
-    "num_attention_pool_heads": 4,
-    "block_kind": [["rconv%d" % (i+1), "transformerropesg"] for i in range(24)],
-    "p1_num_channels": 64,
-    "g1_num_channels": 64,
-    "v1_num_channels": 128,
-    "sbv2_num_channels": 128,
-    "num_scorebeliefs": 8,
-    "v2_size": 144,
-}
+b24c1024 = make_config(24, 1024, 16, ffn_dim=3072)
 
-# ---------------------------------------------------------------------------
-# config_of_name: same access pattern as the original modelconfigs.py
-# ---------------------------------------------------------------------------
 config_of_name = {
-    "b11c96h3tfrs": b11c96h3tfrs,
-    "b14c192h6tfrs": b14c192h6tfrs,
-    "b12c384h12tfrs": b12c384h12tfrs,
-    "b12c768h12tfrs": b12c768h12tfrs,
-    "b24c1024h16tfrs": b24c1024h16tfrs,
+    "b11c96": b11c96,
+    "b14c192": b14c192,
+    "b12c384": b12c384,
+    "b12c768": b12c768,
+    "b24c1024": b24c1024,
 }

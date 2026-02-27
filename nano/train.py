@@ -111,7 +111,14 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         use_amp = False
 
     # Model config
-    model_config = configs.config_of_name[args.model_kind].copy()
+    if args.num_layers is not None:
+        model_config = configs.make_config(
+            num_layers=args.num_layers,
+            hidden_size=args.hidden_size,
+            num_heads=args.num_heads,
+        )
+    else:
+        model_config = configs.config_of_name[args.model_kind].copy()
     logging.info(f"Model config: {json.dumps(model_config, indent=2, default=str)}")
 
     pos_len = args.pos_len
@@ -122,7 +129,12 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     if os.path.exists(checkpoint_path):
         logging.info(f"Loading checkpoint: {checkpoint_path}")
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        model_config = state.get("config", model_config)
+        ckpt_config = configs.migrate_config(state.get("config", model_config))
+        if ckpt_config != model_config:
+            logging.warning(f"Checkpoint config differs from command-line config, using checkpoint config")
+            logging.warning(f"  checkpoint: {ckpt_config}")
+            logging.warning(f"  command-line: {model_config}")
+        model_config = ckpt_config
         model = Model(model_config, pos_len, score_mode=args.score_mode)
         model.load_state_dict(state["model"])
         model.moving_unowned_proportion_sum = state.get("moving_unowned_proportion_sum", 0.0)
@@ -140,7 +152,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     elif args.initial_checkpoint is not None:
         logging.info(f"Loading initial checkpoint: {args.initial_checkpoint}")
         state = torch.load(args.initial_checkpoint, map_location="cpu", weights_only=False)
-        model_config = state.get("config", model_config)
+        model_config = configs.migrate_config(state.get("config", model_config))
         model = Model(model_config, pos_len, score_mode=args.score_mode)
         model.load_state_dict(state["model"])
         global_step = 0
@@ -588,7 +600,10 @@ if __name__ == "__main__":
     parser.add_argument("--pos-len", type=int, default=19, help="Board size")
     parser.add_argument("--batch-size", type=int, default=256, help="Per-GPU micro batch size")
     parser.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps")
-    parser.add_argument("--model-kind", type=str, default="b14c192h6tfrs", help="Model config name")
+    parser.add_argument("--model-kind", type=str, default="b14c192", help="Model config preset name")
+    parser.add_argument("--num-layers", type=int, default=None, help="Number of transformer layers (overrides --model-kind)")
+    parser.add_argument("--hidden-size", type=int, default=192, help="Hidden dimension")
+    parser.add_argument("--num-heads", type=int, default=6, help="Number of attention heads")
     parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate")
     parser.add_argument("--wd", type=float, default=0.1, help="Weight decay")
     parser.add_argument("--muon-scope", type=str, default="off", choices=["all", "blocks", "off"],

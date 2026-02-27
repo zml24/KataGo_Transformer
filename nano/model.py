@@ -79,21 +79,19 @@ class RMSNormFP32(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Transformer Block (NLC format, RoPE + GQA + SwiGLU + RMSNorm)
+# Transformer Block (NLC format, RoPE + MHA + SwiGLU + RMSNorm)
 # ---------------------------------------------------------------------------
 class TransformerBlock(nn.Module):
-    def __init__(self, c_main: int, num_heads: int, num_kv_heads: int,
+    def __init__(self, c_main: int, num_heads: int,
                  ffn_dim: int, pos_len: int, rope_theta: float = 100.0):
         super().__init__()
         self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.n_rep = num_heads // num_kv_heads
         self.head_dim = c_main // num_heads
         self.ffn_dim = ffn_dim
 
         self.q_proj = nn.Linear(c_main, c_main, bias=False)
-        self.k_proj = nn.Linear(c_main, num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(c_main, num_kv_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(c_main, c_main, bias=False)
+        self.v_proj = nn.Linear(c_main, c_main, bias=False)
         self.out_proj = nn.Linear(c_main, c_main, bias=False)
 
         cos_cached, sin_cached = precompute_freqs_cos_sin_2d(self.head_dim, pos_len, rope_theta)
@@ -117,20 +115,15 @@ class TransformerBlock(nn.Module):
         x_normed = self.norm1(x)
 
         q = self.q_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
-        k = self.k_proj(x_normed).view(B, L, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(x_normed).view(B, L, self.num_kv_heads, self.head_dim)
+        k = self.k_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
+        v = self.v_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
 
         q, k = apply_rotary_emb(q, k, self.cos_cached, self.sin_cached)
 
-        # SDPA: (B, H, S, D), manual GQA expand
+        # SDPA: (B, H, S, D)
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
-        if self.n_rep > 1:
-            k = k.unsqueeze(2).expand(B, self.num_kv_heads, self.n_rep, L, self.head_dim)
-            k = k.reshape(B, self.num_heads, L, self.head_dim)
-            v = v.unsqueeze(2).expand(B, self.num_kv_heads, self.n_rep, L, self.head_dim)
-            v = v.reshape(B, self.num_heads, L, self.head_dim)
         attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
         attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, C)
         x = x + self.out_proj(attn_out)
@@ -169,13 +162,12 @@ class PolicyHead(nn.Module):
 # ValueHead (NLC input, per-position + mean-pool projection)
 # ---------------------------------------------------------------------------
 class ValueHead(nn.Module):
-    def __init__(self, c_in, c_sv2, num_scorebeliefs, pos_len, score_mode="mixop"):
+    def __init__(self, c_in, num_scorebeliefs, pos_len, score_mode="mixop"):
         super().__init__()
         self.pos_len = pos_len
         self.scorebelief_mid = pos_len * pos_len + EXTRA_SCORE_DISTR_RADIUS
         self.scorebelief_len = self.scorebelief_mid * 2
         self.num_scorebeliefs = num_scorebeliefs
-        self.c_sv2 = c_sv2
         self.score_mode = score_mode
 
         # Per-position: ownership(1) + scoring(1) + futurepos(2) + seki(4)
@@ -271,43 +263,35 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
-        self.c_trunk = config["trunk_num_channels"]
+        self.c_trunk = config["hidden_size"]
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
 
-        num_heads = config.get("transformer_heads", 4)
-        num_kv_heads = config.get("transformer_kv_heads", num_heads)
-        ffn_dim = config.get("transformer_ffn_channels", self.c_trunk * 2)
-        rope_theta = config.get("rope_theta", 100.0)
+        num_heads = config["num_heads"]
+        ffn_dim = config["ffn_dim"]
 
         # Stem
-        if config.get("initial_conv_1x1", False):
-            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=1, padding="same", bias=False)
-        else:
-            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
+        self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
         self.linear_global = nn.Linear(num_global_features, self.c_trunk, bias=False)
 
         # Transformer blocks
         self.blocks = nn.ModuleList()
-        for _ in config["block_kind"]:
+        for _ in range(config["num_layers"]):
             self.blocks.append(TransformerBlock(
                 c_main=self.c_trunk,
                 num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
                 ffn_dim=ffn_dim,
                 pos_len=pos_len,
-                rope_theta=rope_theta,
             ))
 
         # Final normalization
         self.norm_final = RMSNormFP32(self.c_trunk, eps=1e-6)
 
         # Output heads
-        c_sv2 = config["sbv2_num_channels"]
         num_scorebeliefs = config["num_scorebeliefs"]
 
         self.policy_head = PolicyHead(self.c_trunk, pos_len)
-        self.value_head = ValueHead(self.c_trunk, c_sv2, num_scorebeliefs, pos_len, score_mode=score_mode)
+        self.value_head = ValueHead(self.c_trunk, num_scorebeliefs, pos_len, score_mode=score_mode)
 
         # Seki dynamic weight moving average state
         self.moving_unowned_proportion_sum = 0.0
