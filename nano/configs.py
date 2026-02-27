@@ -70,13 +70,10 @@ def migrate_config(old: ModelConfig) -> ModelConfig:
 # Predefined model configs
 # ---------------------------------------------------------------------------
 
-# ~1.3M params — tiny, for debugging
-b11c96 = make_config(11, 96, 3, ffn_dim=256, num_scorebeliefs=4)
+# ~5M params — tiny, for debugging
+b12c192 = make_config(12, 192, 6, ffn_dim=512)
 
-# ~6M params
-b14c192 = make_config(14, 192, 6, ffn_dim=512)
-
-# ~20M params
+# ~22M params
 b12c384 = make_config(12, 384, 12, ffn_dim=1024)
 
 # ~85M params
@@ -86,8 +83,7 @@ b12c768 = make_config(12, 768, 12, ffn_dim=2048)
 b24c1024 = make_config(24, 1024, 16, ffn_dim=3072)
 
 config_of_name = {
-    "b11c96": b11c96,
-    "b14c192": b14c192,
+    "b12c192": b12c192,
     "b12c384": b12c384,
     "b12c768": b12c768,
     "b24c1024": b24c1024,
