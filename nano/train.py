@@ -229,8 +229,8 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     if gpu_peak_tflops > 0:
         logging.info(f"GPU BF16 peak: {gpu_peak_tflops:.1f} TFLOPS")
 
-    # Optimizers: ZeRO Stage 1 when multi-GPU, plain otherwise
-    if world_size > 1:
+    # Optimizers: ZeRO Stage 1 when --zero flag is set, plain otherwise
+    if args.zero:
         zero_adam = ZeROAdamW(
             adam_params, no_decay_params, lr=args.lr, betas=(0.9, 0.95),
             wd=args.wd, device=device, rank=rank, world_size=world_size,
@@ -731,6 +731,7 @@ if __name__ == "__main__":
     parser.add_argument("--score-mode", type=str, default="simple", choices=["mixop", "mix", "simple"],
                         help="Score belief head mode: mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--zero", action="store_true", help="Enable ZeRO Stage 1 optimizer state partitioning (requires --multi-gpus)")
     args = parser.parse_args()
 
     # Validation
@@ -742,6 +743,8 @@ if __name__ == "__main__":
         parser.error("muon-scope and shampoo-scope cannot both be enabled. Set one to 'off'.")
     if args.symmetry_type == "all" and args.batch_size % 8 != 0:
         parser.error("--batch-size must be divisible by 8 when --symmetry-type is 'all'")
+    if args.zero and args.multi_gpus is None:
+        parser.error("--zero requires --multi-gpus")
 
     # Parse multi-gpus
     multi_gpu_device_ids = []
