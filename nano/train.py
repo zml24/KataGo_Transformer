@@ -12,6 +12,8 @@ import time
 import logging
 import json
 import glob
+import signal
+from datetime import timedelta
 import numpy as np
 
 import torch
@@ -36,7 +38,7 @@ def multiprocessing_setup(rank: int, world_size: int, master_port: int):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = f'{master_port}'
     logging.info(f"Running torch.distributed.init_process_group, rank={rank}, world_size={world_size}")
-    torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size, timeout=timedelta(seconds=120))
     logging.info(f"Returned from init_process_group, rank={rank}")
 
 def multiprocessing_cleanup():
@@ -644,10 +646,14 @@ if __name__ == "__main__":
 
     if num_gpus_used > 1:
         torch.multiprocessing.set_start_method("spawn")
-        torch.multiprocessing.spawn(
-            main,
-            nprocs=num_gpus_used,
-            args=(num_gpus_used, args, multi_gpu_device_ids),
-        )
+        try:
+            torch.multiprocessing.spawn(
+                main,
+                nprocs=num_gpus_used,
+                args=(num_gpus_used, args, multi_gpu_device_ids),
+            )
+        except KeyboardInterrupt:
+            print("\nInterrupted. Killing all worker processes...", file=sys.stderr, flush=True)
+            os.killpg(os.getpgid(os.getpid()), signal.SIGKILL)
     else:
         main(0, 1, args, multi_gpu_device_ids)
