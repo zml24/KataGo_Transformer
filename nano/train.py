@@ -120,7 +120,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         logging.info(f"Loading checkpoint: {checkpoint_path}")
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         model_config = state.get("config", model_config)
-        model = Model(model_config, pos_len, score_mode=args.score_mode)
+        model = Model(model_config, pos_len, score_mode=args.score_mode, attn_backend=args.attn_backend)
         model.load_state_dict(state["model"])
         model.moving_unowned_proportion_sum = state.get("moving_unowned_proportion_sum", 0.0)
         model.moving_unowned_proportion_weight = state.get("moving_unowned_proportion_weight", 0.0)
@@ -131,13 +131,13 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         logging.info(f"Loading initial checkpoint: {args.initial_checkpoint}")
         state = torch.load(args.initial_checkpoint, map_location="cpu", weights_only=False)
         model_config = state.get("config", model_config)
-        model = Model(model_config, pos_len, score_mode=args.score_mode)
+        model = Model(model_config, pos_len, score_mode=args.score_mode, attn_backend=args.attn_backend)
         model.load_state_dict(state["model"])
         global_step = 0
         total_samples_trained = 0
     else:
         logging.info("Creating new model")
-        model = Model(model_config, pos_len, score_mode=args.score_mode)
+        model = Model(model_config, pos_len, score_mode=args.score_mode, attn_backend=args.attn_backend)
         model.initialize(init_std=args.init_std)
         logging.info(f"Initialized weights with std={args.init_std}, output_std={args.init_std / math.sqrt(2.0 * len(model.blocks)):.6f}")
         global_step = 0
@@ -147,7 +147,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
 
     # torch.compile
     if not args.no_compile and device.type != "mps":
-        compiled_model = torch.compile(model, mode="reduce-overhead")
+        compiled_model = torch.compile(model, mode="default")
         compiled_loss_fn = torch.compile(postprocess_and_loss_core, mode="reduce-overhead")
     else:
         compiled_model = model
@@ -542,6 +542,8 @@ if __name__ == "__main__":
     parser.add_argument("--prefetch-batches", type=int, default=20, help="Prefetch queue depth (0=off)")
     parser.add_argument("--score-mode", type=str, default="simple", choices=["mixop", "mix", "simple"],
                         help="Score belief head mode: mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
+    parser.add_argument("--attn-backend", type=str, default="sdpa", choices=["sdpa", "flex"],
+                        help="Attention backend: sdpa=F.scaled_dot_product_attention, flex=FlexAttention")
     args = parser.parse_args()
 
     # Mutual exclusion check

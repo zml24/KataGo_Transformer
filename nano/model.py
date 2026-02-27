@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
 from configs import get_num_bin_input_features, get_num_global_input_features
 
@@ -83,13 +84,15 @@ class RMSNormFP32(nn.Module):
 # ---------------------------------------------------------------------------
 class TransformerBlock(nn.Module):
     def __init__(self, c_main: int, num_heads: int, num_kv_heads: int,
-                 ffn_dim: int, pos_len: int, rope_theta: float = 100.0):
+                 ffn_dim: int, pos_len: int, rope_theta: float = 100.0,
+                 attn_backend: str = "sdpa"):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.n_rep = num_heads // num_kv_heads
         self.head_dim = c_main // num_heads
         self.ffn_dim = ffn_dim
+        self.attn_backend = attn_backend
 
         self.q_proj = nn.Linear(c_main, c_main, bias=False)
         self.k_proj = nn.Linear(c_main, num_kv_heads * self.head_dim, bias=False)
@@ -108,9 +111,11 @@ class TransformerBlock(nn.Module):
         self.norm1 = RMSNormFP32(c_main, eps=1e-6)
         self.norm2 = RMSNormFP32(c_main, eps=1e-6)
 
-    def forward(self, x, attn_mask=None):
+    def forward(self, x, attn_mask=None, block_mask=None):
         """
-        x: (N, L, C)   attn_mask: (N, 1, 1, L) additive mask, 0 or -inf
+        x: (N, L, C)
+        attn_mask: (N, 1, 1, L) additive mask, 0 or -inf  (sdpa backend)
+        block_mask: BlockMask from create_block_mask        (flex backend)
         """
         B, L, C = x.shape
         x_normed = self.norm1(x)
@@ -131,7 +136,10 @@ class TransformerBlock(nn.Module):
             v = v.unsqueeze(2).expand(B, self.num_kv_heads, self.n_rep, L, self.head_dim)
             v = v.reshape(B, self.num_heads, L, self.head_dim)
 
-        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
+        if self.attn_backend == "flex":
+            attn_out = flex_attention(q, k, v, block_mask=block_mask)
+        else:
+            attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
         attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, C)
         x = x + self.out_proj(attn_out)
 
@@ -267,10 +275,12 @@ class ValueHead(nn.Module):
 # Model
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
-    def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop"):
+    def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
+                 attn_backend: str = "sdpa"):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
+        self.attn_backend = attn_backend
         self.c_trunk = config["trunk_num_channels"]
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
@@ -297,6 +307,7 @@ class Model(nn.Module):
                 ffn_dim=ffn_dim,
                 pos_len=pos_len,
                 rope_theta=rope_theta,
+                attn_backend=attn_backend,
             ))
 
         # Final normalization
@@ -346,14 +357,22 @@ class Model(nn.Module):
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
         x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
 
-        # Attention mask: (N, 1, 1, L) additive
-        mask_flat = mask.view(N, 1, 1, L)
-        attn_mask = torch.zeros_like(mask_flat, dtype=x.dtype)
-        attn_mask.masked_fill_(mask_flat == 0, float("-inf"))
-
-        # Trunk
-        for block in self.blocks:
-            x = block(x, attn_mask=attn_mask)
+        # Attention mask
+        if self.attn_backend == "flex":
+            mask_bool = mask.view(N, L).bool()
+            def mask_mod(b, h, q_idx, kv_idx):
+                return mask_bool[b, kv_idx]
+            block_mask = create_block_mask(mask_mod, B=N, H=None, Q_LEN=L, KV_LEN=L)
+            # Trunk
+            for block in self.blocks:
+                x = block(x, block_mask=block_mask)
+        else:
+            mask_flat = mask.view(N, 1, 1, L)
+            attn_mask = torch.zeros_like(mask_flat, dtype=x.dtype)
+            attn_mask.masked_fill_(mask_flat == 0, float("-inf"))
+            # Trunk
+            for block in self.blocks:
+                x = block(x, attn_mask=attn_mask)
 
         x = self.norm_final(x)
 
