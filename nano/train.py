@@ -413,10 +413,6 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                 # Scale loss for gradient averaging across accumulation steps
                 (loss / grad_accum_steps).backward()
 
-            # Write back seki moving average state
-            model.moving_unowned_proportion_sum = new_moving_sum.item()
-            model.moving_unowned_proportion_weight = new_moving_weight.item()
-
             # Accumulate micro-step metrics
             metrics = dict(zip(_METRIC_KEYS, metrics_stack.tolist()))
             for k in metrics:
@@ -427,6 +423,10 @@ def main(rank, world_size, args, multi_gpu_device_ids):
 
             if accum_step == grad_accum_steps:
                 accum_step = 0
+
+                # Write back seki moving average (once per optimizer step)
+                model.moving_unowned_proportion_sum = new_moving_sum.item()
+                model.moving_unowned_proportion_weight = new_moving_weight.item()
 
                 # Gradient clipping + optimizer step
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
