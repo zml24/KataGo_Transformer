@@ -126,7 +126,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         model.moving_unowned_proportion_sum = state.get("moving_unowned_proportion_sum", 0.0)
         model.moving_unowned_proportion_weight = state.get("moving_unowned_proportion_weight", 0.0)
         global_step = state.get("global_step", 0)
-        total_samples_trained = state.get("total_samples_trained", global_step * batch_size)
+        total_samples_trained = state.get("total_samples_trained", global_step * batch_size * world_size * args.grad_accum_steps)
         logging.info(f"Resumed from step {global_step}, {total_samples_trained} samples")
     elif args.initial_checkpoint is not None:
         logging.info(f"Loading initial checkpoint: {args.initial_checkpoint}")
@@ -352,6 +352,8 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     last_print_time = time_start
     accum_step = 0
     micro_metrics_accum = {k: 0.0 for k in _metric_keys}
+    accum_moving_sum = 0.0
+    accum_moving_weight = 0.0
 
     while total_samples_trained < args.max_training_samples:
         model.train()
@@ -412,20 +414,23 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                 # Scale loss for gradient averaging across accumulation steps
                 (loss / grad_accum_steps).backward()
 
-            # Accumulate micro-step metrics
+            # Accumulate micro-step metrics and seki moving average
             metrics = dict(zip(_METRIC_KEYS, metrics_stack.tolist()))
             for k in metrics:
                 micro_metrics_accum[k] += metrics[k]
-            total_samples_trained += batch_size * world_size
+            accum_moving_sum += new_moving_sum.item()
+            accum_moving_weight += new_moving_weight.item()
 
             accum_step += 1
 
             if accum_step == grad_accum_steps:
                 accum_step = 0
 
-                # Write back seki moving average (once per optimizer step)
-                model.moving_unowned_proportion_sum = new_moving_sum.item()
-                model.moving_unowned_proportion_weight = new_moving_weight.item()
+                # Write back seki moving average (averaged across micro-steps)
+                model.moving_unowned_proportion_sum = accum_moving_sum / grad_accum_steps
+                model.moving_unowned_proportion_weight = accum_moving_weight / grad_accum_steps
+                accum_moving_sum = 0.0
+                accum_moving_weight = 0.0
 
                 # Gradient clipping + optimizer step
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -439,6 +444,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                 if shampoo_opt is not None:
                     shampoo_opt.step(base_lr)
                 global_step += 1
+                total_samples_trained += batch_size * world_size * grad_accum_steps
 
                 # Average micro-step metrics and add to running totals
                 for k in _metric_keys:
@@ -526,8 +532,8 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                                 tb_writer.add_scalar(f"val/{k}", val_metrics[k] / weight_sum, total_samples_trained)
                         model.train()
 
-            if total_samples_trained >= args.max_training_samples:
-                break
+                if total_samples_trained >= args.max_training_samples:
+                    break
 
     # Final save (rank 0 only)
     if rank == 0:
@@ -581,7 +587,9 @@ if __name__ == "__main__":
                         help="Score belief head mode: mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
     args = parser.parse_args()
 
-    # Mutual exclusion check
+    # Validation
+    if args.grad_accum_steps < 1:
+        parser.error("--grad-accum-steps must be >= 1")
     if args.muon_scope != "off" and args.shampoo_scope != "off":
         parser.error("muon-scope and shampoo-scope cannot both be enabled. Set one to 'off'.")
 
