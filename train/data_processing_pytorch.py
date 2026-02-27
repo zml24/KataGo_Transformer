@@ -315,7 +315,9 @@ def build_history_matrices(model_config: modelconfigs.ModelConfig, device):
 def apply_history_matrices(model_config, batch_binaryInputNCHW, batch_globalInputNC, batch_globalTargetsNC, h_base, h_builder):
     num_global_features = modelconfigs.get_num_global_input_features(model_config)
     # include_history = batch_globalTargetsNC[:,36:41]
-    should_stop_history = torch.rand_like(batch_globalTargetsNC[:,36:41]) >= 0.98
+    # Generate random on CPU to avoid conflict with torch.compile CUDA graph capture
+    ref = batch_globalTargetsNC[:,36:41]
+    should_stop_history = (torch.rand(ref.shape, dtype=ref.dtype, device="cpu") >= 0.98).to(ref.device)
     include_history = (torch.cumsum(should_stop_history,axis=1,dtype=torch.float32) <= 0.1).to(torch.float32)
 
     # include_history: (N, 5)

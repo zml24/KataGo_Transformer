@@ -4,17 +4,17 @@
 MULTI_GPUS=""
 
 python3 -u train.py \
-  -traindir ../data/train/nano_test \
-  -datadir ../data/shuffleddata/kata1_trainingdata_25q4_2601 \
-  -pos-len 19 \
-  -batch-size 1024 \
-  -model-kind b12c768h12tfrs \
-  -lr 2e-4 \
-  -max-training-samples 300000000 \
-  -symmetry-type xyt \
-  -print-every 1 \
-  -save-every-samples 1000000 \
-  -val-every-samples 1000000 \
-  -warmup-samples 2000000 \
-  -enable-history-matrices \
-  ${MULTI_GPUS}
+    --traindir ../data/train/nano_test \
+    --datadir ../data/shuffleddata/kata1_trainingdata_25q4_2601 \
+    --pos-len 19 \
+    --batch-size 1024 \
+    --model-kind b12c768h12tfrs \
+    --lr 2e-4 \
+    --max-training-samples 300000000 \
+    --symmetry-type xyt \
+    --print-every 1 \
+    --save-every-samples 1000000 \
+    --val-every-samples 1000000 \
+    --warmup-samples 2000000 \
+    --enable-history-matrices \
+    ${MULTI_GPUS}
