@@ -13,8 +13,8 @@ set -euo pipefail
 if [ $# -lt 2 ]; then
     echo "Usage: $0 <input_base_dir> <output_base_dir> [preprocess.py options...]"
     echo ""
-    echo "Preprocesses train/ and val/ subdirectories."
-    echo "Extra arguments are passed to preprocess.py."
+    echo "Preprocesses train/ (with symmetry) and val/ (no symmetry, unpackbits only)."
+    echo "Extra arguments are passed to preprocess.py for the train set."
     exit 1
 fi
 
@@ -24,20 +24,44 @@ shift 2
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-for subdir in train val; do
-    input_dir="${INPUT_BASE}/${subdir}"
-    output_dir="${OUTPUT_BASE}/${subdir}"
+# Save all extra args for train
+ALL_ARGS=("$@")
 
-    if [ ! -d "$input_dir" ]; then
-        echo "Skipping ${subdir}/ (not found: ${input_dir})"
-        continue
-    fi
-
-    echo "=== Preprocessing ${subdir}/ ==="
-    python3 "${SCRIPT_DIR}/preprocess.py" \
-        --input-dir "$input_dir" \
-        --output-dir "$output_dir" \
-        "$@"
+# Parse --pos-len and --workers for val (defaults if not provided)
+POS_LEN="19"
+WORKERS="4"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --pos-len) POS_LEN="$2"; shift 2 ;;
+        --workers) WORKERS="$2"; shift 2 ;;
+        *) shift ;;
+    esac
 done
+
+# Train: use user-specified symmetry options
+train_dir="${INPUT_BASE}/train"
+if [ -d "$train_dir" ]; then
+    echo "=== Preprocessing train/ ==="
+    python3 "${SCRIPT_DIR}/preprocess.py" \
+        --input-dir "$train_dir" \
+        --output-dir "${OUTPUT_BASE}/train" \
+        "${ALL_ARGS[@]}"
+else
+    echo "Skipping train/ (not found: ${train_dir})"
+fi
+
+# Val: only unpackbits, no symmetry augmentation
+val_dir="${INPUT_BASE}/val"
+if [ -d "$val_dir" ]; then
+    echo "=== Preprocessing val/ (no symmetry) ==="
+    python3 "${SCRIPT_DIR}/preprocess.py" \
+        --input-dir "$val_dir" \
+        --output-dir "${OUTPUT_BASE}/val" \
+        --pos-len "$POS_LEN" \
+        --workers "$WORKERS" \
+        --symmetry-type none
+else
+    echo "Skipping val/ (not found: ${val_dir})"
+fi
 
 echo "=== All done ==="
