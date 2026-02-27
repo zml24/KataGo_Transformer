@@ -6,6 +6,7 @@ Self-contained — only depends on modules within nano/.
 import sys
 import os
 import argparse
+import contextlib
 import math
 import time
 import logging
@@ -233,8 +234,10 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             shampoo_opt.load_state_dict(state["shampoo_state"], device)
             logging.info("Shampoo state loaded")
     # LR schedule: linear warmup + cosine decay
-    warmup_steps = args.warmup_samples // batch_size
-    total_steps = args.max_training_samples // batch_size
+    grad_accum_steps = args.grad_accum_steps
+    samples_per_step = batch_size * world_size * grad_accum_steps
+    warmup_steps = args.warmup_samples // samples_per_step
+    total_steps = args.max_training_samples // samples_per_step
 
     def lr_lambda(step):
         if step < warmup_steps:
@@ -304,7 +307,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     def print_metrics(elapsed):
         weight_sum = max(running["wsum"], 1e-10)
         batch_count = max(running["count"], 1)
-        samples_per_sec = batch_count * batch_size * world_size / elapsed
+        samples_per_sec = batch_count * batch_size * world_size * grad_accum_steps / elapsed
         achieved_tflops_per_gpu = samples_per_sec * train_flops_per_sample / (world_size * 1e12)
         mfu = achieved_tflops_per_gpu / gpu_peak_tflops * 100.0 if gpu_peak_tflops > 0 else 0.0
         logging.info(
@@ -336,8 +339,10 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             tb_writer.add_scalar("perf/mfu", mfu, total_samples_trained)
 
     # Start training
+    effective_batch = batch_size * world_size * grad_accum_steps
     logging.info("=" * 60)
     logging.info(f"Starting training: {total_samples_trained}/{args.max_training_samples} samples done")
+    logging.info(f"Effective batch size: {effective_batch} (micro={batch_size} x gpus={world_size} x accum={grad_accum_steps})")
     logging.info("=" * 60)
 
     last_save_samples = total_samples_trained
@@ -372,123 +377,146 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             model_config=model_config,
             use_pin_memory=use_pin_memory,
         )
+        accum_step = 0
+        micro_metrics_accum = {k: 0.0 for k in _metric_keys}
+
         for batch in data_processing.prefetch_generator(train_gen, args.prefetch_batches):
-            for p in model.parameters():
-                p.grad = None
+            # Clear gradients at the start of each accumulation cycle
+            if accum_step == 0:
+                for p in model.parameters():
+                    p.grad = None
 
-            with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
-                outputs = ddp_model(batch["binaryInputNCHW"], batch["globalInputNC"])
+            # DDP no_sync: skip all-reduce for intermediate micro-steps
+            is_last_micro = (accum_step + 1 == grad_accum_steps)
+            ctx = contextlib.nullcontext() if (is_last_micro or world_size == 1) else ddp_model.no_sync()
 
-            # Compiled postprocess + loss (seki moving average computed inside as tensor ops)
-            moving_sum_t = torch.tensor(model.moving_unowned_proportion_sum, device=device)
-            moving_weight_t = torch.tensor(model.moving_unowned_proportion_weight, device=device)
-            loss, metrics_stack, new_moving_sum, new_moving_weight = compiled_loss_fn(
-                outputs, model.value_head.score_belief_offset_vector,
-                batch["binaryInputNCHW"], batch["policyTargetsNCMove"],
-                batch["globalTargetsNC"], batch["scoreDistrN"], batch["valueTargetsNCHW"],
-                pos_len, moving_sum_t, moving_weight_t, True,
-                soft_policy_weight_scale=args.soft_policy_weight_scale,
-                value_loss_scale=args.value_loss_scale,
-                td_value_loss_scales=td_value_loss_scales,
-                seki_loss_scale=args.seki_loss_scale,
-                variance_time_loss_scale=args.variance_time_loss_scale,
-                disable_optimistic_policy=args.disable_optimistic_policy,
-            )
+            with ctx:
+                with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
+                    outputs = ddp_model(batch["binaryInputNCHW"], batch["globalInputNC"])
 
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
+                # Compiled postprocess + loss (seki moving average computed inside as tensor ops)
+                moving_sum_t = torch.tensor(model.moving_unowned_proportion_sum, device=device)
+                moving_weight_t = torch.tensor(model.moving_unowned_proportion_weight, device=device)
+                loss, metrics_stack, new_moving_sum, new_moving_weight = compiled_loss_fn(
+                    outputs, model.value_head.score_belief_offset_vector,
+                    batch["binaryInputNCHW"], batch["policyTargetsNCMove"],
+                    batch["globalTargetsNC"], batch["scoreDistrN"], batch["valueTargetsNCHW"],
+                    pos_len, moving_sum_t, moving_weight_t, True,
+                    soft_policy_weight_scale=args.soft_policy_weight_scale,
+                    value_loss_scale=args.value_loss_scale,
+                    td_value_loss_scales=td_value_loss_scales,
+                    seki_loss_scale=args.seki_loss_scale,
+                    variance_time_loss_scale=args.variance_time_loss_scale,
+                    disable_optimistic_policy=args.disable_optimistic_policy,
+                )
+
+                # Scale loss for gradient averaging across accumulation steps
+                (loss / grad_accum_steps).backward()
 
             # Write back seki moving average state
             model.moving_unowned_proportion_sum = new_moving_sum.item()
             model.moving_unowned_proportion_weight = new_moving_weight.item()
 
-            # Muon / Shampoo / Adam update
-            base_lr = scheduler.get_last_lr()[0]
-            if muon_opt is not None:
-                muon_opt.step(base_lr)
-            if shampoo_opt is not None:
-                shampoo_opt.step(base_lr)
-            global_step += 1
-            total_samples_trained += batch_size * world_size
-
-            # Accumulate metrics (single CUDA sync via .tolist())
+            # Accumulate micro-step metrics
             metrics = dict(zip(_METRIC_KEYS, metrics_stack.tolist()))
             for k in metrics:
-                running[k] += metrics[k]
-            running["grad_norm"] += grad_norm.item()
-            if muon_opt is not None:
-                running["muon_update_rms"] += muon_opt.last_update_rms
-            if shampoo_opt is not None:
-                running["shampoo_precond_rms"] += shampoo_opt.last_precond_rms
-            running["count"] += 1
+                micro_metrics_accum[k] += metrics[k]
+            total_samples_trained += batch_size * world_size
 
-            if rank == 0 and global_step % args.print_every == 0:
-                time_now = time.perf_counter()
-                print_metrics(time_now - last_print_time)
-                reset_running()
-                last_print_time = time_now
+            accum_step += 1
 
-            # Periodic save (rank 0 only)
-            if rank == 0 and total_samples_trained - last_save_samples >= args.save_every_samples:
-                save_checkpoint()
-                last_save_samples = total_samples_trained
+            if accum_step == grad_accum_steps:
+                accum_step = 0
 
-            # Validation (rank 0 only)
-            if rank == 0 and total_samples_trained - last_val_samples >= args.val_every_samples:
-                last_val_samples = total_samples_trained
-                val_files = sorted(glob.glob(os.path.join(val_dir, "*.npz")))
-                if val_files:
-                    model.eval()
-                    val_metrics = {k: 0.0 for k in _metric_keys}
-                    val_metrics["count"] = 0
-                    with torch.no_grad():
-                        val_gen = data_processing.read_npz_training_data(
-                            val_files[:3],
-                            batch_size=batch_size,
-                            world_size=1,
-                            rank=0,
-                            pos_len=pos_len,
-                            device=device,
-                            symmetry_type=None,
-                            include_meta=False,
-                            enable_history_matrices=args.enable_history_matrices,
-                            model_config=model_config,
-                            use_pin_memory=use_pin_memory,
-                        )
-                        for val_batch in data_processing.prefetch_generator(val_gen, args.prefetch_batches):
-                            with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
-                                outputs = model(val_batch["binaryInputNCHW"], val_batch["globalInputNC"])
-                            _, batch_metrics = compute_loss(
-                                model, outputs, val_batch, pos_len,
-                                is_training=False,
-                                soft_policy_weight_scale=args.soft_policy_weight_scale,
-                                value_loss_scale=args.value_loss_scale,
-                                td_value_loss_scales=td_value_loss_scales,
-                                seki_loss_scale=args.seki_loss_scale,
-                                variance_time_loss_scale=args.variance_time_loss_scale,
-                                disable_optimistic_policy=args.disable_optimistic_policy,
+                # Gradient clipping + optimizer step
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
+
+                # Muon / Shampoo / Adam update
+                base_lr = scheduler.get_last_lr()[0]
+                if muon_opt is not None:
+                    muon_opt.step(base_lr)
+                if shampoo_opt is not None:
+                    shampoo_opt.step(base_lr)
+                global_step += 1
+
+                # Average micro-step metrics and add to running totals
+                for k in _metric_keys:
+                    running[k] += micro_metrics_accum[k] / grad_accum_steps
+                    micro_metrics_accum[k] = 0.0
+                running["grad_norm"] += grad_norm.item()
+                if muon_opt is not None:
+                    running["muon_update_rms"] += muon_opt.last_update_rms
+                if shampoo_opt is not None:
+                    running["shampoo_precond_rms"] += shampoo_opt.last_precond_rms
+                running["count"] += 1
+
+                if rank == 0 and global_step % args.print_every == 0:
+                    time_now = time.perf_counter()
+                    print_metrics(time_now - last_print_time)
+                    reset_running()
+                    last_print_time = time_now
+
+                # Periodic save (rank 0 only)
+                if rank == 0 and total_samples_trained - last_save_samples >= args.save_every_samples:
+                    save_checkpoint()
+                    last_save_samples = total_samples_trained
+
+                # Validation (rank 0 only)
+                if rank == 0 and total_samples_trained - last_val_samples >= args.val_every_samples:
+                    last_val_samples = total_samples_trained
+                    val_files = sorted(glob.glob(os.path.join(val_dir, "*.npz")))
+                    if val_files:
+                        model.eval()
+                        val_metrics = {k: 0.0 for k in _metric_keys}
+                        val_metrics["count"] = 0
+                        with torch.no_grad():
+                            val_gen = data_processing.read_npz_training_data(
+                                val_files[:3],
+                                batch_size=batch_size,
+                                world_size=1,
+                                rank=0,
+                                pos_len=pos_len,
+                                device=device,
+                                symmetry_type=None,
+                                include_meta=False,
+                                enable_history_matrices=args.enable_history_matrices,
+                                model_config=model_config,
+                                use_pin_memory=use_pin_memory,
                             )
-                            for k in batch_metrics:
-                                val_metrics[k] += batch_metrics[k]
-                            val_metrics["count"] += 1
+                            for val_batch in data_processing.prefetch_generator(val_gen, args.prefetch_batches):
+                                with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
+                                    outputs = model(val_batch["binaryInputNCHW"], val_batch["globalInputNC"])
+                                _, batch_metrics = compute_loss(
+                                    model, outputs, val_batch, pos_len,
+                                    is_training=False,
+                                    soft_policy_weight_scale=args.soft_policy_weight_scale,
+                                    value_loss_scale=args.value_loss_scale,
+                                    td_value_loss_scales=td_value_loss_scales,
+                                    seki_loss_scale=args.seki_loss_scale,
+                                    variance_time_loss_scale=args.variance_time_loss_scale,
+                                    disable_optimistic_policy=args.disable_optimistic_policy,
+                                )
+                                for k in batch_metrics:
+                                    val_metrics[k] += batch_metrics[k]
+                                val_metrics["count"] += 1
 
-                    weight_sum = max(val_metrics["wsum"], 1e-10)
-                    batch_count = max(val_metrics["count"], 1)
-                    logging.info(
-                        f"  VAL [{total_samples_trained} samples]: loss={val_metrics['loss'] / batch_count:.4f}, "
-                        f"p0loss={val_metrics['p0loss'] / weight_sum:.4f}, "
-                        f"vloss={val_metrics['vloss'] / weight_sum:.4f}, "
-                        f"oloss={val_metrics['oloss'] / weight_sum:.4f}, "
-                        f"skloss={val_metrics['skloss'] / weight_sum:.4f}, "
-                        f"pacc1={val_metrics['pacc1'] / weight_sum:.4f}"
-                    )
-                    if tb_writer is not None:
-                        tb_writer.add_scalar("val/loss", val_metrics["loss"] / batch_count, total_samples_trained)
-                        for k in _per_sample_keys:
-                            tb_writer.add_scalar(f"val/{k}", val_metrics[k] / weight_sum, total_samples_trained)
-                    model.train()
+                        weight_sum = max(val_metrics["wsum"], 1e-10)
+                        batch_count = max(val_metrics["count"], 1)
+                        logging.info(
+                            f"  VAL [{total_samples_trained} samples]: loss={val_metrics['loss'] / batch_count:.4f}, "
+                            f"p0loss={val_metrics['p0loss'] / weight_sum:.4f}, "
+                            f"vloss={val_metrics['vloss'] / weight_sum:.4f}, "
+                            f"oloss={val_metrics['oloss'] / weight_sum:.4f}, "
+                            f"skloss={val_metrics['skloss'] / weight_sum:.4f}, "
+                            f"pacc1={val_metrics['pacc1'] / weight_sum:.4f}"
+                        )
+                        if tb_writer is not None:
+                            tb_writer.add_scalar("val/loss", val_metrics["loss"] / batch_count, total_samples_trained)
+                            for k in _per_sample_keys:
+                                tb_writer.add_scalar(f"val/{k}", val_metrics[k] / weight_sum, total_samples_trained)
+                        model.train()
 
             if total_samples_trained >= args.max_training_samples:
                 break
@@ -506,7 +534,8 @@ if __name__ == "__main__":
     parser.add_argument("--traindir", required=True, help="Training output directory")
     parser.add_argument("--datadir", required=True, help="Data directory with train/ and val/ subdirs")
     parser.add_argument("--pos-len", type=int, default=19, help="Board size")
-    parser.add_argument("--batch-size", type=int, default=256, help="Per-GPU batch size")
+    parser.add_argument("--batch-size", type=int, default=256, help="Per-GPU micro batch size")
+    parser.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--model-kind", type=str, default="b14c192h6tfrs", help="Model config name")
     parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate")
     parser.add_argument("--wd", type=float, default=0.1, help="Weight decay")
