@@ -1096,6 +1096,96 @@ def detensorify_metrics(metrics):
     return ret
 
 
+def estimate_forward_flops(config, pos_len):
+    """估算单个样本的前向传播 FLOPs。"""
+    S = pos_len * pos_len
+    D = config["trunk_num_channels"]
+    num_heads = config.get("transformer_heads", 4)
+    num_kv_heads = config.get("transformer_kv_heads", num_heads)
+    head_dim = D // num_heads
+    D_kv = num_kv_heads * head_dim
+    F = config.get("transformer_ffn_channels", D * 2)
+    num_blocks = len(config["block_kind"])
+
+    # 每个 TransformerBlock
+    attn_proj = 2 * S * (D * D + 2 * D * D_kv)       # Q/K/V 投影
+    attn_scores = 2 * S * S * D                        # Q@K^T (per head, total = D)
+    attn_values = 2 * S * S * D                        # Attn@V
+    out_proj = 2 * S * D * D                           # 输出投影
+    ffn = 3 * 2 * S * D * F                            # SwiGLU (w1 + wgate + w2)
+    block_flops = attn_proj + attn_scores + attn_values + out_proj + ffn
+    trunk_flops = block_flops * num_blocks
+
+    # 输入层
+    num_bin_features = modelconfigs.get_num_bin_input_features(config)
+    num_global_features = modelconfigs.get_num_global_input_features(config)
+    K = 1 if config.get("initial_conv_1x1", False) else 3
+    conv_flops = 2 * num_bin_features * D * K * K * S
+    global_flops = 2 * num_global_features * D
+
+    # 输出头
+    # PolicyHead: linear_board(D→6, per-position) + linear_pass(D→6, pooled)
+    policy_flops = 2 * S * D * 6 + 2 * D * 6
+    # ValueHead: linear_sv(D→29, per-position)
+    value_sv_flops = 2 * S * D * 29
+    # ValueHead: linear_s_mix(D→sb_len*n_sb+n_sb, pooled)
+    num_scorebeliefs = config["num_scorebeliefs"]
+    scorebelief_len = (S + EXTRA_SCORE_DISTR_RADIUS) * 2
+    score_mix_out = scorebelief_len * num_scorebeliefs + num_scorebeliefs
+    score_flops = 2 * D * score_mix_out
+
+    total = trunk_flops + conv_flops + global_flops + policy_flops + value_sv_flops + score_flops
+    return total
+
+
+def get_gpu_peak_tflops(device):
+    """返回 GPU 的 BF16 峰值 TFLOPS，用于 MFU 计算。"""
+    if device.type != "cuda":
+        return 0.0
+
+    name = torch.cuda.get_device_name(device).lower()
+    # 常见 GPU 的 BF16 Tensor Core 峰值 TFLOPS（不含 sparsity）
+    known_gpus = {
+        "4090": 165.2,
+        "4080 super": 97.5,
+        "4080": 97.5,
+        "4070 ti super": 93.2,
+        "4070 ti": 40.1,
+        "4070": 29.1,
+        "3090 ti": 40.0,
+        "3090": 35.6,
+        "3080 ti": 34.1,
+        "3080": 29.8,
+        "a100 sxm": 312.0,
+        "a100 pcie": 312.0,
+        "a100": 312.0,
+        "a6000": 38.7,
+        "a10": 31.2,
+        "h100 sxm": 989.5,
+        "h100 pcie": 756.0,
+        "h100": 756.0,
+        "h200": 989.5,
+        "l40s": 91.6,
+        "l40": 90.5,
+        "l4": 30.3,
+    }
+    for key, tflops in known_gpus.items():
+        if key in name:
+            return tflops
+
+    # 未知 GPU：用硬件属性粗估
+    props = torch.cuda.get_device_properties(device)
+    # 粗估：SM数 × 每SM的FMA OPs × 频率（BF16 tensor core 估算）
+    clock_ghz = props.clock_rate / 1e6  # kHz -> GHz
+    # 保守估计每 SM 128 BF16 FMA ops/cycle
+    estimated = props.multi_processor_count * 128 * 2 * clock_ghz / 1e3
+    logging.warning(
+        f"Unknown GPU '{torch.cuda.get_device_name(device)}', "
+        f"rough BF16 estimate: {estimated:.1f} TFLOPS (MFU may be inaccurate)"
+    )
+    return estimated
+
+
 # ---------------------------------------------------------------------------
 # 训练主循环
 # ---------------------------------------------------------------------------
@@ -1247,6 +1337,14 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                  f"Adam decay: {sum(p.numel() for p in adam_params.values()):,}, "
                  f"AdamW no-decay: {sum(p.numel() for p in no_decay_params):,}")
 
+    # FLOPs 估算（用于 MFU 计算）
+    forward_flops = estimate_forward_flops(model_config, pos_len)
+    train_flops_per_sample = 3 * forward_flops
+    gpu_peak_tflops = get_gpu_peak_tflops(device)
+    logging.info(f"FLOPs/sample (fwd): {forward_flops/1e9:.2f}G, (train): {train_flops_per_sample/1e9:.2f}G")
+    if gpu_peak_tflops > 0:
+        logging.info(f"GPU BF16 peak: {gpu_peak_tflops:.1f} TFLOPS")
+
     # torch.optim.AdamW 仅处理 no_decay 参数（1D bias/norm）
     optimizer = torch.optim.AdamW([
         {"params": no_decay_params, "weight_decay": 0.0},
@@ -1363,6 +1461,9 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     def print_metrics(elapsed):
         weight_sum = max(running["wsum"], 1e-10)
         batch_count = max(running["count"], 1)
+        samples_per_sec = batch_count * batch_size * world_size / elapsed
+        achieved_tflops_per_gpu = samples_per_sec * train_flops_per_sample / (world_size * 1e12)
+        mfu = achieved_tflops_per_gpu / gpu_peak_tflops * 100.0 if gpu_peak_tflops > 0 else 0.0
         logging.info(
             f"step={global_step}, samples={total_samples_trained}, "
             f"time={elapsed:.1f}s, "
@@ -1372,7 +1473,8 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             f"vloss={running['vloss'] / weight_sum:.4f}, "
             f"oloss={running['oloss'] / weight_sum:.4f}, "
             f"skloss={running['skloss'] / weight_sum:.4f}, "
-            f"pacc1={running['pacc1'] / weight_sum:.4f}"
+            f"pacc1={running['pacc1'] / weight_sum:.4f}, "
+            f"sps={samples_per_sec:.0f}, MFU={mfu:.1f}%"
         )
         if tb_writer is not None:
             tb_writer.add_scalar("train/loss", running["loss"] / batch_count, total_samples_trained)
@@ -1386,6 +1488,11 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                 tb_writer.add_scalar("train/shampoo_precond_rms", running["shampoo_precond_rms"] / batch_count, total_samples_trained)
             if adam_opt is not None:
                 tb_writer.add_scalar("train/adam_update_rms", running["adam_update_rms"] / batch_count, total_samples_trained)
+            tokens_per_sec = samples_per_sec * pos_len * pos_len
+            tb_writer.add_scalar("perf/samples_per_sec", samples_per_sec, total_samples_trained)
+            tb_writer.add_scalar("perf/tokens_per_sec", tokens_per_sec, total_samples_trained)
+            tb_writer.add_scalar("perf/achieved_tflops_per_gpu", achieved_tflops_per_gpu, total_samples_trained)
+            tb_writer.add_scalar("perf/mfu", mfu, total_samples_trained)
 
     # 开始训练
     logging.info("=" * 60)
