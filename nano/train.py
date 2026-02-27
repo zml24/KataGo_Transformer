@@ -126,7 +126,14 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         model.moving_unowned_proportion_sum = state.get("moving_unowned_proportion_sum", 0.0)
         model.moving_unowned_proportion_weight = state.get("moving_unowned_proportion_weight", 0.0)
         global_step = state.get("global_step", 0)
-        total_samples_trained = state.get("total_samples_trained", global_step * batch_size * world_size * args.grad_accum_steps)
+        if "total_samples_trained" in state:
+            total_samples_trained = state["total_samples_trained"]
+        else:
+            total_samples_trained = global_step * batch_size * world_size * args.grad_accum_steps
+            logging.warning(
+                f"Checkpoint missing total_samples_trained, estimated from current settings: {total_samples_trained}. "
+                f"This may be inaccurate if batch_size/world_size/grad_accum_steps changed."
+            )
         logging.info(f"Resumed from step {global_step}, {total_samples_trained} samples")
     elif args.initial_checkpoint is not None:
         logging.info(f"Loading initial checkpoint: {args.initial_checkpoint}")
@@ -205,7 +212,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     ]
     if adam_params:
         adam_param_groups.append({"params": list(adam_params.values()), "weight_decay": args.wd})
-    optimizer = torch.optim.AdamW(adam_param_groups, lr=args.lr, betas=(0.9, 0.95), fused=True)
+    optimizer = torch.optim.AdamW(adam_param_groups, lr=args.lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
 
     # Independent optimizer instances
     muon_opt = MuonOptimizer(
@@ -239,6 +246,15 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     warmup_steps = args.warmup_samples // samples_per_step
     total_steps = args.max_training_samples // samples_per_step
 
+    if global_step > 0:
+        saved_sps = state.get("samples_per_step")
+        if saved_sps is not None and saved_sps != samples_per_step:
+            logging.warning(
+                f"samples_per_step changed: {saved_sps} -> {samples_per_step} "
+                f"(batch_size*world_size*grad_accum_steps). "
+                f"LR schedule may have a discontinuity."
+            )
+
     def lr_lambda(step):
         if step < warmup_steps:
             return (step + 1) / warmup_steps
@@ -270,6 +286,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             "config": model_config,
             "global_step": global_step,
             "total_samples_trained": total_samples_trained,
+            "samples_per_step": samples_per_step,
             "moving_unowned_proportion_sum": model.moving_unowned_proportion_sum,
             "moving_unowned_proportion_weight": model.moving_unowned_proportion_weight,
         }
@@ -348,8 +365,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     last_save_samples = total_samples_trained
     last_val_samples = total_samples_trained
     reset_running()
-    time_start = time.perf_counter()
-    last_print_time = time_start
+    last_print_time = time.perf_counter()
     accum_step = 0
     micro_metrics_accum = {k: 0.0 for k in _metric_keys}
     accum_moving_sum = 0.0
@@ -357,6 +373,15 @@ def main(rank, world_size, args, multi_gpu_device_ids):
 
     while total_samples_trained < args.max_training_samples:
         model.train()
+
+        # Discard partial gradient accumulation from previous file list
+        if accum_step > 0:
+            logging.info(f"Discarding partial gradient accumulation ({accum_step}/{grad_accum_steps} micro-steps)")
+            accum_step = 0
+            for k in _metric_keys:
+                micro_metrics_accum[k] = 0.0
+            accum_moving_sum = 0.0
+            accum_moving_weight = 0.0
 
         # Find training files
         train_files = sorted(glob.glob(os.path.join(train_dir, "*.npz")))
@@ -481,11 +506,14 @@ def main(rank, world_size, args, multi_gpu_device_ids):
 
                 # Periodic save (rank 0 only)
                 if rank == 0 and total_samples_trained - last_save_samples >= args.save_every_samples:
+                    t_save_start = time.perf_counter()
                     save_checkpoint()
                     last_save_samples = total_samples_trained
+                    last_print_time += time.perf_counter() - t_save_start
 
                 # Validation (rank 0 only)
                 if rank == 0 and total_samples_trained - last_val_samples >= args.val_every_samples:
+                    t_val_start = time.perf_counter()
                     last_val_samples = total_samples_trained
                     val_files = sorted(glob.glob(os.path.join(val_dir, "*.npz")))
                     if val_files:
@@ -538,6 +566,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                             for k in _per_sample_keys:
                                 tb_writer.add_scalar(f"val/{k}", val_metrics[k] / weight_sum, total_samples_trained)
                         model.train()
+                    last_print_time += time.perf_counter() - t_val_start
 
                 if total_samples_trained >= args.max_training_samples:
                     break
@@ -575,7 +604,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-training-samples", type=int, default=100000000, help="Total training samples")
     parser.add_argument("--save-every-samples", type=int, default=1000000, help="Save checkpoint every N samples")
     parser.add_argument("--symmetry-type", type=str, default="xyt", help="Data symmetry type")
-    parser.add_argument("--print-every", type=int, default=100, help="Print every N batches")
+    parser.add_argument("--print-every", type=int, default=100, help="Print every N optimizer steps")
     parser.add_argument("--val-every-samples", type=int, default=1000000, help="Run validation every N samples")
     parser.add_argument("--warmup-samples", type=int, default=2000000, help="LR warmup samples")
     parser.add_argument("--enable-history-matrices", action="store_true", help="Enable history matrices (for Go)")
