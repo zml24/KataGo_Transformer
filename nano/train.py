@@ -542,8 +542,8 @@ if __name__ == "__main__":
     parser.add_argument("--prefetch-batches", type=int, default=20, help="Prefetch queue depth (0=off)")
     parser.add_argument("--score-mode", type=str, default="simple", choices=["mixop", "mix", "simple"],
                         help="Score belief head mode: mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
-    parser.add_argument("--attn-backend", type=str, default="sdpa", choices=["sdpa", "flex"],
-                        help="Attention backend: sdpa=F.scaled_dot_product_attention, flex=FlexAttention")
+    parser.add_argument("--attn-backend", type=str, default="sdpa", choices=["sdpa", "fa2", "fa3"],
+                        help="Attention backend: sdpa=F.scaled_dot_product_attention, fa2=FlashAttention-2, fa3=FlashAttention-3(Hopper)")
     args = parser.parse_args()
 
     # Mutual exclusion check

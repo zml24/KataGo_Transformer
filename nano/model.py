@@ -5,7 +5,16 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+try:
+    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_v2
+except ImportError:
+    _flash_attn_varlen_v2 = None
+
+try:
+    from flash_attn_interface import flash_attn_varlen_func as _flash_attn_varlen_v3
+except ImportError:
+    _flash_attn_varlen_v3 = None
 
 from configs import get_num_bin_input_features, get_num_global_input_features
 
@@ -111,11 +120,13 @@ class TransformerBlock(nn.Module):
         self.norm1 = RMSNormFP32(c_main, eps=1e-6)
         self.norm2 = RMSNormFP32(c_main, eps=1e-6)
 
-    def forward(self, x, attn_mask=None, block_mask=None):
+    def forward(self, x, attn_mask=None, mask_bool=None, cu_seqlens=None, max_seqlen=None):
         """
         x: (N, L, C)
-        attn_mask: (N, 1, 1, L) additive mask, 0 or -inf  (sdpa backend)
-        block_mask: BlockMask from create_block_mask        (flex backend)
+        attn_mask:  (N, 1, 1, L) additive mask       (sdpa only)
+        mask_bool:  (N, L) boolean, True=valid         (fa2/fa3 varlen)
+        cu_seqlens: (N+1,) int32 cumulative seq lens   (fa2/fa3 varlen)
+        max_seqlen: int, max valid length in batch     (fa2/fa3 varlen)
         """
         B, L, C = x.shape
         x_normed = self.norm1(x)
@@ -126,21 +137,35 @@ class TransformerBlock(nn.Module):
 
         q, k = apply_rotary_emb(q, k, self.cos_cached, self.sin_cached)
 
-        q = q.permute(0, 2, 1, 3)  # (B, H, L, D)
-        k = k.permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
-
-        if self.n_rep > 1:
-            k = k.unsqueeze(2).expand(B, self.num_kv_heads, self.n_rep, L, self.head_dim)
-            k = k.reshape(B, self.num_heads, L, self.head_dim)
-            v = v.unsqueeze(2).expand(B, self.num_kv_heads, self.n_rep, L, self.head_dim)
-            v = v.reshape(B, self.num_heads, L, self.head_dim)
-
-        if self.attn_backend == "flex":
-            attn_out = flex_attention(q, k, v, block_mask=block_mask)
+        if self.attn_backend in ("fa2", "fa3"):
+            # Pack valid tokens, native GQA support
+            q_pack = q[mask_bool]  # (T, num_heads, head_dim)
+            k_pack = k[mask_bool]  # (T, num_kv_heads, head_dim)
+            v_pack = v[mask_bool]  # (T, num_kv_heads, head_dim)
+            if self.attn_backend == "fa2":
+                out_pack = _flash_attn_varlen_v2(
+                    q_pack, k_pack, v_pack,
+                    cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                )
+            else:
+                out_pack = _flash_attn_varlen_v3(
+                    q_pack, k_pack, v_pack,
+                    cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                )[0]
+            attn_out = x.new_zeros(B, L, C)
+            attn_out[mask_bool] = out_pack.reshape(-1, C)
         else:
+            # SDPA: (B, H, S, D), manual GQA expand
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+            v = v.permute(0, 2, 1, 3)
+            if self.n_rep > 1:
+                k = k.unsqueeze(2).expand(B, self.num_kv_heads, self.n_rep, L, self.head_dim)
+                k = k.reshape(B, self.num_heads, L, self.head_dim)
+                v = v.unsqueeze(2).expand(B, self.num_kv_heads, self.n_rep, L, self.head_dim)
+                v = v.reshape(B, self.num_heads, L, self.head_dim)
             attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
-        attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, C)
+            attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, C)
         x = x + self.out_proj(attn_out)
 
         # SwiGLU FFN
@@ -358,21 +383,22 @@ class Model(nn.Module):
         x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
 
         # Attention mask
-        if self.attn_backend == "flex":
-            mask_bool = mask.view(N, L).bool()
-            def mask_mod(b, h, q_idx, kv_idx):
-                return mask_bool[b, kv_idx]
-            block_mask = create_block_mask(mask_mod, B=N, H=None, Q_LEN=L, KV_LEN=L)
-            # Trunk
-            for block in self.blocks:
-                x = block(x, block_mask=block_mask)
-        else:
+        if self.attn_backend == "sdpa":
             mask_flat = mask.view(N, 1, 1, L)
             attn_mask = torch.zeros_like(mask_flat, dtype=x.dtype)
             attn_mask.masked_fill_(mask_flat == 0, float("-inf"))
-            # Trunk
-            for block in self.blocks:
-                x = block(x, attn_mask=attn_mask)
+            mask_bool = cu_seqlens = max_seqlen = None
+        else:
+            attn_mask = None
+            mask_bool = mask.view(N, L).bool()
+            seqlens = mask_bool.sum(dim=1, dtype=torch.int32)
+            cu_seqlens = F.pad(seqlens.cumsum(0, dtype=torch.int32), (1, 0))
+            max_seqlen = L  # upper bound, avoids .item() CUDA sync
+
+        # Trunk
+        for block in self.blocks:
+            x = block(x, attn_mask=attn_mask, mask_bool=mask_bool,
+                      cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
         x = self.norm_final(x)
 
