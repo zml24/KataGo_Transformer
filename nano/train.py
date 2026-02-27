@@ -24,8 +24,8 @@ import atexit
 import configs
 import data as data_processing
 from model import Model
-from optimizers import MuonOptimizer, ShampooOptimizer, AdamOptimizer
-from losses import compute_loss, estimate_forward_flops, get_gpu_peak_tflops
+from optimizers import MuonOptimizer, ShampooOptimizer
+from losses import compute_loss, postprocess_and_loss_core, _METRIC_KEYS, estimate_forward_flops, get_gpu_peak_tflops
 
 
 # ---------------------------------------------------------------------------
@@ -147,9 +147,11 @@ def main(rank, world_size, args, multi_gpu_device_ids):
 
     # torch.compile
     if not args.no_compile and device.type != "mps":
-        compiled_model = torch.compile(model, mode="default")
+        compiled_model = torch.compile(model, mode="reduce-overhead")
+        compiled_loss_fn = torch.compile(postprocess_and_loss_core, mode="reduce-overhead")
     else:
         compiled_model = model
+        compiled_loss_fn = postprocess_and_loss_core
 
     # DDP wrapper
     if world_size > 1:
@@ -196,10 +198,13 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     if gpu_peak_tflops > 0:
         logging.info(f"GPU BF16 peak: {gpu_peak_tflops:.1f} TFLOPS")
 
-    # torch.optim.AdamW only for no_decay params (1D bias/norm)
-    optimizer = torch.optim.AdamW([
+    # torch.optim.AdamW for no_decay params (1D bias/norm) + adam_params (2D with decay)
+    adam_param_groups = [
         {"params": no_decay_params, "weight_decay": 0.0},
-    ], lr=args.lr, betas=(0.9, 0.95))
+    ]
+    if adam_params:
+        adam_param_groups.append({"params": list(adam_params.values()), "weight_decay": args.wd})
+    optimizer = torch.optim.AdamW(adam_param_groups, lr=args.lr, betas=(0.9, 0.95), fused=True)
 
     # Independent optimizer instances
     muon_opt = MuonOptimizer(
@@ -210,9 +215,6 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
         momentum=args.shampoo_momentum, wd=args.wd, beta2=args.shampoo_beta2, device=device,
     ) if shampoo_params else None
-    adam_opt = AdamOptimizer(
-        adam_params, wd=args.wd, beta1=0.9, beta2=0.95, device=device,
-    ) if adam_params else None
 
     # Restore optimizer state
     if os.path.exists(checkpoint_path):
@@ -230,10 +232,6 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         if "shampoo_state" in state and shampoo_opt is not None:
             shampoo_opt.load_state_dict(state["shampoo_state"], device)
             logging.info("Shampoo state loaded")
-        if "adam_state" in state and adam_opt is not None:
-            adam_opt.load_state_dict(state["adam_state"], device)
-            logging.info("Adam state loaded")
-
     # LR schedule: linear warmup + cosine decay
     warmup_steps = args.warmup_samples // batch_size
     total_steps = args.max_training_samples // batch_size
@@ -276,8 +274,6 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             state_dict["muon_state"] = muon_opt.state_dict()
         if shampoo_opt is not None:
             state_dict["shampoo_state"] = shampoo_opt.state_dict()
-        if adam_opt is not None:
-            state_dict["adam_state"] = adam_opt.state_dict()
         path = os.path.join(args.traindir, "checkpoint.ckpt")
         torch.save(state_dict, path + ".tmp")
         os.replace(path + ".tmp", path)
@@ -298,7 +294,6 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     running["grad_norm"] = 0.0
     running["muon_update_rms"] = 0.0
     running["shampoo_precond_rms"] = 0.0
-    running["adam_update_rms"] = 0.0
 
     def reset_running():
         for k in running:
@@ -334,8 +329,6 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                 tb_writer.add_scalar("train/muon_update_rms", running["muon_update_rms"] / batch_count, total_samples_trained)
             if shampoo_opt is not None:
                 tb_writer.add_scalar("train/shampoo_precond_rms", running["shampoo_precond_rms"] / batch_count, total_samples_trained)
-            if adam_opt is not None:
-                tb_writer.add_scalar("train/adam_update_rms", running["adam_update_rms"] / batch_count, total_samples_trained)
             tokens_per_sec = samples_per_sec * pos_len * pos_len
             tb_writer.add_scalar("perf/samples_per_sec", samples_per_sec, total_samples_trained)
             tb_writer.add_scalar("perf/tokens_per_sec", tokens_per_sec, total_samples_trained)
@@ -386,11 +379,14 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
                 outputs = ddp_model(batch["binaryInputNCHW"], batch["globalInputNC"])
 
-            # fp32 postprocess
-            postprocessed = model.postprocess(outputs)
-            loss, metrics = compute_loss(
-                model, postprocessed, batch, pos_len,
-                is_training=True,
+            # Compiled postprocess + loss (seki moving average computed inside as tensor ops)
+            moving_sum_t = torch.tensor(model.moving_unowned_proportion_sum, device=device)
+            moving_weight_t = torch.tensor(model.moving_unowned_proportion_weight, device=device)
+            loss, metrics_stack, new_moving_sum, new_moving_weight = compiled_loss_fn(
+                outputs, model.value_head.score_belief_offset_vector,
+                batch["binaryInputNCHW"], batch["policyTargetsNCMove"],
+                batch["globalTargetsNC"], batch["scoreDistrN"], batch["valueTargetsNCHW"],
+                pos_len, moving_sum_t, moving_weight_t, True,
                 soft_policy_weight_scale=args.soft_policy_weight_scale,
                 value_loss_scale=args.value_loss_scale,
                 td_value_loss_scales=td_value_loss_scales,
@@ -404,19 +400,21 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             optimizer.step()
             scheduler.step()
 
+            # Write back seki moving average state
+            model.moving_unowned_proportion_sum = new_moving_sum.item()
+            model.moving_unowned_proportion_weight = new_moving_weight.item()
+
             # Muon / Shampoo / Adam update
             base_lr = scheduler.get_last_lr()[0]
             if muon_opt is not None:
                 muon_opt.step(base_lr)
             if shampoo_opt is not None:
                 shampoo_opt.step(base_lr)
-            if adam_opt is not None:
-                adam_opt.step(base_lr)
-
             global_step += 1
             total_samples_trained += batch_size * world_size
 
-            # Accumulate metrics
+            # Accumulate metrics (single CUDA sync via .tolist())
+            metrics = dict(zip(_METRIC_KEYS, metrics_stack.tolist()))
             for k in metrics:
                 running[k] += metrics[k]
             running["grad_norm"] += grad_norm.item()
@@ -424,8 +422,6 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                 running["muon_update_rms"] += muon_opt.last_update_rms
             if shampoo_opt is not None:
                 running["shampoo_precond_rms"] += shampoo_opt.last_precond_rms
-            if adam_opt is not None:
-                running["adam_update_rms"] += adam_opt.last_update_rms
             running["count"] += 1
 
             if rank == 0 and global_step % args.print_every == 0:
@@ -464,9 +460,8 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                         for val_batch in data_processing.prefetch_generator(val_gen, args.prefetch_batches):
                             with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
                                 outputs = model(val_batch["binaryInputNCHW"], val_batch["globalInputNC"])
-                            postprocessed = model.postprocess(outputs)
                             _, batch_metrics = compute_loss(
-                                model, postprocessed, val_batch, pos_len,
+                                model, outputs, val_batch, pos_len,
                                 is_training=False,
                                 soft_policy_weight_scale=args.soft_policy_weight_scale,
                                 value_loss_scale=args.value_loss_scale,

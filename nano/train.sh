@@ -1,7 +1,7 @@
 #!/bin/bash
 # Multi-GPU DDP: uncomment MULTI_GPUS below, batch-size is per-GPU
-# MULTI_GPUS="-multi-gpus 0,1"
-MULTI_GPUS=""
+MULTI_GPUS="--multi-gpus 0,1,2,3,4,5,6,7"
+# MULTI_GPUS=""
 
 python3 -u train.py \
     --traindir ../data/train/nano_test \

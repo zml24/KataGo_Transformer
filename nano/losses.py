@@ -5,12 +5,26 @@ import logging
 import torch
 import torch.nn.functional as F
 
-from model import EXTRA_SCORE_DISTR_RADIUS, cross_entropy
+from model import EXTRA_SCORE_DISTR_RADIUS, SoftPlusWithGradientFloor, cross_entropy
 from configs import get_num_bin_input_features, get_num_global_input_features
 
 
-def compute_loss(
-    model, postprocessed, batch, pos_len, is_training,
+_METRIC_KEYS = [
+    "loss", "p0loss", "p1loss", "p0softloss", "p1softloss",
+    "p0lopt", "p0sopt", "vloss", "tdvloss1", "tdvloss2", "tdvloss3",
+    "tdsloss", "oloss", "sloss", "fploss", "skloss", "smloss",
+    "sbcdfloss", "sbpdfloss", "sdregloss", "leadloss", "vtimeloss",
+    "evstloss", "esstloss", "pacc1", "wsum",
+]
+
+
+def postprocess_and_loss_core(
+    outputs,
+    score_belief_offset_vector,
+    input_binary, target_policy_ncmove, target_global, score_distr, target_value_nchw,
+    pos_len,
+    moving_unowned_proportion_sum, moving_unowned_proportion_weight,
+    is_training,
     soft_policy_weight_scale=8.0,
     value_loss_scale=0.6,
     td_value_loss_scales=(0.6, 0.6, 0.6),
@@ -18,22 +32,39 @@ def compute_loss(
     variance_time_loss_scale=1.0,
     disable_optimistic_policy=False,
 ):
-    (
-        policy_logits, value_logits, td_value_logits, pred_td_score,
-        ownership_pretanh, pred_scoring, futurepos_pretanh, seki_logits,
-        pred_scoremean, pred_scorestdev, pred_lead, pred_variance_time,
-        pred_shortterm_value_error, pred_shortterm_score_error,
-        scorebelief_logits,
-    ) = postprocessed
+    """Postprocess model outputs and compute loss. torch.compile friendly.
 
+    Returns (loss_sum, metrics_stack, new_moving_sum, new_moving_weight) where
+    metrics_stack is a 1-D tensor of shape (26,) matching _METRIC_KEYS order.
+    """
+    # --- Postprocess (inlined from model.postprocess) ---
+    (
+        out_policy, out_value, out_misc, out_moremisc,
+        out_ownership, out_scoring, out_futurepos, out_seki,
+        out_scorebelief,
+    ) = outputs
+
+    policy_logits = out_policy
+    value_logits = out_value
+    td_value_logits = torch.stack(
+        (out_misc[:, 4:7], out_misc[:, 7:10], out_moremisc[:, 2:5]), dim=1
+    )
+    pred_td_score = out_moremisc[:, 5:8] * 20.0
+    ownership_pretanh = out_ownership
+    pred_scoring = out_scoring
+    futurepos_pretanh = out_futurepos
+    seki_logits = out_seki
+    pred_scoremean = out_misc[:, 0] * 20.0
+    pred_scorestdev = SoftPlusWithGradientFloor.apply(out_misc[:, 1], 0.05, False) * 20.0
+    pred_lead = out_misc[:, 2] * 20.0
+    pred_variance_time = SoftPlusWithGradientFloor.apply(out_misc[:, 3], 0.05, False) * 40.0
+    pred_shortterm_value_error = SoftPlusWithGradientFloor.apply(out_moremisc[:, 0], 0.05, True) * 0.25
+    pred_shortterm_score_error = SoftPlusWithGradientFloor.apply(out_moremisc[:, 1], 0.05, True) * 150.0
+    scorebelief_logits = out_scorebelief
+
+    # --- Loss computation ---
     N = policy_logits.shape[0]
     pos_area = pos_len * pos_len
-
-    input_binary = batch["binaryInputNCHW"]
-    target_policy_ncmove = batch["policyTargetsNCMove"]
-    target_global = batch["globalTargetsNC"]
-    score_distr = batch["scoreDistrN"]
-    target_value_nchw = batch["valueTargetsNCHW"]
 
     mask = input_binary[:, 0, :, :].contiguous()
     mask_sum_hw = torch.sum(mask, dim=(1, 2))
@@ -189,16 +220,19 @@ def compute_loss(
     owned_target = torch.square(target_ownership)
     unowned_target = 1.0 - owned_target
 
+    # Seki dynamic weight: compute moving average and seki_weight_scale as tensors
+    unowned_proportion = torch.mean(
+        torch.sum(unowned_target * mask, dim=(1, 2)) / (1.0 + mask_sum_hw) * target_weight_ownership
+    )
+
     if is_training:
-        unowned_proportion = torch.sum(unowned_target * mask, dim=(1, 2)) / (1.0 + mask_sum_hw)
-        unowned_proportion = torch.mean(unowned_proportion * target_weight_ownership)
-        model.moving_unowned_proportion_sum *= 0.998
-        model.moving_unowned_proportion_weight *= 0.998
-        model.moving_unowned_proportion_sum += unowned_proportion.item()
-        model.moving_unowned_proportion_weight += 1.0
-        moving_unowned_proportion = model.moving_unowned_proportion_sum / model.moving_unowned_proportion_weight
+        new_moving_sum = moving_unowned_proportion_sum * 0.998 + unowned_proportion
+        new_moving_weight = moving_unowned_proportion_weight * 0.998 + 1.0
+        moving_unowned_proportion = new_moving_sum / new_moving_weight
         seki_weight_scale = 8.0 * 0.005 / (0.005 + moving_unowned_proportion)
     else:
+        new_moving_sum = moving_unowned_proportion_sum
+        new_moving_weight = moving_unowned_proportion_weight
         seki_weight_scale = 7.0
 
     sign_pred = seki_logits[:, 0:3, :, :]
@@ -230,7 +264,7 @@ def compute_loss(
 
     # Score stdev regularization
     score_belief_probs = F.softmax(scorebelief_logits, dim=1)
-    score_belief_offsets = model.value_head.score_belief_offset_vector.view(1, -1)
+    score_belief_offsets = score_belief_offset_vector.view(1, -1)
     expected_score = torch.sum(score_belief_probs * score_belief_offsets, dim=1, keepdim=True)
     stdev_of_belief = torch.sqrt(0.001 + torch.sum(score_belief_probs * torch.square(score_belief_offsets - expected_score), dim=1))
     loss_scorestdev = 0.001 * (global_weight * F.huber_loss(pred_scorestdev, stdev_of_belief, reduction="none", delta=10.0)).sum()
@@ -287,39 +321,64 @@ def compute_loss(
     ) / N
 
     # Accuracy
-    with torch.no_grad():
-        policy_acc1 = (global_weight * target_weight_policy_player * (
-            torch.argmax(policy_logits[:, 0, :], dim=1) == torch.argmax(target_policy_player, dim=1)
-        ).float()).sum()
+    policy_acc1 = (global_weight * target_weight_policy_player * (
+        torch.argmax(policy_logits[:, 0, :], dim=1) == torch.argmax(target_policy_player, dim=1)
+    ).float()).sum()
 
-    return loss_sum, {
-        "loss": loss_sum.item(),
-        "p0loss": loss_policy_player.item(),
-        "p1loss": loss_policy_opponent.item(),
-        "p0softloss": loss_policy_player_soft.item(),
-        "p1softloss": loss_policy_opponent_soft.item(),
-        "p0lopt": loss_longoptimistic_policy.item(),
-        "p0sopt": loss_shortoptimistic_policy.item(),
-        "vloss": loss_value.item(),
-        "tdvloss1": loss_td_value1.item(),
-        "tdvloss2": loss_td_value2.item(),
-        "tdvloss3": loss_td_value3.item(),
-        "tdsloss": loss_td_score.item(),
-        "oloss": loss_ownership.item(),
-        "sloss": loss_scoring.item(),
-        "fploss": loss_futurepos.item(),
-        "skloss": loss_seki.item(),
-        "smloss": loss_scoremean.item(),
-        "sbcdfloss": loss_sb_cdf.item(),
-        "sbpdfloss": loss_sb_pdf.item(),
-        "sdregloss": loss_scorestdev.item(),
-        "leadloss": loss_lead.item(),
-        "vtimeloss": loss_variance_time.item(),
-        "evstloss": loss_st_value_error.item(),
-        "esstloss": loss_st_score_error.item(),
-        "pacc1": policy_acc1.item(),
-        "wsum": global_weight.sum().item(),
-    }
+    metrics_stack = torch.stack([
+        loss_sum, loss_policy_player, loss_policy_opponent,
+        loss_policy_player_soft, loss_policy_opponent_soft,
+        loss_longoptimistic_policy, loss_shortoptimistic_policy,
+        loss_value, loss_td_value1, loss_td_value2, loss_td_value3,
+        loss_td_score, loss_ownership, loss_scoring,
+        loss_futurepos, loss_seki, loss_scoremean,
+        loss_sb_cdf, loss_sb_pdf, loss_scorestdev,
+        loss_lead, loss_variance_time,
+        loss_st_value_error, loss_st_score_error,
+        policy_acc1, global_weight.sum(),
+    ])
+
+    return loss_sum, metrics_stack, new_moving_sum, new_moving_weight
+
+
+def compute_loss(
+    model, outputs, batch, pos_len, is_training,
+    soft_policy_weight_scale=8.0,
+    value_loss_scale=0.6,
+    td_value_loss_scales=(0.6, 0.6, 0.6),
+    seki_loss_scale=1.0,
+    variance_time_loss_scale=1.0,
+    disable_optimistic_policy=False,
+):
+    """Wrapper around postprocess_and_loss_core for backward compatibility.
+
+    Accepts raw model outputs (9-tuple from forward()), handles seki moving
+    average state, and returns (loss, metrics_dict).
+    """
+    dev = outputs[0].device
+    moving_sum_t = torch.tensor(model.moving_unowned_proportion_sum, device=dev)
+    moving_weight_t = torch.tensor(model.moving_unowned_proportion_weight, device=dev)
+
+    loss_sum, metrics_stack, new_sum, new_weight = postprocess_and_loss_core(
+        outputs, model.value_head.score_belief_offset_vector,
+        batch["binaryInputNCHW"], batch["policyTargetsNCMove"],
+        batch["globalTargetsNC"], batch["scoreDistrN"], batch["valueTargetsNCHW"],
+        pos_len, moving_sum_t, moving_weight_t, is_training,
+        soft_policy_weight_scale=soft_policy_weight_scale,
+        value_loss_scale=value_loss_scale,
+        td_value_loss_scales=td_value_loss_scales,
+        seki_loss_scale=seki_loss_scale,
+        variance_time_loss_scale=variance_time_loss_scale,
+        disable_optimistic_policy=disable_optimistic_policy,
+    )
+
+    # Write back seki moving average state
+    if is_training:
+        model.moving_unowned_proportion_sum = new_sum.item()
+        model.moving_unowned_proportion_weight = new_weight.item()
+
+    metrics = dict(zip(_METRIC_KEYS, metrics_stack.tolist()))
+    return loss_sum, metrics
 
 
 def estimate_forward_flops(config, pos_len):
