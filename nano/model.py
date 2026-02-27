@@ -125,7 +125,8 @@ class TransformerBlock(nn.Module):
         x: (N, L, C)
         attn_mask:  (N, 1, 1, L) additive mask       (sdpa only)
         mask_bool:  (N, L) boolean, True=valid         (fa2/fa3 varlen)
-        cu_seqlens: (N+1,) int32 cumulative seq lens   (fa2/fa3 varlen)
+                    None means all tokens are valid and already densely packed.
+        cu_seqlens: (N+1,) int32 cumulative seq lens   (fa2/fa3 varlen / dense-pack)
         max_seqlen: int, max valid length in batch     (fa2/fa3 varlen)
         """
         B, L, C = x.shape
@@ -138,22 +139,39 @@ class TransformerBlock(nn.Module):
         q, k = apply_rotary_emb(q, k, self.cos_cached, self.sin_cached)
 
         if self.attn_backend in ("fa2", "fa3"):
-            # Pack valid tokens, native GQA support
-            q_pack = q[mask_bool]  # (T, num_heads, head_dim)
-            k_pack = k[mask_bool]  # (T, num_kv_heads, head_dim)
-            v_pack = v[mask_bool]  # (T, num_kv_heads, head_dim)
-            if self.attn_backend == "fa2":
-                out_pack = _flash_attn_varlen_v2(
-                    q_pack, k_pack, v_pack,
-                    cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
-                )
+            if mask_bool is None:
+                # Fast path for full-board batches: skip per-layer gather/scatter.
+                q_pack = q.reshape(B * L, self.num_heads, self.head_dim)
+                k_pack = k.reshape(B * L, self.num_kv_heads, self.head_dim)
+                v_pack = v.reshape(B * L, self.num_kv_heads, self.head_dim)
+                if self.attn_backend == "fa2":
+                    out_pack = _flash_attn_varlen_v2(
+                        q_pack, k_pack, v_pack,
+                        cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                    )
+                else:
+                    out_pack = _flash_attn_varlen_v3(
+                        q_pack, k_pack, v_pack,
+                        cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                    )[0]
+                attn_out = out_pack.reshape(B, L, C)
             else:
-                out_pack = _flash_attn_varlen_v3(
-                    q_pack, k_pack, v_pack,
-                    cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
-                )[0]
-            attn_out = x.new_zeros(B, L, C)
-            attn_out[mask_bool] = out_pack.reshape(-1, C)
+                # Pack only valid tokens for variable-size boards.
+                q_pack = q[mask_bool]  # (T, num_heads, head_dim)
+                k_pack = k[mask_bool]  # (T, num_kv_heads, head_dim)
+                v_pack = v[mask_bool]  # (T, num_kv_heads, head_dim)
+                if self.attn_backend == "fa2":
+                    out_pack = _flash_attn_varlen_v2(
+                        q_pack, k_pack, v_pack,
+                        cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                    )
+                else:
+                    out_pack = _flash_attn_varlen_v3(
+                        q_pack, k_pack, v_pack,
+                        cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                    )[0]
+                attn_out = x.new_zeros(B, L, C)
+                attn_out[mask_bool] = out_pack.reshape(-1, C)
         else:
             # SDPA: (B, H, S, D), manual GQA expand
             q = q.permute(0, 2, 1, 3)
@@ -306,6 +324,10 @@ class Model(nn.Module):
         self.config = config
         self.pos_len = pos_len
         self.attn_backend = attn_backend
+        if self.attn_backend == "fa2" and _flash_attn_varlen_v2 is None:
+            raise RuntimeError("attn_backend='fa2' requires flash-attn v2 (`pip install flash-attn`).")
+        if self.attn_backend == "fa3" and _flash_attn_varlen_v3 is None:
+            raise RuntimeError("attn_backend='fa3' requires flash-attn v3 (`pip install flash-attn-3`).")
         self.c_trunk = config["trunk_num_channels"]
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
@@ -392,7 +414,12 @@ class Model(nn.Module):
             attn_mask = None
             mask_bool = mask.view(N, L).bool()
             seqlens = mask_bool.sum(dim=1, dtype=torch.int32)
-            cu_seqlens = F.pad(seqlens.cumsum(0, dtype=torch.int32), (1, 0))
+            if bool((seqlens == L).all().item()):
+                # No padding in this batch: avoid per-block gather/scatter in FA paths.
+                mask_bool = None
+                cu_seqlens = torch.arange(0, (N + 1) * L, L, dtype=torch.int32, device=x.device)
+            else:
+                cu_seqlens = F.pad(seqlens.cumsum(0, dtype=torch.int32), (1, 0))
             max_seqlen = L  # upper bound, avoids .item() CUDA sync
 
         # Trunk
