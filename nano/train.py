@@ -426,9 +426,16 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             if accum_step == grad_accum_steps:
                 accum_step = 0
 
-                # Write back seki moving average (averaged across micro-steps)
-                model.moving_unowned_proportion_sum = accum_moving_sum / grad_accum_steps
-                model.moving_unowned_proportion_weight = accum_moving_weight / grad_accum_steps
+                # Write back seki moving average (averaged across micro-steps and ranks)
+                avg_moving_sum = accum_moving_sum / grad_accum_steps
+                avg_moving_weight = accum_moving_weight / grad_accum_steps
+                if world_size > 1:
+                    mv_t = torch.tensor([avg_moving_sum, avg_moving_weight], device=device)
+                    torch.distributed.all_reduce(mv_t, op=torch.distributed.ReduceOp.SUM)
+                    mv_t /= world_size
+                    avg_moving_sum, avg_moving_weight = mv_t.tolist()
+                model.moving_unowned_proportion_sum = avg_moving_sum
+                model.moving_unowned_proportion_weight = avg_moving_weight
                 accum_moving_sum = 0.0
                 accum_moving_weight = 0.0
 
@@ -590,6 +597,8 @@ if __name__ == "__main__":
     # Validation
     if args.grad_accum_steps < 1:
         parser.error("--grad-accum-steps must be >= 1")
+    if args.print_every < 1:
+        parser.error("--print-every must be >= 1")
     if args.muon_scope != "off" and args.shampoo_scope != "off":
         parser.error("muon-scope and shampoo-scope cannot both be enabled. Set one to 'off'.")
 
