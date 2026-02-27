@@ -114,7 +114,10 @@ def apply_symmetry_to_arrays(binaryInputNCHW, policyTargetsNCMove, valueTargetsN
 
 def save_npz_atomic(output_path, arrays_dict):
     """Save NPZ with atomic write (write to .tmp then rename)."""
-    tmp_path = output_path + ".tmp"
+    # np.savez auto-appends .npz if the path doesn't end with it,
+    # so the tmp file must also end with .npz to avoid a mismatch.
+    assert output_path.endswith(".npz")
+    tmp_path = output_path[:-4] + ".tmp.npz"
     np.savez(tmp_path, **arrays_dict)
     os.replace(tmp_path, output_path)
 
