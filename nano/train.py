@@ -350,6 +350,8 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     reset_running()
     time_start = time.perf_counter()
     last_print_time = time_start
+    accum_step = 0
+    micro_metrics_accum = {k: 0.0 for k in _metric_keys}
 
     while total_samples_trained < args.max_training_samples:
         model.train()
@@ -377,9 +379,6 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             model_config=model_config,
             use_pin_memory=use_pin_memory,
         )
-        accum_step = 0
-        micro_metrics_accum = {k: 0.0 for k in _metric_keys}
-
         for batch in data_processing.prefetch_generator(train_gen, args.prefetch_batches):
             # Clear gradients at the start of each accumulation cycle
             if accum_step == 0:
@@ -452,11 +451,20 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                     running["shampoo_precond_rms"] += shampoo_opt.last_precond_rms
                 running["count"] += 1
 
-                if rank == 0 and global_step % args.print_every == 0:
-                    time_now = time.perf_counter()
-                    print_metrics(time_now - last_print_time)
+                if global_step % args.print_every == 0:
+                    # All-reduce running metrics across ranks
+                    if world_size > 1:
+                        keys = list(running.keys())
+                        vals = torch.tensor([running[k] for k in keys], device=device)
+                        torch.distributed.all_reduce(vals, op=torch.distributed.ReduceOp.SUM)
+                        vals /= world_size
+                        for i, k in enumerate(keys):
+                            running[k] = vals[i].item()
+                    if rank == 0:
+                        time_now = time.perf_counter()
+                        print_metrics(time_now - last_print_time)
+                        last_print_time = time_now
                     reset_running()
-                    last_print_time = time_now
 
                 # Periodic save (rank 0 only)
                 if rank == 0 and total_samples_trained - last_save_samples >= args.save_every_samples:
