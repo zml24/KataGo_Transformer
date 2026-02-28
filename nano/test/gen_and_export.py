@@ -24,7 +24,6 @@ import torch
 import torch.nn as nn
 
 import configs
-from model import Model
 
 # ---------------------------------------------------------------------------
 # Patch nn.RMSNorm.forward so that ONNX export sees only basic math ops
@@ -76,6 +75,8 @@ def main():
     parser.add_argument("--pos-len", type=int, default=19, help="Board size (default: 19)")
     parser.add_argument("--opset", type=int, default=18, help="ONNX opset version (default: 18)")
     parser.add_argument("--verify", action="store_true", help="Verify with onnxruntime")
+    parser.add_argument("--use-te", action="store_true",
+                        help="Use TransformerEngine model for checkpoint generation (ONNX export still uses model.py)")
     args = parser.parse_args()
 
     # Resolve config
@@ -105,8 +106,24 @@ def main():
         print(f"Custom config ({model_name}): {model_config}")
 
     # Create and initialize random model
+    if args.use_te:
+        from model_te import Model as TEModel
+        te_model = TEModel(model_config, args.pos_len, score_mode="simple")
+        te_model.initialize(init_std=0.02)
+        te_model.eval()
+        num_params = sum(p.numel() for p in te_model.parameters())
+        print(f"Parameters (TE): {num_params:,}")
+    else:
+        te_model = None
+
+    from model import Model
     model = Model(model_config, args.pos_len, score_mode="simple")
-    model.initialize(init_std=0.02)
+    if args.use_te:
+        # Convert TE weights to model.py format for ONNX export
+        from model_te import convert_checkpoint_te_to_model
+        model.load_state_dict(convert_checkpoint_te_to_model(te_model.state_dict()))
+    else:
+        model.initialize(init_std=0.02)
     model.eval()
 
     num_params = sum(p.numel() for p in model.parameters())
@@ -117,8 +134,11 @@ def main():
     onnx_path = args.output or os.path.join(models_dir, f"{model_name}.onnx")
     ckpt_path = args.checkpoint or os.path.join(models_dir, f"{model_name}.ckpt")
 
-    # Save checkpoint
-    torch.save({"model": model.state_dict(), "config": model_config}, ckpt_path)
+    # Save checkpoint (TE format if --use-te, model.py format otherwise)
+    if args.use_te:
+        torch.save({"model": te_model.state_dict(), "config": model_config}, ckpt_path)
+    else:
+        torch.save({"model": model.state_dict(), "config": model_config}, ckpt_path)
     print(f"Saved checkpoint: {ckpt_path}")
 
     # Dummy inputs
@@ -130,7 +150,7 @@ def main():
     input_spatial[:, 0, :, :] = 1.0  # mask channel = valid
     input_global = torch.randn(1, num_global)
 
-    # Export ONNX
+    # Export ONNX (always uses model.py's Model for compatibility)
     dynamic_axes = {"input_spatial": {0: "batch"}, "input_global": {0: "batch"}}
     for name in OUTPUT_NAMES:
         dynamic_axes[name] = {0: "batch"}

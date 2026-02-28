@@ -55,9 +55,15 @@ def export(args):
     print(f"Model config: {config}")
     print(f"pos_len={args.pos_len}, score_mode={args.score_mode}")
 
-    # Build model
+    # Build model — always export via model.py's Model for ONNX compatibility
+    model_state = state["model"]
+    if args.use_te:
+        from model_te import detect_checkpoint_format, convert_checkpoint_te_to_model
+        if detect_checkpoint_format(model_state) == "te":
+            print("Converting TE checkpoint to model.py format for ONNX export")
+            model_state = convert_checkpoint_te_to_model(model_state)
     model = Model(config, args.pos_len, score_mode=args.score_mode)
-    model.load_state_dict(state["model"])
+    model.load_state_dict(model_state)
     model.eval()
 
     num_params = sum(p.numel() for p in model.parameters())
@@ -148,6 +154,8 @@ def main():
                         choices=["mixop", "mix", "simple"], help="Score belief head mode")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version (default: 17)")
     parser.add_argument("--verify", action="store_true", help="Verify exported model with onnxruntime")
+    parser.add_argument("--use-te", action="store_true",
+                        help="Checkpoint is from TE model — convert weights to model.py format before export")
     args = parser.parse_args()
 
     onnx_path, model, input_spatial, input_global = export(args)

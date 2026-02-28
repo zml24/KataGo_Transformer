@@ -32,7 +32,7 @@ def polar_express(G):
     if G.size(0) > G.size(1):
         X = X.mT
 
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-7)
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
 
     for a, b, c in _POLAR_EXPRESS_COEFFS:
         A = X @ X.mT

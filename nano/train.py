@@ -26,7 +26,6 @@ import atexit
 
 import configs
 import data as data_processing
-from model import Model
 from optimizers import MuonOptimizer, ShampooOptimizer
 from zero import ZeROAdamW, ZeROMuon, ZeROShampoo, sync_zero_params
 from losses import compute_loss, postprocess_and_loss_core, _METRIC_KEYS, estimate_forward_flops, get_gpu_peak_tflops
@@ -50,9 +49,28 @@ def multiprocessing_cleanup():
 # Training main loop
 # ---------------------------------------------------------------------------
 def main(rank, world_size, args, multi_gpu_device_ids):
+    # Conditional model import
+    if args.use_te:
+        from model_te import Model, detect_checkpoint_format, convert_checkpoint_model_to_te, convert_checkpoint_te_to_model
+    else:
+        from model import Model
+
     # Parse td_value_loss_scales
     td_value_loss_scales = [float(x) for x in args.td_value_loss_scales.split(",")]
     assert len(td_value_loss_scales) == 3
+
+    # FP8 setup
+    fp8_ctx_fn = contextlib.nullcontext
+    if args.use_fp8:
+        assert args.use_te, "--use-fp8 requires --use-te"
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import DelayedScaling, Format
+        fp8_recipe = DelayedScaling(
+            fp8_format=Format.HYBRID,
+            amax_history_len=args.fp8_amax_history,
+            amax_compute_algo="max",
+        )
+        fp8_ctx_fn = lambda: te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
 
     # Logging
     os.makedirs(args.traindir, exist_ok=True)
@@ -145,7 +163,22 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             logging.warning(f"  command-line: {model_config}")
         model_config = ckpt_config
         model = Model(model_config, pos_len, score_mode=args.score_mode)
-        model.load_state_dict(state["model"])
+        model_state = state["model"]
+        if args.use_te:
+            ckpt_fmt = detect_checkpoint_format(model_state)
+            if ckpt_fmt == "model":
+                logging.info("Converting model.py checkpoint to TE format")
+                model_state = convert_checkpoint_model_to_te(model_state)
+            model.load_state_dict(model_state, strict=False)
+        else:
+            try:
+                from model_te import detect_checkpoint_format as _detect, convert_checkpoint_te_to_model as _convert
+                if _detect(model_state) == "te":
+                    logging.info("Converting TE checkpoint to model.py format")
+                    model_state = _convert(model_state)
+            except ImportError:
+                pass
+            model.load_state_dict(model_state)
         model.moving_unowned_proportion_sum = state.get("moving_unowned_proportion_sum", 0.0)
         model.moving_unowned_proportion_weight = state.get("moving_unowned_proportion_weight", 0.0)
         global_step = state.get("global_step", 0)
@@ -163,7 +196,22 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         state = torch.load(args.initial_checkpoint, map_location="cpu", weights_only=False)
         model_config = configs.migrate_config(state.get("config", model_config))
         model = Model(model_config, pos_len, score_mode=args.score_mode)
-        model.load_state_dict(state["model"])
+        model_state = state["model"]
+        if args.use_te:
+            ckpt_fmt = detect_checkpoint_format(model_state)
+            if ckpt_fmt == "model":
+                logging.info("Converting model.py initial checkpoint to TE format")
+                model_state = convert_checkpoint_model_to_te(model_state)
+            model.load_state_dict(model_state, strict=False)
+        else:
+            try:
+                from model_te import detect_checkpoint_format as _detect, convert_checkpoint_te_to_model as _convert
+                if _detect(model_state) == "te":
+                    logging.info("Converting TE initial checkpoint to model.py format")
+                    model_state = _convert(model_state)
+            except ImportError:
+                pass
+            model.load_state_dict(model_state)
         global_step = 0
         total_samples_trained = 0
     else:
@@ -517,7 +565,8 @@ def main(rank, world_size, args, multi_gpu_device_ids):
 
             with ctx:
                 with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
-                    outputs = ddp_model(batch["binaryInputNCHW"], batch["globalInputNC"])
+                    with fp8_ctx_fn():
+                        outputs = ddp_model(batch["binaryInputNCHW"], batch["globalInputNC"])
 
                 # Compiled postprocess + loss (seki moving average computed inside as tensor ops)
                 moving_sum_t = torch.tensor(model.moving_unowned_proportion_sum, device=device)
@@ -741,6 +790,9 @@ if __name__ == "__main__":
     parser.add_argument("--score-mode", type=str, default="simple", choices=["mixop", "mix", "simple"],
                         help="Score belief head mode: mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--use-te", action="store_true", help="Use TransformerEngine model (model_te.py) for fused kernels")
+    parser.add_argument("--use-fp8", action="store_true", help="Enable FP8 training (requires --use-te and Hopper/Ada GPU)")
+    parser.add_argument("--fp8-amax-history", type=int, default=1024, help="FP8 amax history length for delayed scaling")
     args = parser.parse_args()
 
     # Validation

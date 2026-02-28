@@ -21,7 +21,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch
 
 import configs
-from model import Model
 from losses import estimate_forward_flops, get_gpu_peak_tflops
 
 
@@ -38,12 +37,24 @@ def main():
                         help="Number of timed iterations (default: 100)")
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile")
+    parser.add_argument("--use-te", action="store_true",
+                        help="Use TransformerEngine model (model_te.py)")
+    parser.add_argument("--use-fp8", action="store_true",
+                        help="Enable FP8 inference (requires --use-te and Hopper/Ada GPU)")
     args = parser.parse_args()
 
     assert torch.cuda.is_available(), "CUDA is required for this benchmark"
     device = torch.device("cuda")
 
+    if args.use_fp8:
+        assert args.use_te, "--use-fp8 requires --use-te"
+
     # Model setup
+    if args.use_te:
+        from model_te import Model
+    else:
+        from model import Model
+
     model_config = configs.config_of_name[args.model_kind]
     model = Model(model_config, args.pos_len)
     model.initialize()
@@ -73,6 +84,8 @@ def main():
     print(f"Batch size:     {args.batch_size}")
     print(f"Board:          {args.pos_len}x{args.pos_len}")
     print(f"torch.compile:  {'OFF' if args.no_compile else 'ON'}")
+    print(f"TransformerEngine: {'ON' if args.use_te else 'OFF'}")
+    print(f"FP8:            {'ON' if args.use_fp8 else 'OFF'}")
     print(f"FLOPs/sample:   {forward_flops/1e9:.2f} GFLOPs")
     print(f"GPU:            {gpu_name}")
     print(f"GPU BF16 peak:  {gpu_peak_tflops:.1f} TFLOPS")
@@ -91,12 +104,27 @@ def main():
                                                   dtype=torch.float32, device=device)
     input_global = torch.randn(args.batch_size, num_global_features, dtype=torch.float32, device=device)
 
+    # FP8 context
+    import contextlib
+    if args.use_fp8:
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import DelayedScaling, Format
+        fp8_recipe = DelayedScaling(
+            fp8_format=Format.HYBRID,
+            amax_history_len=1024,
+            amax_compute_algo="max",
+        )
+        fp8_ctx_fn = lambda: te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
+    else:
+        fp8_ctx_fn = contextlib.nullcontext
+
     # Warmup (includes torch.compile tracing)
     print(f"\nWarming up ({args.warmup} iters)...", flush=True)
     with torch.inference_mode():
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            for i in range(args.warmup):
-                _ = compiled_model(input_spatial, input_global)
+            with fp8_ctx_fn():
+                for i in range(args.warmup):
+                    _ = compiled_model(input_spatial, input_global)
     torch.cuda.synchronize()
     print("Warmup done.")
 
@@ -106,8 +134,9 @@ def main():
     t0 = time.perf_counter()
     with torch.inference_mode():
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            for i in range(args.iters):
-                _ = compiled_model(input_spatial, input_global)
+            with fp8_ctx_fn():
+                for i in range(args.iters):
+                    _ = compiled_model(input_spatial, input_global)
     torch.cuda.synchronize()
     t1 = time.perf_counter()
     elapsed = t1 - t0
