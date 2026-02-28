@@ -67,23 +67,11 @@ def apply_rotary_emb(xq, xk, cos, sin):
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
-class RMSNormFP32(nn.Module):
-    """RMSNorm that always runs in float32 (autocast disabled)."""
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.norm = nn.RMSNorm(dim, eps=eps)
-
-    def forward(self, x):
-        with torch.amp.autocast(x.device.type, enabled=False):
-            return self.norm(x.float()).to(x.dtype)
-
-
 # ---------------------------------------------------------------------------
-# Transformer Block (NLC format, RoPE + MHA + SwiGLU + RMSNorm)
+# Transformer Block (NLC format, RoPE + MHA + SwiGLU + LayerNorm)
 # ---------------------------------------------------------------------------
 class TransformerBlock(nn.Module):
-    def __init__(self, c_main: int, num_heads: int,
-                 ffn_dim: int, pos_len: int, rope_theta: float = 100.0):
+    def __init__(self, c_main: int, num_heads: int, ffn_dim: int):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c_main // num_heads
@@ -94,22 +82,19 @@ class TransformerBlock(nn.Module):
         self.v_proj = nn.Linear(c_main, c_main, bias=False)
         self.out_proj = nn.Linear(c_main, c_main, bias=False)
 
-        cos_cached, sin_cached = precompute_freqs_cos_sin_2d(self.head_dim, pos_len, rope_theta)
-        self.register_buffer("cos_cached", cos_cached, persistent=False)
-        self.register_buffer("sin_cached", sin_cached, persistent=False)
-
         # SwiGLU FFN
         self.ffn_w1 = nn.Linear(c_main, ffn_dim, bias=False)
         self.ffn_wgate = nn.Linear(c_main, ffn_dim, bias=False)
         self.ffn_w2 = nn.Linear(ffn_dim, c_main, bias=False)
 
-        self.norm1 = RMSNormFP32(c_main, eps=1e-6)
-        self.norm2 = RMSNormFP32(c_main, eps=1e-6)
+        self.norm1 = nn.LayerNorm(c_main, eps=1e-6)
+        self.norm2 = nn.LayerNorm(c_main, eps=1e-6)
 
-    def forward(self, x, attn_mask):
+    def forward(self, x, attn_mask, rope_cos, rope_sin):
         """
         x: (N, L, C)
         attn_mask: (N, 1, 1, L) additive mask
+        rope_cos, rope_sin: (L, head_dim) precomputed RoPE embeddings
         """
         B, L, C = x.shape
         x_normed = self.norm1(x)
@@ -118,7 +103,7 @@ class TransformerBlock(nn.Module):
         k = self.k_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
         v = self.v_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
 
-        q, k = apply_rotary_emb(q, k, self.cos_cached, self.sin_cached)
+        q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
 
         # SDPA: (B, H, S, D)
         q = q.permute(0, 2, 1, 3)
@@ -269,10 +254,16 @@ class Model(nn.Module):
 
         num_heads = config["num_heads"]
         ffn_dim = config["ffn_dim"]
+        head_dim = self.c_trunk // num_heads
 
         # Stem
         self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
         self.linear_global = nn.Linear(num_global_features, self.c_trunk, bias=False)
+
+        # Precompute RoPE embeddings once for the whole model
+        rope_cos, rope_sin = precompute_freqs_cos_sin_2d(head_dim, pos_len)
+        self.register_buffer("rope_cos", rope_cos, persistent=False)
+        self.register_buffer("rope_sin", rope_sin, persistent=False)
 
         # Transformer blocks
         self.blocks = nn.ModuleList()
@@ -281,11 +272,10 @@ class Model(nn.Module):
                 c_main=self.c_trunk,
                 num_heads=num_heads,
                 ffn_dim=ffn_dim,
-                pos_len=pos_len,
             ))
 
         # Final normalization
-        self.norm_final = RMSNormFP32(self.c_trunk, eps=1e-6)
+        self.norm_final = nn.LayerNorm(self.c_trunk, eps=1e-6)
 
         # Output heads
         num_scorebeliefs = config["num_scorebeliefs"]
@@ -337,7 +327,7 @@ class Model(nn.Module):
 
         # Trunk
         for block in self.blocks:
-            x = block(x, attn_mask)
+            x = block(x, attn_mask, self.rope_cos, self.rope_sin)
 
         x = self.norm_final(x)
 
