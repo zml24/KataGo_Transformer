@@ -37,6 +37,32 @@ OPTIONAL_KEYS = [
     "metadataInputNC",
 ]
 
+POS_LEN = 19
+PACKED_BYTES = (POS_LEN * POS_LEN + 7) // 8  # 46
+
+
+def check_board_size(args):
+    """Check if a file's data matches the required board size.
+
+    Each file is one game (one board size), so checking the first row suffices.
+    Returns (filename, num_rows, match).
+    """
+    filename, num_rows, board_size = args
+    try:
+        with np.load(filename) as npz:
+            packed = npz["binaryInputNCHWPacked"]
+            if packed.shape[2] != PACKED_BYTES:
+                return (filename, num_rows, False)
+            # Unpack channel 0 of first row and reshape to (POS_LEN, POS_LEN)
+            ch0 = np.unpackbits(packed[0:1, 0:1, :], axis=2)
+            ch0 = ch0[0, 0, :POS_LEN * POS_LEN].reshape(POS_LEN, POS_LEN)
+            # Board occupies top-left board_size x board_size, rest is padding
+            ok = (int(ch0[:board_size, :board_size].sum()) == board_size * board_size
+                  and int(ch0.sum()) == board_size * board_size)
+            return (filename, num_rows, ok)
+    except Exception:
+        return (filename, num_rows, False)
+
 
 def get_numpy_npz_headers(filename):
     """Read NPZ headers without loading array data."""
@@ -219,6 +245,8 @@ def main():
                         help="Include only files with MD5 hash >= this (for train/val split)")
     parser.add_argument("--md5-ubound", type=float, default=None,
                         help="Include only files with MD5 hash < this (for train/val split)")
+    parser.add_argument("--filter-board-size", type=int, default=None,
+                        help="Keep only files matching this board size (e.g. 19 for 19x19)")
     args = parser.parse_args()
 
     out_dir = args.out_dir
@@ -283,6 +311,27 @@ def main():
 
     if not file_rows:
         print("No files after MD5 filtering, exiting.")
+        sys.exit(0)
+
+    # --- Step 3b: Board size filtering ---
+    if args.filter_board_size is not None:
+        bs = args.filter_board_size
+        with Timer(f"Filtering for {bs}x{bs} boards"):
+            with multiprocessing.Pool(num_processes) as pool:
+                check_results = pool.map(
+                    check_board_size,
+                    [(f, nr, bs) for f, nr in file_rows],
+                    chunksize=64,
+                )
+        filtered = [(f, nr) for f, nr, ok in check_results if ok]
+        filtered_rows = sum(nr for _, nr in filtered)
+        print(f"Board size filter ({bs}x{bs}): {len(filtered)}/{len(file_rows)} files, "
+              f"{filtered_rows}/{total_rows} rows", flush=True)
+        file_rows = filtered
+        total_rows = filtered_rows
+
+    if not file_rows:
+        print("No files after filtering, exiting.")
         sys.exit(0)
 
     # --- Step 4: Setup output ---
