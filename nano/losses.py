@@ -1,6 +1,7 @@
 """Loss functions and FLOPs estimation for KataGo nano training."""
 
 import logging
+import math
 
 import torch
 import torch.nn.functional as F
@@ -21,7 +22,7 @@ _METRIC_KEYS = [
 def postprocess_and_loss_core(
     outputs,
     score_belief_offset_vector,
-    input_binary, target_policy_ncmove, target_global, score_distr, target_value_nchw,
+    target_policy_ncmove, target_global, score_distr, target_value_nchw,
     pos_len,
     moving_unowned_proportion_sum, moving_unowned_proportion_weight,
     is_training,
@@ -66,12 +67,6 @@ def postprocess_and_loss_core(
     N = policy_logits.shape[0]
     pos_area = pos_len * pos_len
 
-    mask = input_binary[:, 0, :, :].contiguous()
-    mask_sum_hw = torch.sum(mask, dim=(1, 2))
-
-    H = W = pos_len
-    policymask = torch.cat([mask.view(N, H * W), mask.new_ones(N, 1)], dim=1)
-
     # Target distributions
     target_policy_player = target_policy_ncmove[:, 0, :]
     target_policy_player = target_policy_player / torch.sum(target_policy_player, dim=1, keepdim=True)
@@ -79,10 +74,10 @@ def postprocess_and_loss_core(
     target_policy_opponent = target_policy_opponent / torch.sum(target_policy_opponent, dim=1, keepdim=True)
 
     # Soft policy targets (0.25 power smoothing)
-    target_policy_player_soft = (target_policy_player + 1e-7) * policymask
+    target_policy_player_soft = (target_policy_player + 1e-7)
     target_policy_player_soft = torch.pow(target_policy_player_soft, 0.25)
     target_policy_player_soft = target_policy_player_soft / torch.sum(target_policy_player_soft, dim=1, keepdim=True)
-    target_policy_opponent_soft = (target_policy_opponent + 1e-7) * policymask
+    target_policy_opponent_soft = (target_policy_opponent + 1e-7)
     target_policy_opponent_soft = torch.pow(target_policy_opponent_soft, 0.25)
     target_policy_opponent_soft = target_policy_opponent_soft / torch.sum(target_policy_opponent_soft, dim=1, keepdim=True)
 
@@ -202,18 +197,18 @@ def postprocess_and_loss_core(
     pred_own_logits = torch.cat([ownership_pretanh, -ownership_pretanh], dim=1).view(N, 2, pos_area)
     target_own_probs = torch.stack([(1.0 + target_ownership) / 2.0, (1.0 - target_ownership) / 2.0], dim=1).view(N, 2, pos_area)
     loss_ownership = 1.5 * (global_weight * target_weight_ownership * (
-        torch.sum(cross_entropy(pred_own_logits, target_own_probs, dim=1) * mask.view(N, pos_area), dim=1) / mask_sum_hw
+        torch.sum(cross_entropy(pred_own_logits, target_own_probs, dim=1), dim=1) / pos_area
     )).sum()
 
     # Scoring
-    loss_scoring_raw = torch.sum(torch.square(pred_scoring.squeeze(1) - target_scoring) * mask, dim=(1, 2)) / mask_sum_hw
+    loss_scoring_raw = torch.sum(torch.square(pred_scoring.squeeze(1) - target_scoring), dim=(1, 2)) / pos_area
     loss_scoring = (global_weight * target_weight_scoring * 4.0 * (torch.sqrt(loss_scoring_raw * 0.5 + 1.0) - 1.0)).sum()
 
     # Future position
-    fp_loss = torch.square(torch.tanh(futurepos_pretanh) - target_futurepos) * mask.unsqueeze(1)
+    fp_loss = torch.square(torch.tanh(futurepos_pretanh) - target_futurepos)
     fp_weight = torch.tensor([1.0, 0.25], device=fp_loss.device).view(1, 2, 1, 1)
     loss_futurepos = 0.25 * (global_weight * target_weight_futurepos * (
-        torch.sum(fp_loss * fp_weight, dim=(1, 2, 3)) / torch.sqrt(mask_sum_hw)
+        torch.sum(fp_loss * fp_weight, dim=(1, 2, 3)) / math.sqrt(pos_area)
     )).sum()
 
     # Seki (dynamic weight)
@@ -222,7 +217,7 @@ def postprocess_and_loss_core(
 
     # Seki dynamic weight: compute moving average and seki_weight_scale as tensors
     unowned_proportion = torch.mean(
-        torch.sum(unowned_target * mask, dim=(1, 2)) / (1.0 + mask_sum_hw) * target_weight_ownership
+        torch.sum(unowned_target, dim=(1, 2)) / (1.0 + pos_area) * target_weight_ownership
     )
 
     if is_training:
@@ -241,11 +236,11 @@ def postprocess_and_loss_core(
         F.relu(target_seki),
         F.relu(-target_seki),
     ], dim=1)
-    loss_sign = torch.sum(cross_entropy(sign_pred, sign_target, dim=1) * mask, dim=(1, 2))
+    loss_sign = torch.sum(cross_entropy(sign_pred, sign_target, dim=1), dim=(1, 2))
     neutral_pred = torch.stack([seki_logits[:, 3, :, :], torch.zeros_like(target_ownership)], dim=1)
     neutral_target = torch.stack([unowned_target, owned_target], dim=1)
-    loss_neutral = torch.sum(cross_entropy(neutral_pred, neutral_target, dim=1) * mask, dim=(1, 2))
-    loss_seki = (global_weight * seki_weight_scale * target_weight_ownership * (loss_sign + 0.5 * loss_neutral) / mask_sum_hw).sum()
+    loss_neutral = torch.sum(cross_entropy(neutral_pred, neutral_target, dim=1), dim=(1, 2))
+    loss_seki = (global_weight * seki_weight_scale * target_weight_ownership * (loss_sign + 0.5 * loss_neutral) / pos_area).sum()
 
     # --- Score belief loss ---
     loss_scoremean = 0.0015 * (global_weight * target_weight_ownership * F.huber_loss(
@@ -361,7 +356,7 @@ def compute_loss(
 
     loss_sum, metrics_stack, new_sum, new_weight = postprocess_and_loss_core(
         outputs, model.value_head.score_belief_offset_vector,
-        batch["binaryInputNCHW"], batch["policyTargetsNCMove"],
+        batch["policyTargetsNCMove"],
         batch["globalTargetsNC"], batch["scoreDistrN"], batch["valueTargetsNCHW"],
         pos_len, moving_sum_t, moving_weight_t, is_training,
         soft_policy_weight_scale=soft_policy_weight_scale,

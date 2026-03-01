@@ -109,7 +109,8 @@ def main():
 
     input_spatial = torch.zeros(args.batch_size, num_bin_features, args.pos_len, args.pos_len,
                                 dtype=torch.float32, device=device)
-    input_spatial[:, 0, :, :] = 1.0  # mask channel = all valid positions
+    # Channel 0 is the on-board mask: all 1 for full-board positions
+    input_spatial[:, 0, :, :] = 1.0
     input_spatial[:, 1:9, :, :] = torch.randint(0, 2, (args.batch_size, 8, args.pos_len, args.pos_len),
                                                   dtype=torch.float32, device=device)
     input_global = torch.randn(args.batch_size, num_global_features, dtype=torch.float32, device=device)

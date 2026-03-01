@@ -583,7 +583,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                 moving_weight_t = torch.tensor(model.moving_unowned_proportion_weight, device=device)
                 loss, metrics_stack, new_moving_sum, new_moving_weight = compiled_loss_fn(
                     outputs, model.value_head.score_belief_offset_vector,
-                    batch["binaryInputNCHW"], batch["policyTargetsNCMove"],
+                    batch["policyTargetsNCMove"],
                     batch["globalTargetsNC"], batch["scoreDistrN"], batch["valueTargetsNCHW"],
                     pos_len, moving_sum_t, moving_weight_t, True,
                     soft_policy_weight_scale=args.soft_policy_weight_scale,

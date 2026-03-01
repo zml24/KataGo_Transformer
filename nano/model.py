@@ -89,10 +89,9 @@ class TransformerBlock(nn.Module):
         self.norm1 = nn.LayerNorm(c_main, eps=1e-6)
         self.norm2 = nn.LayerNorm(c_main, eps=1e-6)
 
-    def forward(self, x, attn_mask, rope_cos, rope_sin):
+    def forward(self, x, rope_cos, rope_sin):
         """
         x: (N, L, C)
-        attn_mask: (N, 1, 1, L) additive mask
         rope_cos, rope_sin: (L, head_dim) precomputed RoPE embeddings
         """
         B, L, C = x.shape
@@ -108,7 +107,7 @@ class TransformerBlock(nn.Module):
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
-        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
+        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0)
         attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, C)
         x = x + self.out_proj(attn_out)
 
@@ -130,14 +129,10 @@ class PolicyHead(nn.Module):
         self.linear_board = nn.Linear(c_in, self.num_policy_outputs, bias=False)
         self.linear_pass = nn.Linear(c_in, self.num_policy_outputs, bias=False)
 
-    def forward(self, x_nlc, mask, mask_sum_hw):
+    def forward(self, x_nlc):
         N, L, _ = x_nlc.shape
         board = self.linear_board(x_nlc).permute(0, 2, 1)  # (N, 6, L)
-        if mask is not None:
-            board = board - (1.0 - mask.view(N, 1, L)) * 5000.0
-            pooled = (x_nlc * mask.view(N, L, 1)).sum(dim=1) / mask_sum_hw.view(N, 1)
-        else:
-            pooled = x_nlc.mean(dim=1)
+        pooled = x_nlc.mean(dim=1)
         pass_logits = self.linear_pass(pooled)  # (N, 6)
         return torch.cat([board, pass_logits.unsqueeze(-1)], dim=2)  # (N, 6, L+1)
 
@@ -184,30 +179,21 @@ class ValueHead(nn.Module):
                 dtype=torch.float32,
             ), persistent=False)
 
-    def forward(self, x_nlc, mask, mask_sum_hw, score_parity):
+    def forward(self, x_nlc, score_parity):
         N, L, _ = x_nlc.shape
         H = W = self.pos_len
 
         spatial_global = self.linear_sv(x_nlc)
         spatial, global_feats = spatial_global.split([self.n_spatial, self.n_global], dim=-1)
 
-        if mask is not None:
-            spatial = spatial * mask.view(N, L, 1)
         spatial = spatial.permute(0, 2, 1).view(N, self.n_spatial, H, W)
         out_ownership, out_scoring, out_futurepos, out_seki = spatial.split([1, 1, 2, 4], dim=1)
 
-        if mask is not None:
-            global_feats = global_feats * mask.view(N, L, 1)
-            global_feats = global_feats.sum(dim=1) / mask_sum_hw.view(N, 1)
-        else:
-            global_feats = global_feats.mean(dim=1)
+        global_feats = global_feats.mean(dim=1)
         out_value, out_misc, out_moremisc = global_feats.split([3, 10, 8], dim=-1)
 
         # Score belief: mean-pool then project
-        if mask is not None:
-            pooled_s = (x_nlc * mask.view(N, L, 1)).sum(dim=1) / mask_sum_hw.view(N, 1)
-        else:
-            pooled_s = x_nlc.mean(dim=1)
+        pooled_s = x_nlc.mean(dim=1)
         if self.score_mode == "simple":
             out_scorebelief_logprobs = F.log_softmax(self.linear_s_simple(pooled_s), dim=1)
         elif self.score_mode in ("mix", "mixop"):
@@ -311,33 +297,25 @@ class Model(nn.Module):
         H = W = self.pos_len
         L = H * W
 
-        mask = input_spatial[:, 0:1, :, :].contiguous()
-        mask_sum_hw = torch.sum(mask, dim=(2, 3), keepdim=True)
-
         # Stem: NCHW -> NLC
         x_spatial = self.conv_spatial(input_spatial)
         x_global = self.linear_global(input_global)
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
         x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
 
-        # Attention mask
-        # mask_flat = mask.view(N, 1, 1, L)
-        # attn_mask = torch.zeros_like(mask_flat, dtype=x.dtype)
-        # attn_mask.masked_fill_(mask_flat == 0, float("-inf"))
-
         # Trunk
         for block in self.blocks:
-            x = block(x, None, self.rope_cos, self.rope_sin)
+            x = block(x, self.rope_cos, self.rope_sin)
 
         x = self.norm_final(x)
 
         # Output heads
-        out_policy = self.policy_head(x, mask, mask_sum_hw)
+        out_policy = self.policy_head(x)
         (
             out_value, out_misc, out_moremisc,
             out_ownership, out_scoring, out_futurepos, out_seki,
             out_scorebelief,
-        ) = self.value_head(x, mask, mask_sum_hw, input_global[:, -1:])
+        ) = self.value_head(x, input_global[:, -1:])
 
         return (
             out_policy.float(), out_value.float(), out_misc.float(), out_moremisc.float(),

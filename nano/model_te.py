@@ -82,10 +82,9 @@ class TransformerBlockTE_DPA(nn.Module):
             activation="swiglu",
         )
 
-    def forward(self, x, attn_mask, rope_cos, rope_sin):
+    def forward(self, x, rope_cos, rope_sin):
         """
         x: (N, L, C)
-        attn_mask: unused (None)
         rope_cos, rope_sin: (L, 1, 1, head_dim) precomputed
         """
         B, L, C = x.shape
@@ -138,10 +137,9 @@ class TransformerBlockTE_MHA(nn.Module):
             activation="swiglu",
         )
 
-    def forward(self, x, attn_mask, rope):
+    def forward(self, x, rope):
         """
         x: (N, L, C)
-        attn_mask: unused (None)
         rope: (L, 1, 1, dim_half) raw RoPE embeddings for TE
         """
         x = x + self.attn(x, rotary_pos_emb=rope)
@@ -172,10 +170,9 @@ class TransformerBlockTE_Full(nn.Module):
             attn_input_format="bshd",
         )
 
-    def forward(self, x, attn_mask, rope):
+    def forward(self, x, rope):
         """
         x: (N, L, C)
-        attn_mask: unused (None)
         rope: (L, 1, 1, dim_half) raw RoPE embeddings for TE
         """
         return self.layer(x, rotary_pos_emb=rope)
@@ -252,9 +249,9 @@ class Model(nn.Module):
         # TE PyCapsule kernels are not torch.compile traceable yet.
         for block in self.blocks:
             if self.te_mode == "dpa":
-                x = block(x, None, self.rope_cos, self.rope_sin)
+                x = block(x, self.rope_cos, self.rope_sin)
             else:
-                x = block(x, None, self.rope)
+                x = block(x, self.rope)
         return self.norm_final(x)
 
     @torch._dynamo.disable
@@ -287,9 +284,6 @@ class Model(nn.Module):
         H = W = self.pos_len
         L = H * W
 
-        mask = input_spatial[:, 0:1, :, :].contiguous()
-        mask_sum_hw = torch.sum(mask, dim=(2, 3), keepdim=True)
-
         # Stem: NCHW -> NLC
         x_spatial = self.conv_spatial(input_spatial)
         x_global = self.linear_global(input_global)
@@ -303,12 +297,12 @@ class Model(nn.Module):
             x = self._run_trunk_impl(x)
 
         # Output heads
-        out_policy = self.policy_head(x, mask, mask_sum_hw)
+        out_policy = self.policy_head(x)
         (
             out_value, out_misc, out_moremisc,
             out_ownership, out_scoring, out_futurepos, out_seki,
             out_scorebelief,
-        ) = self.value_head(x, mask, mask_sum_hw, input_global[:, -1:])
+        ) = self.value_head(x, input_global[:, -1:])
 
         return (
             out_policy.float(), out_value.float(), out_misc.float(), out_moremisc.float(),

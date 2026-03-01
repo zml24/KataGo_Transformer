@@ -147,7 +147,6 @@ def main():
     H = W = args.pos_len
 
     input_spatial = torch.randn(1, num_bin, H, W)
-    input_spatial[:, 0, :, :] = 1.0  # mask channel = valid
     input_global = torch.randn(1, num_global)
 
     # Export ONNX (always uses model.py's Model for compatibility)

@@ -69,14 +69,12 @@ def export(args):
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {num_params:,}")
 
-    # Dummy inputs — mask channel (channel 0) set to 1.0 so all positions are valid,
-    # avoiding -inf propagation in attention masking during tracing.
+    # Dummy inputs
     num_bin = get_num_bin_input_features(config)
     num_global = get_num_global_input_features(config)
     H = W = args.pos_len
 
     input_spatial = torch.randn(1, num_bin, H, W)
-    input_spatial[:, 0, :, :] = 1.0
     input_global = torch.randn(1, num_global)
 
     # Output path
