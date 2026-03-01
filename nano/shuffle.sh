@@ -34,39 +34,15 @@ mkdir -p "$TMPDIR"/val
 
 echo "Beginning shuffle at $(date "+%Y-%m-%d %H:%M:%S")"
 
-# Train split (95% of files by md5 hash)
-(
-    time python3 "$SCRIPTDIR"/shuffle.py \
-         "$INPUTDIR" \
-         --out-dir "$OUTPUTDIR"/train \
-         --tmp-dir "$TMPDIR"/train \
-         --num-processes "$NTHREADS" \
-         --batch-size "$BATCHSIZE" \
-         --approx-rows-per-out-file 70000 \
-         --md5-lbound 0.00 \
-         --md5-ubound 0.95 \
-         "$@" \
-         2>&1 | tee "$OUTPUTDIR"/outtrain.txt &
-
-    wait
-)
-
-# Validation split (5% of files by md5 hash)
-(
-    time python3 "$SCRIPTDIR"/shuffle.py \
-         "$INPUTDIR" \
-         --out-dir "$OUTPUTDIR"/val \
-         --tmp-dir "$TMPDIR"/val \
-         --num-processes "$NTHREADS" \
-         --batch-size "$BATCHSIZE" \
-         --approx-rows-per-out-file 70000 \
-         --md5-lbound 0.95 \
-         --md5-ubound 1.00 \
-         "$@" \
-         2>&1 | tee "$OUTPUTDIR"/outval.txt &
-
-    wait
-)
+time python3 "$SCRIPTDIR"/shuffle.py \
+     "$INPUTDIR" \
+     --num-processes "$NTHREADS" \
+     --batch-size "$BATCHSIZE" \
+     --approx-rows-per-out-file 70000 \
+     --split "train:0.00:0.95:$OUTPUTDIR/train:$TMPDIR/train" \
+     --split "val:0.95:1.00:$OUTPUTDIR/val:$TMPDIR/val" \
+     "$@" \
+     2>&1 | tee "$OUTPUTDIR"/output.txt
 
 echo "Finished shuffle at $(date "+%Y-%m-%d %H:%M:%S")"
 echo "Output: $OUTPUTDIR/{train,val}/"

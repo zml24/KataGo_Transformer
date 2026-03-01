@@ -25,6 +25,7 @@ Torch compile note:
 """
 
 import math
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -53,7 +54,8 @@ class TransformerBlockTE_DPA(nn.Module):
     so weights are directly compatible with model.py checkpoints.
     """
 
-    def __init__(self, c_main: int, num_heads: int, ffn_dim: int):
+    def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
+                 init_method=None, output_layer_init_method=None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c_main // num_heads
@@ -62,10 +64,10 @@ class TransformerBlockTE_DPA(nn.Module):
         self.norm1 = te.RMSNorm(c_main, eps=1e-6)
 
         # Q/K/V/Out projections (te.Linear for FP8 GEMM support)
-        self.q_proj = te.Linear(c_main, c_main, bias=False)
-        self.k_proj = te.Linear(c_main, c_main, bias=False)
-        self.v_proj = te.Linear(c_main, c_main, bias=False)
-        self.out_proj = te.Linear(c_main, c_main, bias=False)
+        self.q_proj = te.Linear(c_main, c_main, bias=False, init_method=init_method)
+        self.k_proj = te.Linear(c_main, c_main, bias=False, init_method=init_method)
+        self.v_proj = te.Linear(c_main, c_main, bias=False, init_method=init_method)
+        self.out_proj = te.Linear(c_main, c_main, bias=False, init_method=output_layer_init_method)
 
         # TE DotProductAttention (fused flash/memory-efficient attention)
         self.attn = te.DotProductAttention(
@@ -80,6 +82,8 @@ class TransformerBlockTE_DPA(nn.Module):
             eps=1e-6, bias=False,
             normalization="RMSNorm",
             activation="swiglu",
+            init_method=init_method,
+            output_layer_init_method=output_layer_init_method,
         )
 
     def forward(self, x, rope_cos, rope_sin):
@@ -113,7 +117,8 @@ class TransformerBlockTE_MHA(nn.Module):
     RoPE is handled internally by TE using rotate_half.
     """
 
-    def __init__(self, c_main: int, num_heads: int, ffn_dim: int):
+    def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
+                 init_method=None, output_layer_init_method=None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c_main // num_heads
@@ -127,6 +132,8 @@ class TransformerBlockTE_MHA(nn.Module):
             normalization="RMSNorm",
             bias=False,
             qkv_format="bshd",
+            init_method=init_method,
+            output_layer_init_method=output_layer_init_method,
         )
 
         # Fused RMSNorm + SwiGLU MLP
@@ -135,6 +142,8 @@ class TransformerBlockTE_MHA(nn.Module):
             eps=1e-6, bias=False,
             normalization="RMSNorm",
             activation="swiglu",
+            init_method=init_method,
+            output_layer_init_method=output_layer_init_method,
         )
 
     def forward(self, x, rope):
@@ -156,7 +165,8 @@ class TransformerBlockTE_Full(nn.Module):
     RoPE is handled internally by TE using rotate_half.
     """
 
-    def __init__(self, c_main: int, num_heads: int, ffn_dim: int):
+    def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
+                 init_method=None, output_layer_init_method=None):
         super().__init__()
         self.layer = te.TransformerLayer(
             c_main, ffn_dim, num_heads,
@@ -168,6 +178,8 @@ class TransformerBlockTE_Full(nn.Module):
             bias=False,
             activation="swiglu",
             attn_input_format="bshd",
+            init_method=init_method,
+            output_layer_init_method=output_layer_init_method,
         )
 
     def forward(self, x, rope):
@@ -259,21 +271,33 @@ class Model(nn.Module):
         return self._run_trunk_impl(x)
 
     def initialize(self, init_std=0.02):
-        """Megatron-LM style initialization (adapted for TE parameter naming)."""
+        """Megatron-LM style initialization using TE-native init_method."""
         num_blocks = len(self.blocks)
         output_std = init_std / math.sqrt(2.0 * num_blocks)
+        init_fn = partial(nn.init.normal_, mean=0.0, std=init_std)
+        output_init_fn = partial(nn.init.normal_, mean=0.0, std=output_std)
 
-        for name, p in self.named_parameters():
-            if p.dim() < 2:
-                # Skip norm params (keep at default: weight=1, bias=0)
-                if "rms_norm" not in name and "norm" not in name:
-                    nn.init.zeros_(p)
-            else:
-                # Output projections get smaller init for residual scaling
-                if ".out_proj." in name or "fc2_weight" in name:
-                    nn.init.normal_(p, mean=0.0, std=output_std)
-                else:
-                    nn.init.normal_(p, mean=0.0, std=init_std)
+        # Rebuild blocks with TE-native init methods
+        BlockClass = _BLOCK_CLASSES[self.te_mode]
+        num_heads = self.config["num_heads"]
+        ffn_dim = self.config["ffn_dim"]
+        self.blocks = nn.ModuleList([
+            BlockClass(
+                c_main=self.c_trunk, num_heads=num_heads, ffn_dim=ffn_dim,
+                init_method=init_fn, output_layer_init_method=output_init_fn,
+            )
+            for _ in range(num_blocks)
+        ])
+
+        # Stem
+        init_fn(self.conv_spatial.weight)
+        init_fn(self.linear_global.weight)
+
+        # Heads (nn.Linear from model.py, all bias=False)
+        for m in (self.policy_head, self.value_head):
+            for p in m.parameters():
+                if p.dim() >= 2:
+                    init_fn(p)
 
     def forward(self, input_spatial, input_global):
         """
