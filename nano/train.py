@@ -52,8 +52,10 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     # Conditional model import
     if args.use_te:
         from model_te import Model, detect_checkpoint_format, convert_checkpoint_model_to_te, convert_checkpoint_te_to_model
+        model_extra_kwargs = {"te_mode": args.te_mode}
     else:
         from model import Model
+        model_extra_kwargs = {}
 
     # Parse td_value_loss_scales
     td_value_loss_scales = [float(x) for x in args.td_value_loss_scales.split(",")]
@@ -162,18 +164,22 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             logging.warning(f"  checkpoint: {ckpt_config}")
             logging.warning(f"  command-line: {model_config}")
         model_config = ckpt_config
-        model = Model(model_config, pos_len, score_mode=args.score_mode)
+        model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
             ckpt_fmt = detect_checkpoint_format(model_state)
             if ckpt_fmt == "model":
-                logging.info("Converting model.py checkpoint to TE format")
-                model_state = convert_checkpoint_model_to_te(model_state)
+                logging.info(f"Converting model.py checkpoint to TE format ({args.te_mode})")
+                model_state = convert_checkpoint_model_to_te(model_state, te_mode=args.te_mode)
+            elif ckpt_fmt != f"te_{args.te_mode}":
+                logging.info(f"Converting {ckpt_fmt} checkpoint to TE format ({args.te_mode})")
+                model_state = convert_checkpoint_te_to_model(model_state)
+                model_state = convert_checkpoint_model_to_te(model_state, te_mode=args.te_mode)
             model.load_state_dict(model_state, strict=False)
         else:
             try:
                 from model_te import detect_checkpoint_format as _detect, convert_checkpoint_te_to_model as _convert
-                if _detect(model_state) == "te":
+                if _detect(model_state) != "model":
                     logging.info("Converting TE checkpoint to model.py format")
                     model_state = _convert(model_state)
             except ImportError:
@@ -195,18 +201,22 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         logging.info(f"Loading initial checkpoint: {args.initial_checkpoint}")
         state = torch.load(args.initial_checkpoint, map_location="cpu", weights_only=False)
         model_config = configs.migrate_config(state.get("config", model_config))
-        model = Model(model_config, pos_len, score_mode=args.score_mode)
+        model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
             ckpt_fmt = detect_checkpoint_format(model_state)
             if ckpt_fmt == "model":
-                logging.info("Converting model.py initial checkpoint to TE format")
-                model_state = convert_checkpoint_model_to_te(model_state)
+                logging.info(f"Converting model.py initial checkpoint to TE format ({args.te_mode})")
+                model_state = convert_checkpoint_model_to_te(model_state, te_mode=args.te_mode)
+            elif ckpt_fmt != f"te_{args.te_mode}":
+                logging.info(f"Converting {ckpt_fmt} initial checkpoint to TE format ({args.te_mode})")
+                model_state = convert_checkpoint_te_to_model(model_state)
+                model_state = convert_checkpoint_model_to_te(model_state, te_mode=args.te_mode)
             model.load_state_dict(model_state, strict=False)
         else:
             try:
                 from model_te import detect_checkpoint_format as _detect, convert_checkpoint_te_to_model as _convert
-                if _detect(model_state) == "te":
+                if _detect(model_state) != "model":
                     logging.info("Converting TE initial checkpoint to model.py format")
                     model_state = _convert(model_state)
             except ImportError:
@@ -216,7 +226,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         total_samples_trained = 0
     else:
         logging.info("Creating new model")
-        model = Model(model_config, pos_len, score_mode=args.score_mode)
+        model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model.initialize(init_std=args.init_std)
         logging.info(f"Initialized weights with std={args.init_std}, output_std={args.init_std / math.sqrt(2.0 * len(model.blocks)):.6f}")
         global_step = 0
@@ -791,6 +801,8 @@ if __name__ == "__main__":
                         help="Score belief head mode: mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--use-te", action="store_true", help="Use TransformerEngine model (model_te.py) for fused kernels")
+    parser.add_argument("--te-mode", type=str, default="mha", choices=["dpa", "mha", "full"],
+                        help="TransformerEngine integration level: dpa=DotProductAttention, mha=MultiheadAttention, full=TransformerLayer")
     parser.add_argument("--use-fp8", action="store_true", help="Enable FP8 training (requires --use-te and Hopper/Ada GPU)")
     parser.add_argument("--fp8-amax-history", type=int, default=1024, help="FP8 amax history length for delayed scaling")
     args = parser.parse_args()

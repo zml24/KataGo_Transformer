@@ -50,8 +50,7 @@ def precompute_freqs_cos_sin_2d(dim: int, pos_len: int, theta: float = 100.0):
     emb_h = grid_h.unsqueeze(-1) * freqs
     emb_w = grid_w.unsqueeze(-1) * freqs
     emb = torch.cat([emb_h, emb_w], dim=-1).flatten(0, 1)
-    emb = emb.repeat_interleave(2, dim=-1)
-    return emb.cos(), emb.sin()
+    return emb.reshape(pos_len * pos_len, 1, 1, dim_half)
 
 
 def apply_rotary_emb(xq, xk, cos, sin):
@@ -261,9 +260,10 @@ class Model(nn.Module):
         self.linear_global = nn.Linear(num_global_features, self.c_trunk, bias=False)
 
         # Precompute RoPE embeddings once for the whole model
-        rope_cos, rope_sin = precompute_freqs_cos_sin_2d(head_dim, pos_len)
-        self.register_buffer("rope_cos", rope_cos, persistent=False)
-        self.register_buffer("rope_sin", rope_sin, persistent=False)
+        emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)           # (L, 1, 1, dim_half)
+        emb_expanded = emb.repeat_interleave(2, dim=-1)                # (L, 1, 1, dim) for rotate_every_two
+        self.register_buffer("rope_cos", emb_expanded.cos(), persistent=False)
+        self.register_buffer("rope_sin", emb_expanded.sin(), persistent=False)
 
         # Transformer blocks
         self.blocks = nn.ModuleList()
@@ -321,13 +321,13 @@ class Model(nn.Module):
         x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
 
         # Attention mask
-        mask_flat = mask.view(N, 1, 1, L)
-        attn_mask = torch.zeros_like(mask_flat, dtype=x.dtype)
-        attn_mask.masked_fill_(mask_flat == 0, float("-inf"))
+        # mask_flat = mask.view(N, 1, 1, L)
+        # attn_mask = torch.zeros_like(mask_flat, dtype=x.dtype)
+        # attn_mask.masked_fill_(mask_flat == 0, float("-inf"))
 
         # Trunk
         for block in self.blocks:
-            x = block(x, attn_mask, self.rope_cos, self.rope_sin)
+            x = block(x, None, self.rope_cos, self.rope_sin)
 
         x = self.norm_final(x)
 
