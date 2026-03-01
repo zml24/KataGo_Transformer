@@ -41,6 +41,8 @@ def main():
                         help="Use TransformerEngine model (model_te.py)")
     parser.add_argument("--te-mode", type=str, default="mha", choices=["dpa", "mha", "full"],
                         help="TransformerEngine integration level (default: mha)")
+    parser.add_argument("--te-compile", type=str, default="safe", choices=["safe", "full"],
+                        help="TE + torch.compile strategy: safe=skip TE trunk tracing, full=compile full model")
     parser.add_argument("--use-fp8", action="store_true",
                         help="Enable FP8 inference (requires --use-te and Hopper/Ada GPU)")
     args = parser.parse_args()
@@ -54,7 +56,10 @@ def main():
     # Model setup
     if args.use_te:
         from model_te import Model
-        model = Model(configs.config_of_name[args.model_kind], args.pos_len, te_mode=args.te_mode)
+        model = Model(
+            configs.config_of_name[args.model_kind], args.pos_len,
+            te_mode=args.te_mode, te_compile=args.te_compile,
+        )
     else:
         from model import Model
         model = Model(configs.config_of_name[args.model_kind], args.pos_len)
@@ -88,6 +93,8 @@ def main():
     print(f"Board:          {args.pos_len}x{args.pos_len}")
     print(f"torch.compile:  {'OFF' if args.no_compile else 'ON'}")
     print(f"TransformerEngine: {'ON (' + args.te_mode + ')' if args.use_te else 'OFF'}")
+    if args.use_te:
+        print(f"TE compile:     {args.te_compile}")
     print(f"FP8:            {'ON' if args.use_fp8 else 'OFF'}")
     print(f"FLOPs/sample:   {forward_flops/1e9:.2f} GFLOPs")
     print(f"GPU:            {gpu_name}")

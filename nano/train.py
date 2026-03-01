@@ -52,7 +52,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     # Conditional model import
     if args.use_te:
         from model_te import Model, detect_checkpoint_format, convert_checkpoint_model_to_te, convert_checkpoint_te_to_model
-        model_extra_kwargs = {"te_mode": args.te_mode}
+        model_extra_kwargs = {"te_mode": args.te_mode, "te_compile": args.te_compile}
     else:
         from model import Model
         model_extra_kwargs = {}
@@ -803,6 +803,8 @@ if __name__ == "__main__":
     parser.add_argument("--use-te", action="store_true", help="Use TransformerEngine model (model_te.py) for fused kernels")
     parser.add_argument("--te-mode", type=str, default="mha", choices=["dpa", "mha", "full"],
                         help="TransformerEngine integration level: dpa=DotProductAttention, mha=MultiheadAttention, full=TransformerLayer")
+    parser.add_argument("--te-compile", type=str, default="safe", choices=["safe", "full"],
+                        help="TE + torch.compile strategy: safe=skip TE trunk tracing (recommended), full=compile full model")
     parser.add_argument("--use-fp8", action="store_true", help="Enable FP8 training (requires --use-te and Hopper/Ada GPU)")
     parser.add_argument("--fp8-amax-history", type=int, default=1024, help="FP8 amax history length for delayed scaling")
     args = parser.parse_args()

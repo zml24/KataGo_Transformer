@@ -17,6 +17,11 @@ Usage:
     - Requires: pip install transformer-engine[pytorch]
     - FP8 requires Hopper (H100/H200) or Ada (RTX 4090) GPU
     - Non-FP8 mode still benefits from TE's fused kernels
+
+Torch compile note:
+    - TE kernels currently call several PyCapsule ops that torch._dynamo cannot trace.
+    - te_compile="safe" isolates the TE trunk from torch.compile to avoid frequent graph-break warnings.
+    - te_compile="full" keeps previous behavior (compile full model, may emit graph-break warnings).
 """
 
 import math
@@ -189,12 +194,15 @@ _BLOCK_CLASSES = {
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
-                 te_mode: str = "mha"):
+                 te_mode: str = "mha", te_compile: str = "safe"):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
         self.c_trunk = config["hidden_size"]
         self.te_mode = te_mode
+        self.te_compile = te_compile
+        if self.te_compile not in ("safe", "full"):
+            raise ValueError(f"Unknown te_compile: {self.te_compile}")
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
 
@@ -240,6 +248,19 @@ class Model(nn.Module):
         self.moving_unowned_proportion_sum = 0.0
         self.moving_unowned_proportion_weight = 0.0
 
+    def _run_trunk_impl(self, x):
+        # TE PyCapsule kernels are not torch.compile traceable yet.
+        for block in self.blocks:
+            if self.te_mode == "dpa":
+                x = block(x, None, self.rope_cos, self.rope_sin)
+            else:
+                x = block(x, None, self.rope)
+        return self.norm_final(x)
+
+    @torch._dynamo.disable
+    def _run_trunk_no_compile(self, x):
+        return self._run_trunk_impl(x)
+
     def initialize(self, init_std=0.02):
         """Megatron-LM style initialization (adapted for TE parameter naming)."""
         num_blocks = len(self.blocks)
@@ -275,14 +296,11 @@ class Model(nn.Module):
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
         x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
 
-        # Trunk
-        for block in self.blocks:
-            if self.te_mode == "dpa":
-                x = block(x, None, self.rope_cos, self.rope_sin)
-            else:
-                x = block(x, None, self.rope)
-
-        x = self.norm_final(x)
+        # Trunk (optionally isolated from torch.compile for TE compatibility)
+        if self.te_compile == "safe":
+            x = self._run_trunk_no_compile(x)
+        else:
+            x = self._run_trunk_impl(x)
 
         # Output heads
         out_policy = self.policy_head(x, mask, mask_sum_hw)
