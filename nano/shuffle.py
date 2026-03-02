@@ -6,8 +6,8 @@ of all data using the Shardify + Merge two-stage approach.
 
 Usage:
     python3 shuffle.py <input-dirs...> \\
-        --num-processes 8 --batch-size 1024 \\
-        [--approx-rows-per-out-file 70000] \\
+        --num-processes 8 \\
+        [--approx-rows-per-out-file 131072] \\
         --split "train:0.00:0.95:/out/train:/tmp/train" \\
         --split "val:0.95:1.00:/out/val:/tmp/val"
 """
@@ -190,10 +190,10 @@ def shardify(input_idx, file_group, num_out_files, out_tmp_dirs):
     return num_rows
 
 
-def merge_shards(out_file, num_shards, tmp_dir, batch_size):
+def merge_shards(out_file, num_shards, tmp_dir):
     """Merge shard files into a single shuffled output file.
 
-    Returns: number of rows written (truncated to batch_size multiple).
+    Returns: number of rows written.
     """
     np.random.seed([int.from_bytes(os.urandom(4), byteorder="little") for _ in range(5)])
 
@@ -215,7 +215,6 @@ def merge_shards(out_file, num_shards, tmp_dir, batch_size):
         return 0
 
     merged = {key: np.concatenate(arrs) for key, arrs in all_data.items()}
-    num_rows = merged["binaryInputNCHWPacked"].shape[0]
 
     # Shuffle
     keys = list(merged.keys())
@@ -223,14 +222,8 @@ def merge_shards(out_file, num_shards, tmp_dir, batch_size):
     arrays = joint_shuffle(arrays)
     merged = dict(zip(keys, arrays))
 
-    # Truncate to batch_size multiple
-    num_keep = (num_rows // batch_size) * batch_size
-    if num_keep == 0:
-        return 0
-
-    out = {key: merged[key][:num_keep] for key in keys}
-    np.savez_compressed(out_file, **out)
-    return num_keep
+    np.savez_compressed(out_file, **merged)
+    return merged["binaryInputNCHWPacked"].shape[0]
 
 
 class Timer:
@@ -258,7 +251,7 @@ def md5_filter(file_rows, lbound, ubound):
     return filtered
 
 
-def process_split(split, num_processes, batch_size, approx_rows_per_out_file, worker_group_size):
+def process_split(split, num_processes, approx_rows_per_out_file, worker_group_size):
     """Process a single split: shardify + merge + write index.json + cleanup."""
     file_rows = split.file_rows
     total_rows = sum(nr for _, nr in file_rows)
@@ -320,7 +313,7 @@ def process_split(split, num_processes, batch_size, approx_rows_per_out_file, wo
         with Timer(f"Merging ({split.name})"):
             merge_results = pool.starmap(
                 merge_shards,
-                [(out_files[idx], num_shards, out_tmp_dirs[idx], batch_size)
+                [(out_files[idx], num_shards, out_tmp_dirs[idx])
                  for idx in range(num_out_files)],
             )
 
@@ -335,15 +328,22 @@ def process_split(split, num_processes, batch_size, approx_rows_per_out_file, wo
     index = {
         "files": index_entries,
         "total_rows": total_written,
-        "batch_size": batch_size,
     }
     index_path = os.path.join(split.out_dir, "index.json")
     with open(index_path, "w") as f:
         json.dump(index, f, indent=2)
 
-    print(f"  Output files for '{split.name}':", flush=True)
-    for entry in index_entries:
-        print(f"    {entry['name']}: {entry['num_rows']}", flush=True)
+    # Summary
+    if index_entries:
+        full_file_rows = index_entries[0]["num_rows"]
+        full_count = sum(1 for e in index_entries if e["num_rows"] == full_file_rows)
+        last_entry = index_entries[-1]
+        if last_entry["num_rows"] == full_file_rows:
+            print(f"  {full_count} complete files, {full_file_rows} rows each", flush=True)
+        else:
+            print(f"  {full_count} complete files, {full_file_rows} rows each; "
+                  f"last file ({last_entry['name']}): {last_entry['num_rows']} rows", flush=True)
+
     print(f"  Total rows written: {total_written}", flush=True)
     print(f"  Index written to: {index_path}", flush=True)
 
@@ -383,9 +383,8 @@ def main():
     parser = argparse.ArgumentParser(description="Shuffle NPZ training data for nano.")
     parser.add_argument("dirs", nargs="+", help="Input directories containing NPZ files")
     parser.add_argument("--num-processes", type=int, required=True, help="Number of parallel workers")
-    parser.add_argument("--batch-size", type=int, required=True, help="Batch size (output rows are a multiple of this)")
-    parser.add_argument("--approx-rows-per-out-file", type=int, default=70000,
-                        help="Target rows per output file (default: 70000)")
+    parser.add_argument("--approx-rows-per-out-file", type=int, default=131072,
+                        help="Target rows per output file (default: 131072)")
     parser.add_argument("--worker-group-size", type=int, default=80000,
                         help="Target rows per sharding worker group (default: 80000)")
     parser.add_argument("--filter-board-size", type=int, default=None,
@@ -406,7 +405,6 @@ def main():
             sys.exit(1)
 
     num_processes = args.num_processes
-    batch_size = args.batch_size
     approx_rows_per_out_file = args.approx_rows_per_out_file
     worker_group_size = args.worker_group_size
 
@@ -463,7 +461,7 @@ def main():
 
     # --- Stage 4: Process each split ---
     for split in args.splits:
-        process_split(split, num_processes, batch_size, approx_rows_per_out_file, worker_group_size)
+        process_split(split, num_processes, approx_rows_per_out_file, worker_group_size)
 
     print(f"\nAll splits done.", flush=True)
 
