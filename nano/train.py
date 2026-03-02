@@ -73,14 +73,11 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                 amax_history_len=args.fp8_amax_history,
                 amax_compute_algo="max",
             )
-            fp8_ctx_fn = lambda: te.autocast(enabled=True, recipe=fp8_recipe,
-                amax_reduction_group=torch.distributed.distributed_c10d._get_default_group() if world_size > 1 else None)
         elif args.fp8_recipe == "current":
             fp8_recipe = Float8CurrentScaling(fp8_format=Format.HYBRID)
-            fp8_ctx_fn = lambda: te.autocast(enabled=True, recipe=fp8_recipe)
         elif args.fp8_recipe == "block":
             fp8_recipe = Float8BlockScaling()
-            fp8_ctx_fn = lambda: te.autocast(enabled=True, recipe=fp8_recipe)
+        fp8_ctx_fn = lambda: te.autocast(enabled=True, recipe=fp8_recipe)
 
     # Logging
     os.makedirs(args.traindir, exist_ok=True)
@@ -459,6 +456,9 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             path = os.path.join(args.traindir, "checkpoint.ckpt")
             torch.save(state_dict, path + ".tmp")
             os.replace(path + ".tmp", path)
+            # Keep a numbered copy
+            numbered = os.path.join(args.traindir, f"checkpoint-s{total_samples_trained}.ckpt")
+            os.link(path, numbered)
             logging.info(f"Saved checkpoint at step {global_step}, {total_samples_trained} samples")
 
     # Metrics accumulation
