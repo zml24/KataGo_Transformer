@@ -27,9 +27,9 @@ _NS_COEFFS_R4_SCALED = (
 @torch.compile
 def polar_express(G):
     """Newton-Schulz iteration for matrix orthogonalization, 5 steps."""
-    assert G.ndim == 2
+    assert G.ndim in (2, 3)
     X = G.bfloat16()
-    if G.size(0) > G.size(1):
+    if G.size(-2) > G.size(-1):
         X = X.mT
 
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
@@ -39,7 +39,7 @@ def polar_express(G):
         B = b * A + c * A @ A
         X = a * X + B @ X
 
-    if G.size(0) > G.size(1):
+    if G.size(-2) > G.size(-1):
         X = X.mT
     return X
 
@@ -47,13 +47,14 @@ def polar_express(G):
 class MuonOptimizer:
     """Muon optimizer: momentum + Newton-Schulz orthogonalization."""
 
-    def __init__(self, named_params, lr_multiplier, momentum, wd, scale_mode="moonlight", device="cuda"):
+    def __init__(self, named_params, lr_multiplier, momentum, wd, scale_mode="moonlight", device="cuda", use_te=False):
         self.named_params = named_params
         self.lr_multiplier = lr_multiplier
         self.momentum = momentum
         self.wd = wd
         self.scale_mode = scale_mode
         self._device = device
+        self.use_te = use_te
         self.last_update_rms = 0.0
         self.states = {name: self._init_state(p) for name, p in named_params.items()}
 
@@ -79,11 +80,20 @@ class MuonOptimizer:
                 if update.ndim == 4:
                     update = update.view(update.size(0), -1)
 
+                # TE fused param split: fc1_weight [2*ffn, h] -> [2, ffn, h], fused QKV [3*h, h] -> [3, h, h]
+                n_split = 0
+                if self.use_te and "fc1_weight" in name:
+                    n_split = 2
+                elif self.use_te and "qkv" in name and update.size(0) == 3 * update.size(1):
+                    n_split = 3
+                if n_split > 0:
+                    update = update.view(n_split, update.size(0) // n_split, update.size(-1))
+
                 update = polar_express(update)
                 if self.scale_mode == "moonlight":
-                    update = update * max(update.size()) ** 0.5
+                    update = update * max(update.size(-2), update.size(-1)) ** 0.5
                 else:
-                    update = update * max(1, update.size(0) / update.size(1)) ** 0.5
+                    update = update * max(1, update.size(-2) / update.size(-1)) ** 0.5
                 update = update.view(original_shape)
 
                 rms_sum += update.norm() * self.lr_multiplier / update.numel() ** 0.5

@@ -72,7 +72,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             amax_history_len=args.fp8_amax_history,
             amax_compute_algo="max",
         )
-        fp8_ctx_fn = lambda: te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
+        fp8_ctx_fn = lambda: te.autocast(enabled=True, recipe=fp8_recipe)
 
     # Logging
     os.makedirs(args.traindir, exist_ok=True)
@@ -261,7 +261,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if p.dim() < 2 or "norm" in name:
+        if p.dim() < 2 or name.endswith("layer_norm_weight") or name.endswith("layer_norm_bias"):
             no_decay_params[name] = p
         elif args.muon_scope == "all":
             muon_params[name] = p
@@ -278,6 +278,14 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                  f"Shampoo params: {sum(p.numel() for p in shampoo_params.values()):,}, "
                  f"Adam decay: {sum(p.numel() for p in adam_params.values()):,}, "
                  f"AdamW no-decay: {sum(p.numel() for p in no_decay_params.values()):,}")
+    for name, p in muon_params.items():
+        logging.info(f"  [Muon] {name}: {list(p.shape)}")
+    for name, p in shampoo_params.items():
+        logging.info(f"  [Shampoo] {name}: {list(p.shape)}")
+    for name, p in adam_params.items():
+        logging.info(f"  [Adam] {name}: {list(p.shape)}")
+    for name, p in no_decay_params.items():
+        logging.info(f"  [NoDecay] {name}: {list(p.shape)}")
 
     # FLOPs estimation
     forward_flops = estimate_forward_flops(model_config, pos_len)
@@ -297,7 +305,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         muon_opt = ZeROMuon(
             muon_params, lr_multiplier=args.muon_lr_multiplier,
             momentum=args.muon_momentum, wd=args.wd, scale_mode=args.muon_scale,
-            device=device, rank=rank, world_size=world_size,
+            device=device, rank=rank, world_size=world_size, use_te=args.use_te,
         ) if muon_params else None
         shampoo_opt = ZeROShampoo(
             shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
@@ -314,7 +322,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         inner_optimizer = torch.optim.AdamW(adam_param_groups, lr=args.lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
         muon_opt = MuonOptimizer(
             muon_params, lr_multiplier=args.muon_lr_multiplier,
-            momentum=args.muon_momentum, wd=args.wd, scale_mode=args.muon_scale, device=device,
+            momentum=args.muon_momentum, wd=args.wd, scale_mode=args.muon_scale, device=device, use_te=args.use_te,
         ) if muon_params else None
         shampoo_opt = ShampooOptimizer(
             shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
@@ -796,7 +804,7 @@ if __name__ == "__main__":
     parser.add_argument("--disable-optimistic-policy", action="store_true", help="Disable optimistic policy")
     parser.add_argument("--multi-gpus", type=str, default=None, help="Comma-separated GPU device ids for DDP (e.g. 0,1,2,3)")
     parser.add_argument("--master-port", type=int, default=23456, help="Localhost port for DDP communication")
-    parser.add_argument("--prefetch-batches", type=int, default=20, help="Prefetch queue depth (0=off)")
+    parser.add_argument("--prefetch-batches", type=int, default=64, help="Prefetch queue depth (0=off)")
     parser.add_argument("--score-mode", type=str, default="simple", choices=["mixop", "mix", "simple"],
                         help="Score belief head mode: mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")

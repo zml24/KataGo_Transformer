@@ -253,7 +253,7 @@ class ZeROAdamW:
 class ZeROMuon:
     """ZeRO Stage 1 wrapper for MuonOptimizer."""
 
-    def __init__(self, named_params, lr_multiplier, momentum, wd, scale_mode, device, rank, world_size):
+    def __init__(self, named_params, lr_multiplier, momentum, wd, scale_mode, device, rank, world_size, use_te=False):
         self.rank = rank
         self.world_size = world_size
         self._all_params = named_params
@@ -263,7 +263,7 @@ class ZeROMuon:
         self._local_numel = sum(p.numel() for p in my_params.values())
         self._local_opt = MuonOptimizer(
             my_params, lr_multiplier=lr_multiplier, momentum=momentum,
-            wd=wd, scale_mode=scale_mode, device=device,
+            wd=wd, scale_mode=scale_mode, device=device, use_te=use_te,
         ) if my_params else None
 
         self.last_update_rms = 0.0
