@@ -52,7 +52,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     # Conditional model import
     if args.use_te:
         from model_te import Model, detect_checkpoint_format, convert_checkpoint_model_to_te, convert_checkpoint_te_to_model
-        model_extra_kwargs = {"te_mode": args.te_mode, "te_compile": args.te_compile}
+        model_extra_kwargs = {"te_mode": args.te_mode, "te_compile": args.te_compile, "use_fp8": args.use_fp8}
     else:
         from model import Model
         model_extra_kwargs = {}

@@ -3,10 +3,11 @@
 This module provides the same Model API as model.py but uses NVIDIA TransformerEngine
 for fused kernels and optional FP8 training support.
 
+All modes use rotate_half RoPE, weights are directly compatible with model.py.
+
 Three integration levels (te_mode):
     - "dpa":  Only DotProductAttention from TE; Q/K/V/out_proj as te.Linear;
-              RoPE applied manually (rotate_every_two, same as model.py).
-              Weights are directly compatible with model.py.
+              RoPE applied manually (rotate_half, same as model.py).
     - "mha":  te.MultiheadAttention (fused QKV + attention);
               RoPE handled internally by TE (rotate_half).
     - "full": te.TransformerLayer (full fused block including FFN + residual);
@@ -50,8 +51,8 @@ from model import (
 class TransformerBlockTE_DPA(nn.Module):
     """Uses te.Linear for Q/K/V/out projections and te.DotProductAttention.
 
-    RoPE is applied manually using rotate_every_two (same as model.py),
-    so weights are directly compatible with model.py checkpoints.
+    RoPE is applied manually using rotate_half (same as model.py).
+    Weights are directly compatible with model.py checkpoints.
     """
 
     def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
@@ -127,13 +128,13 @@ class TransformerBlockTE_MHA(nn.Module):
             c_main, num_heads,
             attention_dropout=0,
             layernorm_epsilon=1e-6,
+            init_method=init_method,
+            output_layer_init_method=output_layer_init_method,
             attn_mask_type="no_mask",
             input_layernorm=True,
             normalization="RMSNorm",
             bias=False,
             qkv_format="bshd",
-            init_method=init_method,
-            output_layer_init_method=output_layer_init_method,
         )
 
         # Fused RMSNorm + SwiGLU MLP
@@ -173,13 +174,13 @@ class TransformerBlockTE_Full(nn.Module):
             layernorm_epsilon=1e-6,
             hidden_dropout=0,
             attention_dropout=0,
+            init_method=init_method,
+            output_layer_init_method=output_layer_init_method,
             self_attn_mask_type="no_mask",
             normalization="RMSNorm",
             bias=False,
             activation="swiglu",
             attn_input_format="bshd",
-            init_method=init_method,
-            output_layer_init_method=output_layer_init_method,
         )
 
     def forward(self, x, rope):
@@ -198,12 +199,23 @@ _BLOCK_CLASSES = {
 }
 
 
+def _replace_nn_linear_with_te(module):
+    """Recursively replace nn.Linear with te.Linear in a module."""
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            setattr(module, name, te.Linear(
+                child.in_features, child.out_features, bias=(child.bias is not None),
+            ))
+        else:
+            _replace_nn_linear_with_te(child)
+
+
 # ---------------------------------------------------------------------------
 # Model (same API as model.py)
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
-                 te_mode: str = "mha", te_compile: str = "safe"):
+                 te_mode: str = "mha", te_compile: str = "safe", use_fp8: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
@@ -219,21 +231,22 @@ class Model(nn.Module):
         ffn_dim = config["ffn_dim"]
         head_dim = self.c_trunk // num_heads
 
-        # Stem (Conv2d and global Linear stay as nn — input dims not FP8-aligned)
+        # Stem: Conv2d stays as nn (TE has no Conv2d)
+        # Non-FP8: use te.Linear for fused kernels; FP8: nn.Linear (dims not FP8-aligned)
+        Linear = nn.Linear if use_fp8 else te.Linear
         self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
-        self.linear_global = nn.Linear(num_global_features, self.c_trunk, bias=False)
+        self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
 
-        # Precompute RoPE embeddings
+        # Precompute RoPE embeddings (all modes use rotate_half)
         emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)  # (L, 1, 1, dim_half)
+        emb_full = torch.cat([emb, emb], dim=-1)              # (L, 1, 1, dim)
         if te_mode == "dpa":
-            # DPA uses rotate_every_two (same as model.py)
-            emb_expanded = emb.repeat_interleave(2, dim=-1)  # (L, 1, 1, dim)
-            self.register_buffer("rope_cos", emb_expanded.cos(), persistent=False)
-            self.register_buffer("rope_sin", emb_expanded.sin(), persistent=False)
+            # DPA applies RoPE manually — precompute cos/sin
+            self.register_buffer("rope_cos", emb_full.cos(), persistent=False)
+            self.register_buffer("rope_sin", emb_full.sin(), persistent=False)
         else:
-            # MHA/Full: TE handles RoPE internally (rotate_half)
-            # TE expects raw emb; it does cat([emb, emb]) internally
-            self.register_buffer("rope", emb, persistent=False)
+            # MHA/Full: TE handles cos/sin internally — pass raw angles
+            self.register_buffer("rope", emb_full, persistent=False)
 
         # Transformer blocks
         BlockClass = _BLOCK_CLASSES[te_mode]
@@ -248,10 +261,13 @@ class Model(nn.Module):
         # Final normalization (TE fused kernel)
         self.norm_final = te.RMSNorm(self.c_trunk, eps=1e-6)
 
-        # Output heads (kept as nn.Linear — small dims not FP8-aligned, not a bottleneck)
+        # Output heads: non-FP8 uses te.Linear for fused kernels; FP8 keeps nn.Linear (dims not FP8-aligned)
         num_scorebeliefs = config["num_scorebeliefs"]
         self.policy_head = PolicyHead(self.c_trunk, pos_len)
         self.value_head = ValueHead(self.c_trunk, num_scorebeliefs, pos_len, score_mode=score_mode)
+        if not use_fp8:
+            _replace_nn_linear_with_te(self.policy_head)
+            _replace_nn_linear_with_te(self.value_head)
 
         # Seki dynamic weight moving average state
         self.moving_unowned_proportion_sum = 0.0

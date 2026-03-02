@@ -272,9 +272,6 @@ def process_split(split, num_processes, batch_size, approx_rows_per_out_file, wo
         print(f"  No files for split '{split.name}', skipping.", flush=True)
         return
 
-    # Setup output
-    if os.path.exists(split.out_dir):
-        raise RuntimeError(f"Output directory already exists: {split.out_dir}")
     os.makedirs(split.out_dir)
 
     num_out_files = max(1, round(total_rows / approx_rows_per_out_file))
@@ -401,6 +398,12 @@ def main():
     if not args.splits:
         print("ERROR: at least one --split is required.", file=sys.stderr)
         sys.exit(1)
+
+    # Pre-check: fail fast if any output directory already exists
+    for split in args.splits:
+        if os.path.exists(split.out_dir):
+            print(f"ERROR: Output directory already exists: {split.out_dir}", file=sys.stderr)
+            sys.exit(1)
 
     num_processes = args.num_processes
     batch_size = args.batch_size

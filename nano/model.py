@@ -54,15 +54,14 @@ def precompute_freqs_cos_sin_2d(dim: int, pos_len: int, theta: float = 100.0):
 
 
 def apply_rotary_emb(xq, xk, cos, sin):
-    def rotate_every_two(x):
-        x = x.reshape(*x.shape[:-1], -1, 2)
-        x0, x1 = x.unbind(dim=-1)
-        return torch.stack([-x1, x0], dim=-1).flatten(-2)
+    def rotate_half(x):
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat([-x2, x1], dim=-1)
 
     cos = cos.view(1, xq.shape[1], 1, xq.shape[-1])
     sin = sin.view(1, xq.shape[1], 1, xq.shape[-1])
-    xq_out = xq * cos + rotate_every_two(xq) * sin
-    xk_out = xk * cos + rotate_every_two(xk) * sin
+    xq_out = xq * cos + rotate_half(xq) * sin
+    xk_out = xk * cos + rotate_half(xk) * sin
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -245,9 +244,9 @@ class Model(nn.Module):
         self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
         self.linear_global = nn.Linear(num_global_features, self.c_trunk, bias=False)
 
-        # Precompute RoPE embeddings once for the whole model
+        # Precompute RoPE embeddings once for the whole model (rotate_half style)
         emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)           # (L, 1, 1, dim_half)
-        emb_expanded = emb.repeat_interleave(2, dim=-1)                # (L, 1, 1, dim) for rotate_every_two
+        emb_expanded = torch.cat([emb, emb], dim=-1)                   # (L, 1, 1, dim)
         self.register_buffer("rope_cos", emb_expanded.cos(), persistent=False)
         self.register_buffer("rope_sin", emb_expanded.sin(), persistent=False)
 

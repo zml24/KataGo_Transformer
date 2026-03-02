@@ -38,7 +38,7 @@ time python3 "$SCRIPTDIR"/shuffle.py \
      "$INPUTDIR" \
      --num-processes "$NTHREADS" \
      --batch-size "$BATCHSIZE" \
-     --approx-rows-per-out-file 70000 \
+     --approx-rows-per-out-file 131072 \
      --split "train:0.00:0.95:$OUTPUTDIR/train:$TMPDIR/train" \
      --split "val:0.95:1.00:$OUTPUTDIR/val:$TMPDIR/val" \
      "$@" \
