@@ -1,17 +1,9 @@
 """Transformer model architecture for KataGo nano training (TransformerEngine version).
 
 This module provides the same Model API as model.py but uses NVIDIA TransformerEngine
-for fused kernels and optional FP8 training support.
+(te.TransformerLayer) for fused kernels and optional FP8 training support.
 
-All modes use rotate_half RoPE, weights are directly compatible with model.py.
-
-Three integration levels (te_mode):
-    - "dpa":  Only DotProductAttention from TE; Q/K/V/out_proj as te.Linear;
-              RoPE applied manually (rotate_half, same as model.py).
-    - "mha":  te.MultiheadAttention (fused QKV + attention);
-              RoPE handled internally by TE (rotate_half).
-    - "full": te.TransformerLayer (full fused block including FFN + residual);
-              RoPE handled internally by TE (rotate_half).
+All weights are directly compatible with model.py via checkpoint conversion utilities.
 
 Usage:
     - Drop-in replacement for model.py's Model class
@@ -39,128 +31,15 @@ from model import (
     SoftPlusWithGradientFloor,
     cross_entropy,
     precompute_freqs_cos_sin_2d,
-    apply_rotary_emb,
     PolicyHead,
     ValueHead,
 )
 
 
 # ---------------------------------------------------------------------------
-# Level 1 — DPA: Only DotProductAttention from TE
+# Transformer block: te.TransformerLayer (complete fused block)
 # ---------------------------------------------------------------------------
-class TransformerBlockTE_DPA(nn.Module):
-    """Uses te.Linear for Q/K/V/out projections and te.DotProductAttention.
-
-    RoPE is applied manually using rotate_half (same as model.py).
-    Weights are directly compatible with model.py checkpoints.
-    """
-
-    def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
-                 init_method=None, output_layer_init_method=None):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = c_main // num_heads
-
-        # Pre-attention RMSNorm
-        self.norm1 = te.RMSNorm(c_main, eps=1e-6)
-
-        # Q/K/V/Out projections (te.Linear for FP8 GEMM support)
-        self.q_proj = te.Linear(c_main, c_main, bias=False, init_method=init_method)
-        self.k_proj = te.Linear(c_main, c_main, bias=False, init_method=init_method)
-        self.v_proj = te.Linear(c_main, c_main, bias=False, init_method=init_method)
-        self.out_proj = te.Linear(c_main, c_main, bias=False, init_method=output_layer_init_method)
-
-        # TE DotProductAttention (fused flash/memory-efficient attention)
-        self.attn = te.DotProductAttention(
-            num_heads, self.head_dim,
-            attn_mask_type="no_mask",
-            qkv_format="bshd",
-        )
-
-        # Fused RMSNorm + SwiGLU MLP
-        self.ffn = te.LayerNormMLP(
-            c_main, ffn_dim,
-            eps=1e-6, bias=False,
-            normalization="RMSNorm",
-            activation="swiglu",
-            init_method=init_method,
-            output_layer_init_method=output_layer_init_method,
-        )
-
-    def forward(self, x, rope_cos, rope_sin):
-        """
-        x: (N, L, C)
-        rope_cos, rope_sin: (L, 1, 1, head_dim) precomputed
-        """
-        B, L, C = x.shape
-        x_normed = self.norm1(x)
-
-        q = self.q_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
-        k = self.k_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
-        v = self.v_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
-
-        q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
-
-        attn_out = self.attn(q, k, v).view(B, L, C)
-        x = x + self.out_proj(attn_out)
-
-        # Fused RMSNorm + SwiGLU (residual added manually)
-        x = x + self.ffn(x)
-        return x
-
-
-# ---------------------------------------------------------------------------
-# Level 2 — MHA: te.MultiheadAttention (fused QKV + attention)
-# ---------------------------------------------------------------------------
-class TransformerBlockTE_MHA(nn.Module):
-    """Uses te.MultiheadAttention with built-in layernorm.
-
-    RoPE is handled internally by TE using rotate_half.
-    """
-
-    def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
-                 init_method=None, output_layer_init_method=None):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = c_main // num_heads
-
-        self.attn = te.MultiheadAttention(
-            c_main, num_heads,
-            attention_dropout=0,
-            layernorm_epsilon=1e-6,
-            init_method=init_method,
-            output_layer_init_method=output_layer_init_method,
-            attn_mask_type="no_mask",
-            input_layernorm=True,
-            normalization="RMSNorm",
-            bias=False,
-            qkv_format="bshd",
-        )
-
-        # Fused RMSNorm + SwiGLU MLP
-        self.ffn = te.LayerNormMLP(
-            c_main, ffn_dim,
-            eps=1e-6, bias=False,
-            normalization="RMSNorm",
-            activation="swiglu",
-            init_method=init_method,
-            output_layer_init_method=output_layer_init_method,
-        )
-
-    def forward(self, x, rope):
-        """
-        x: (N, L, C)
-        rope: (L, 1, 1, dim_half) raw RoPE embeddings for TE
-        """
-        x = x + self.attn(x, rotary_pos_emb=rope)
-        x = x + self.ffn(x)
-        return x
-
-
-# ---------------------------------------------------------------------------
-# Level 3 — Full: te.TransformerLayer (complete fused block)
-# ---------------------------------------------------------------------------
-class TransformerBlockTE_Full(nn.Module):
+class TransformerBlockTE(nn.Module):
     """Uses te.TransformerLayer for the entire block including residual connections.
 
     RoPE is handled internally by TE using rotate_half.
@@ -181,6 +60,7 @@ class TransformerBlockTE_Full(nn.Module):
             bias=False,
             activation="swiglu",
             attn_input_format="bshd",
+            fuse_qkv_params=True,
         )
 
     def forward(self, x, rope):
@@ -189,14 +69,6 @@ class TransformerBlockTE_Full(nn.Module):
         rope: (L, 1, 1, dim_half) raw RoPE embeddings for TE
         """
         return self.layer(x, rotary_pos_emb=rope)
-
-
-# Block class lookup
-_BLOCK_CLASSES = {
-    "dpa": TransformerBlockTE_DPA,
-    "mha": TransformerBlockTE_MHA,
-    "full": TransformerBlockTE_Full,
-}
 
 
 def _replace_nn_linear_with_te(module):
@@ -215,12 +87,11 @@ def _replace_nn_linear_with_te(module):
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
-                 te_mode: str = "mha", te_compile: str = "safe", use_fp8: bool = False):
+                 te_compile: str = "safe", use_fp8: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
         self.c_trunk = config["hidden_size"]
-        self.te_mode = te_mode
         self.te_compile = te_compile
         if self.te_compile not in ("safe", "full"):
             raise ValueError(f"Unknown te_compile: {self.te_compile}")
@@ -237,19 +108,13 @@ class Model(nn.Module):
         self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
         self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
 
-        # Precompute RoPE embeddings (all modes use rotate_half)
+        # Precompute RoPE embeddings (rotate_half)
         emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)  # (L, 1, 1, dim_half)
         emb_full = torch.cat([emb, emb], dim=-1)              # (L, 1, 1, dim)
-        if te_mode == "dpa":
-            # DPA applies RoPE manually — precompute cos/sin
-            self.register_buffer("rope_cos", emb_full.cos(), persistent=False)
-            self.register_buffer("rope_sin", emb_full.sin(), persistent=False)
-        else:
-            # MHA/Full: TE handles cos/sin internally — pass raw angles
-            self.register_buffer("rope", emb_full, persistent=False)
+        self.register_buffer("rope", emb_full, persistent=False)
 
         # Transformer blocks
-        BlockClass = _BLOCK_CLASSES[te_mode]
+        BlockClass = TransformerBlockTE
         self.blocks = nn.ModuleList()
         for _ in range(config["num_layers"]):
             self.blocks.append(BlockClass(
@@ -274,12 +139,8 @@ class Model(nn.Module):
         self.moving_unowned_proportion_weight = 0.0
 
     def _run_trunk_impl(self, x):
-        # TE PyCapsule kernels are not torch.compile traceable yet.
         for block in self.blocks:
-            if self.te_mode == "dpa":
-                x = block(x, self.rope_cos, self.rope_sin)
-            else:
-                x = block(x, self.rope)
+            x = block(x, self.rope)
         return self.norm_final(x)
 
     @torch._dynamo.disable
@@ -294,7 +155,7 @@ class Model(nn.Module):
         output_init_fn = partial(nn.init.normal_, mean=0.0, std=output_std)
 
         # Rebuild blocks with TE-native init methods
-        BlockClass = _BLOCK_CLASSES[self.te_mode]
+        BlockClass = TransformerBlockTE
         num_heads = self.config["num_heads"]
         ffn_dim = self.config["ffn_dim"]
         self.blocks = nn.ModuleList([
@@ -398,109 +259,15 @@ class Model(nn.Module):
 # Checkpoint format detection and conversion
 # ---------------------------------------------------------------------------
 def detect_checkpoint_format(state_dict):
-    """Detect checkpoint format: 'model', 'te_dpa', 'te_mha', or 'te_full'.
-
-    Detection logic:
-        - 'te_full': has te.TransformerLayer keys like '.layer.self_attention.'
-        - 'te_mha':  has te.MultiheadAttention keys like '.attn.layernorm_qkv.'
-        - 'te_dpa':  has te.DotProductAttention keys like '.attn.core_attention.' + '.q_proj.'
-        - 'model':   has model.py keys like '.ffn_w1.weight' or '.norm2.weight'
-    """
-    has_transformer_layer = False
-    has_mha_qkv = False
-    has_dpa_q_proj = False
-    has_model_ffn = False
-
+    """Detect checkpoint format: 'pt' (model.py) or 'te' (TransformerEngine)."""
     for key in state_dict:
-        if "_extra_state" in key:
-            continue
         if ".layer.self_attention." in key:
-            has_transformer_layer = True
-        if ".attn.layernorm_qkv." in key:
-            has_mha_qkv = True
-        if ".q_proj." in key and ".attn." not in key:
-            has_dpa_q_proj = True
-        if ".ffn_w1.weight" in key or ".norm2.weight" in key:
-            has_model_ffn = True
-
-    if has_transformer_layer:
-        return "te_full"
-    if has_mha_qkv:
-        return "te_mha"
-    if has_dpa_q_proj and not has_model_ffn:
-        return "te_dpa"
-    return "model"
+            return "te"
+    return "pt"
 
 
-def convert_checkpoint_model_to_te(state_dict, te_mode="mha"):
-    """Convert model.py state_dict to model_te.py format.
-
-    Args:
-        state_dict: model.py format state dict
-        te_mode: target TE mode ("dpa", "mha", or "full")
-
-    For DPA mode, only FFN keys are remapped (Q/K/V/out_proj names match model.py).
-    For MHA mode, attention keys are also remapped to te.MultiheadAttention format.
-    For Full mode, all keys are remapped to te.TransformerLayer format.
-    """
-    if te_mode == "dpa":
-        return _convert_model_to_te_dpa(state_dict)
-    elif te_mode == "mha":
-        return _convert_model_to_te_mha(state_dict)
-    elif te_mode == "full":
-        return _convert_model_to_te_full(state_dict)
-    else:
-        raise ValueError(f"Unknown te_mode: {te_mode}")
-
-
-def _convert_model_to_te_dpa(state_dict):
-    """model.py -> TE DPA: only FFN keys change, attention keys stay the same."""
-    new_sd = {}
-    for key, value in state_dict.items():
-        if ".ffn_w1.weight" in key:
-            block_prefix = key.rsplit(".ffn_w1.weight", 1)[0]
-            wgate_key = block_prefix + ".ffn_wgate.weight"
-            new_sd[block_prefix + ".ffn.fc1_weight"] = torch.cat([value, state_dict[wgate_key]], dim=0)
-        elif ".ffn_wgate.weight" in key:
-            continue
-        elif ".ffn_w2.weight" in key:
-            new_sd[key.replace(".ffn_w2.weight", ".ffn.fc2_weight")] = value
-        elif ".norm2.weight" in key:
-            new_sd[key.replace(".norm2.weight", ".ffn.layer_norm_weight")] = value
-        elif ".norm2.bias" in key:
-            new_sd[key.replace(".norm2.bias", ".ffn.layer_norm_bias")] = value
-        elif ".norm1.weight" in key:
-            new_sd[key.replace(".norm1.weight", ".norm1.weight")] = value
-        elif ".norm1.bias" in key:
-            new_sd[key.replace(".norm1.bias", ".norm1.bias")] = value
-        else:
-            new_sd[key] = value
-    return new_sd
-
-
-def _convert_model_to_te_mha(state_dict):
-    """model.py -> TE MHA: remap norm1+Q/K/V and FFN keys."""
-    new_sd = {}
-    for key, value in state_dict.items():
-        if ".ffn_w1.weight" in key:
-            block_prefix = key.rsplit(".ffn_w1.weight", 1)[0]
-            wgate_key = block_prefix + ".ffn_wgate.weight"
-            new_sd[block_prefix + ".ffn.fc1_weight"] = torch.cat([value, state_dict[wgate_key]], dim=0)
-        elif ".ffn_wgate.weight" in key:
-            continue
-        elif ".ffn_w2.weight" in key:
-            new_sd[key.replace(".ffn_w2.weight", ".ffn.fc2_weight")] = value
-        elif ".norm2.weight" in key:
-            new_sd[key.replace(".norm2.weight", ".ffn.layer_norm_weight")] = value
-        elif ".norm2.bias" in key:
-            new_sd[key.replace(".norm2.bias", ".ffn.layer_norm_bias")] = value
-        else:
-            new_sd[key] = value
-    return new_sd
-
-
-def _convert_model_to_te_full(state_dict):
-    """model.py -> TE Full: remap all keys to te.TransformerLayer format."""
+def convert_checkpoint_model_to_te(state_dict):
+    """Convert model.py state_dict to TE (te.TransformerLayer) format."""
     new_sd = {}
     for key, value in state_dict.items():
         if ".ffn_w1.weight" in key:
@@ -533,70 +300,10 @@ def _convert_model_to_te_full(state_dict):
 
 
 def convert_checkpoint_te_to_model(state_dict):
-    """Convert any TE format state_dict back to model.py format.
+    """Convert TE (te.TransformerLayer) state_dict back to model.py format.
 
-    Auto-detects the TE sub-format and converts accordingly.
     Filters out TE-specific _extra_state keys.
     """
-    fmt = detect_checkpoint_format(state_dict)
-    if fmt == "model":
-        return state_dict
-    elif fmt == "te_dpa":
-        return _convert_te_dpa_to_model(state_dict)
-    elif fmt == "te_mha":
-        return _convert_te_mha_to_model(state_dict)
-    elif fmt == "te_full":
-        return _convert_te_full_to_model(state_dict)
-    else:
-        raise ValueError(f"Unknown format: {fmt}")
-
-
-def _convert_te_dpa_to_model(state_dict):
-    """TE DPA -> model.py: reverse FFN key mapping."""
-    new_sd = {}
-    for key, value in state_dict.items():
-        if "_extra_state" in key:
-            continue
-        if ".ffn.fc1_weight" in key:
-            block_prefix = key.rsplit(".ffn.fc1_weight", 1)[0]
-            half = value.shape[0] // 2
-            new_sd[block_prefix + ".ffn_w1.weight"] = value[:half]
-            new_sd[block_prefix + ".ffn_wgate.weight"] = value[half:]
-        elif ".ffn.fc2_weight" in key:
-            new_sd[key.replace(".ffn.fc2_weight", ".ffn_w2.weight")] = value
-        elif ".ffn.layer_norm_weight" in key:
-            new_sd[key.replace(".ffn.layer_norm_weight", ".norm2.weight")] = value
-        elif ".ffn.layer_norm_bias" in key:
-            new_sd[key.replace(".ffn.layer_norm_bias", ".norm2.bias")] = value
-        else:
-            new_sd[key] = value
-    return new_sd
-
-
-def _convert_te_mha_to_model(state_dict):
-    """TE MHA -> model.py: reverse all key mappings."""
-    new_sd = {}
-    for key, value in state_dict.items():
-        if "_extra_state" in key:
-            continue
-        if ".ffn.fc1_weight" in key:
-            block_prefix = key.rsplit(".ffn.fc1_weight", 1)[0]
-            half = value.shape[0] // 2
-            new_sd[block_prefix + ".ffn_w1.weight"] = value[:half]
-            new_sd[block_prefix + ".ffn_wgate.weight"] = value[half:]
-        elif ".ffn.fc2_weight" in key:
-            new_sd[key.replace(".ffn.fc2_weight", ".ffn_w2.weight")] = value
-        elif ".ffn.layer_norm_weight" in key:
-            new_sd[key.replace(".ffn.layer_norm_weight", ".norm2.weight")] = value
-        elif ".ffn.layer_norm_bias" in key:
-            new_sd[key.replace(".ffn.layer_norm_bias", ".norm2.bias")] = value
-        else:
-            new_sd[key] = value
-    return new_sd
-
-
-def _convert_te_full_to_model(state_dict):
-    """TE Full -> model.py: reverse te.TransformerLayer key mappings."""
     new_sd = {}
     for key, value in state_dict.items():
         if "_extra_state" in key:

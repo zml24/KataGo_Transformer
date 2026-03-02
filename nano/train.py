@@ -51,8 +51,8 @@ def multiprocessing_cleanup():
 def main(rank, world_size, args, multi_gpu_device_ids):
     # Conditional model import
     if args.use_te:
-        from model_te import Model, detect_checkpoint_format, convert_checkpoint_model_to_te, convert_checkpoint_te_to_model
-        model_extra_kwargs = {"te_mode": args.te_mode, "te_compile": args.te_compile, "use_fp8": args.use_fp8}
+        from model_te import Model, detect_checkpoint_format, convert_checkpoint_model_to_te
+        model_extra_kwargs = {"te_compile": args.te_compile, "use_fp8": args.use_fp8}
     else:
         from model import Model
         model_extra_kwargs = {}
@@ -66,13 +66,21 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     if args.use_fp8:
         assert args.use_te, "--use-fp8 requires --use-te"
         import transformer_engine.pytorch as te
-        from transformer_engine.common.recipe import DelayedScaling, Format
-        fp8_recipe = DelayedScaling(
-            fp8_format=Format.HYBRID,
-            amax_history_len=args.fp8_amax_history,
-            amax_compute_algo="max",
-        )
-        fp8_ctx_fn = lambda: te.autocast(enabled=True, recipe=fp8_recipe)
+        from transformer_engine.common.recipe import DelayedScaling, Float8CurrentScaling, Float8BlockScaling, Format
+        if args.fp8_recipe == "delayed":
+            fp8_recipe = DelayedScaling(
+                fp8_format=Format.HYBRID,
+                amax_history_len=args.fp8_amax_history,
+                amax_compute_algo="max",
+            )
+            fp8_ctx_fn = lambda: te.autocast(enabled=True, recipe=fp8_recipe,
+                amax_reduction_group=torch.distributed.distributed_c10d._get_default_group() if world_size > 1 else None)
+        elif args.fp8_recipe == "current":
+            fp8_recipe = Float8CurrentScaling(fp8_format=Format.HYBRID)
+            fp8_ctx_fn = lambda: te.autocast(enabled=True, recipe=fp8_recipe)
+        elif args.fp8_recipe == "block":
+            fp8_recipe = Float8BlockScaling()
+            fp8_ctx_fn = lambda: te.autocast(enabled=True, recipe=fp8_recipe)
 
     # Logging
     os.makedirs(args.traindir, exist_ok=True)
@@ -167,19 +175,14 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
-            ckpt_fmt = detect_checkpoint_format(model_state)
-            if ckpt_fmt == "model":
-                logging.info(f"Converting model.py checkpoint to TE format ({args.te_mode})")
-                model_state = convert_checkpoint_model_to_te(model_state, te_mode=args.te_mode)
-            elif ckpt_fmt != f"te_{args.te_mode}":
-                logging.info(f"Converting {ckpt_fmt} checkpoint to TE format ({args.te_mode})")
-                model_state = convert_checkpoint_te_to_model(model_state)
-                model_state = convert_checkpoint_model_to_te(model_state, te_mode=args.te_mode)
+            if detect_checkpoint_format(model_state) == "pt":
+                logging.info("Converting model.py checkpoint to TE format")
+                model_state = convert_checkpoint_model_to_te(model_state)
             model.load_state_dict(model_state, strict=False)
         else:
             try:
                 from model_te import detect_checkpoint_format as _detect, convert_checkpoint_te_to_model as _convert
-                if _detect(model_state) != "model":
+                if _detect(model_state) == "te":
                     logging.info("Converting TE checkpoint to model.py format")
                     model_state = _convert(model_state)
             except ImportError:
@@ -204,19 +207,14 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
-            ckpt_fmt = detect_checkpoint_format(model_state)
-            if ckpt_fmt == "model":
-                logging.info(f"Converting model.py initial checkpoint to TE format ({args.te_mode})")
-                model_state = convert_checkpoint_model_to_te(model_state, te_mode=args.te_mode)
-            elif ckpt_fmt != f"te_{args.te_mode}":
-                logging.info(f"Converting {ckpt_fmt} initial checkpoint to TE format ({args.te_mode})")
-                model_state = convert_checkpoint_te_to_model(model_state)
-                model_state = convert_checkpoint_model_to_te(model_state, te_mode=args.te_mode)
+            if detect_checkpoint_format(model_state) == "pt":
+                logging.info("Converting model.py initial checkpoint to TE format")
+                model_state = convert_checkpoint_model_to_te(model_state)
             model.load_state_dict(model_state, strict=False)
         else:
             try:
                 from model_te import detect_checkpoint_format as _detect, convert_checkpoint_te_to_model as _convert
-                if _detect(model_state) != "model":
+                if _detect(model_state) == "te":
                     logging.info("Converting TE initial checkpoint to model.py format")
                     model_state = _convert(model_state)
             except ImportError:
@@ -809,12 +807,12 @@ if __name__ == "__main__":
                         help="Score belief head mode: mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--use-te", action="store_true", help="Use TransformerEngine model (model_te.py) for fused kernels")
-    parser.add_argument("--te-mode", type=str, default="mha", choices=["dpa", "mha", "full"],
-                        help="TransformerEngine integration level: dpa=DotProductAttention, mha=MultiheadAttention, full=TransformerLayer")
     parser.add_argument("--te-compile", type=str, default="safe", choices=["safe", "full"],
                         help="TE + torch.compile strategy: safe=skip TE trunk tracing (recommended), full=compile full model")
     parser.add_argument("--use-fp8", action="store_true", help="Enable FP8 training (requires --use-te and Hopper/Ada GPU)")
-    parser.add_argument("--fp8-amax-history", type=int, default=1024, help="FP8 amax history length for delayed scaling")
+    parser.add_argument("--fp8-recipe", type=str, default="delayed", choices=["delayed", "current", "block"],
+                        help="FP8 recipe: delayed=DelayedScaling, current=Float8CurrentScaling, block=Float8BlockScaling")
+    parser.add_argument("--fp8-amax-history", type=int, default=1024, help="FP8 amax history length (only for delayed scaling)")
     args = parser.parse_args()
 
     # Validation
