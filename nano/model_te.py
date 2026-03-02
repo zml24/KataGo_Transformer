@@ -13,8 +13,7 @@ Usage:
 
 Torch compile note:
     - TE kernels currently call several PyCapsule ops that torch._dynamo cannot trace.
-    - te_compile="safe" isolates the TE trunk from torch.compile to avoid frequent graph-break warnings.
-    - te_compile="full" keeps previous behavior (compile full model, may emit graph-break warnings).
+    - The TE trunk is isolated from torch.compile via @torch._dynamo.disable to avoid graph-break warnings.
 """
 
 import math
@@ -87,14 +86,11 @@ def _replace_nn_linear_with_te(module):
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
-                 te_compile: str = "safe", use_fp8: bool = False):
+                 use_fp8: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
         self.c_trunk = config["hidden_size"]
-        self.te_compile = te_compile
-        if self.te_compile not in ("safe", "full"):
-            raise ValueError(f"Unknown te_compile: {self.te_compile}")
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
 
@@ -191,11 +187,8 @@ class Model(nn.Module):
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
         x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
 
-        # Trunk (optionally isolated from torch.compile for TE compatibility)
-        if self.te_compile == "safe":
-            x = self._run_trunk_no_compile(x)
-        else:
-            x = self._run_trunk_impl(x)
+        # Trunk (isolated from torch.compile for TE compatibility)
+        x = self._run_trunk_no_compile(x)
 
         # Output heads
         out_policy = self.policy_head(x)

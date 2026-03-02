@@ -39,12 +39,8 @@ def main():
                         help="Disable torch.compile")
     parser.add_argument("--use-te", action="store_true",
                         help="Use TransformerEngine model (model_te.py)")
-    parser.add_argument("--te-compile", type=str, default="safe", choices=["safe", "full"],
-                        help="TE + torch.compile strategy: safe=skip TE trunk tracing, full=compile full model")
     parser.add_argument("--use-fp8", action="store_true",
                         help="Enable FP8 inference (requires --use-te and Hopper/Ada GPU)")
-    parser.add_argument("--fp8-recipe", type=str, default="delayed", choices=["delayed", "current", "block"],
-                        help="FP8 recipe: delayed=DelayedScaling, current=Float8CurrentScaling, block=Float8BlockScaling")
     args = parser.parse_args()
 
     assert torch.cuda.is_available(), "CUDA is required for this benchmark"
@@ -56,10 +52,7 @@ def main():
     # Model setup
     if args.use_te:
         from model_te import Model
-        model = Model(
-            configs.config_of_name[args.model_kind], args.pos_len,
-            te_compile=args.te_compile,
-        )
+        model = Model(configs.config_of_name[args.model_kind], args.pos_len)
     else:
         from model import Model
         model = Model(configs.config_of_name[args.model_kind], args.pos_len)
@@ -93,8 +86,6 @@ def main():
     print(f"Board:          {args.pos_len}x{args.pos_len}")
     print(f"torch.compile:  {'OFF' if args.no_compile else 'ON'}")
     print(f"TransformerEngine: {'ON' if args.use_te else 'OFF'}")
-    if args.use_te:
-        print(f"TE compile:     {args.te_compile}")
     print(f"FP8:            {'ON' if args.use_fp8 else 'OFF'}")
     print(f"FLOPs/sample:   {forward_flops/1e9:.2f} GFLOPs")
     print(f"GPU:            {gpu_name}")
@@ -119,17 +110,8 @@ def main():
     import contextlib
     if args.use_fp8:
         import transformer_engine.pytorch as te
-        from transformer_engine.common.recipe import DelayedScaling, Float8CurrentScaling, Float8BlockScaling, Format
-        if args.fp8_recipe == "delayed":
-            fp8_recipe = DelayedScaling(
-                fp8_format=Format.HYBRID,
-                amax_history_len=1024,
-                amax_compute_algo="max",
-            )
-        elif args.fp8_recipe == "current":
-            fp8_recipe = Float8CurrentScaling(fp8_format=Format.HYBRID)
-        elif args.fp8_recipe == "block":
-            fp8_recipe = Float8BlockScaling()
+        from transformer_engine.common.recipe import Float8CurrentScaling, Format
+        fp8_recipe = Float8CurrentScaling(fp8_format=Format.HYBRID)
         fp8_ctx_fn = lambda: te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
     else:
         fp8_ctx_fn = contextlib.nullcontext

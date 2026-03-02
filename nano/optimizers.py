@@ -47,12 +47,11 @@ def polar_express(G):
 class MuonOptimizer:
     """Muon optimizer: momentum + Newton-Schulz orthogonalization."""
 
-    def __init__(self, named_params, lr_multiplier, momentum, wd, scale_mode="moonlight", device="cuda", use_te=False):
+    def __init__(self, named_params, lr_multiplier, momentum, wd, device="cuda", use_te=False):
         self.named_params = named_params
         self.lr_multiplier = lr_multiplier
         self.momentum = momentum
         self.wd = wd
-        self.scale_mode = scale_mode
         self._device = device
         self.use_te = use_te
         self.last_update_rms = 0.0
@@ -90,10 +89,7 @@ class MuonOptimizer:
                     update = update.view(n_split, update.size(0) // n_split, update.size(-1))
 
                 update = polar_express(update)
-                if self.scale_mode == "moonlight":
-                    update = update * max(update.size(-2), update.size(-1)) ** 0.5
-                else:
-                    update = update * max(1, update.size(-2) / update.size(-1)) ** 0.5
+                update = update * max(update.size(-2), update.size(-1)) ** 0.5
                 update = update.view(original_shape)
 
                 rms_sum += update.norm() * self.lr_multiplier / update.numel() ** 0.5

@@ -52,7 +52,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     # Conditional model import
     if args.use_te:
         from model_te import Model, detect_checkpoint_format, convert_checkpoint_model_to_te
-        model_extra_kwargs = {"te_compile": args.te_compile, "use_fp8": args.use_fp8}
+        model_extra_kwargs = {"use_fp8": args.use_fp8}
     else:
         from model import Model
         model_extra_kwargs = {}
@@ -66,17 +66,8 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     if args.use_fp8:
         assert args.use_te, "--use-fp8 requires --use-te"
         import transformer_engine.pytorch as te
-        from transformer_engine.common.recipe import DelayedScaling, Float8CurrentScaling, Float8BlockScaling, Format
-        if args.fp8_recipe == "delayed":
-            fp8_recipe = DelayedScaling(
-                fp8_format=Format.HYBRID,
-                amax_history_len=args.fp8_amax_history,
-                amax_compute_algo="max",
-            )
-        elif args.fp8_recipe == "current":
-            fp8_recipe = Float8CurrentScaling(fp8_format=Format.HYBRID)
-        elif args.fp8_recipe == "block":
-            fp8_recipe = Float8BlockScaling()
+        from transformer_engine.common.recipe import Float8CurrentScaling, Format
+        fp8_recipe = Float8CurrentScaling(fp8_format=Format.HYBRID)
         fp8_ctx_fn = lambda: te.autocast(enabled=True, recipe=fp8_recipe)
 
     # Logging
@@ -299,7 +290,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         inner_optimizer = zero_adam.optimizer
         muon_opt = ZeROMuon(
             muon_params, lr_multiplier=args.muon_lr_multiplier,
-            momentum=args.muon_momentum, wd=args.wd, scale_mode=args.muon_scale,
+            momentum=args.muon_momentum, wd=args.wd,
             device=device, rank=rank, world_size=world_size, use_te=args.use_te,
         ) if muon_params else None
         shampoo_opt = ZeROShampoo(
@@ -317,7 +308,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         inner_optimizer = torch.optim.AdamW(adam_param_groups, lr=args.lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
         muon_opt = MuonOptimizer(
             muon_params, lr_multiplier=args.muon_lr_multiplier,
-            momentum=args.muon_momentum, wd=args.wd, scale_mode=args.muon_scale, device=device, use_te=args.use_te,
+            momentum=args.muon_momentum, wd=args.wd, device=device, use_te=args.use_te,
         ) if muon_params else None
         shampoo_opt = ShampooOptimizer(
             shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
@@ -776,8 +767,6 @@ if __name__ == "__main__":
                         help="Muon scope: all=all 2D non-norm params, blocks=only blocks.* params, off=pure AdamW")
     parser.add_argument("--muon-momentum", type=float, default=0.95, help="Muon momentum beta")
     parser.add_argument("--muon-lr-multiplier", type=float, default=0.2, help="Muon LR multiplier over base lr")
-    parser.add_argument("--muon-scale", type=str, default="moonlight", choices=["moonlight", "mup"],
-                        help="Muon update scale: moonlight=sqrt(max(m,n)), mup=sqrt(max(1,m/n))")
     parser.add_argument("--shampoo-scope", type=str, default="off", choices=["all", "blocks", "off"],
                         help="Shampoo scope: all=all 2D non-norm params, blocks=only blocks.* params, off=disabled")
     parser.add_argument("--shampoo-lr-multiplier", type=float, default=2.0, help="Shampoo LR multiplier over base lr")
@@ -808,12 +797,7 @@ if __name__ == "__main__":
                         help="Score belief head mode: mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--use-te", action="store_true", help="Use TransformerEngine model (model_te.py) for fused kernels")
-    parser.add_argument("--te-compile", type=str, default="safe", choices=["safe", "full"],
-                        help="TE + torch.compile strategy: safe=skip TE trunk tracing (recommended), full=compile full model")
     parser.add_argument("--use-fp8", action="store_true", help="Enable FP8 training (requires --use-te and Hopper/Ada GPU)")
-    parser.add_argument("--fp8-recipe", type=str, default="delayed", choices=["delayed", "current", "block"],
-                        help="FP8 recipe: delayed=DelayedScaling, current=Float8CurrentScaling, block=Float8BlockScaling")
-    parser.add_argument("--fp8-amax-history", type=int, default=1024, help="FP8 amax history length (only for delayed scaling)")
     args = parser.parse_args()
 
     # Validation
