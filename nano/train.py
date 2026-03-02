@@ -458,7 +458,8 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             os.replace(path + ".tmp", path)
             # Keep a numbered copy
             numbered = os.path.join(args.traindir, f"checkpoint-s{total_samples_trained}.ckpt")
-            os.link(path, numbered)
+            if not os.path.exists(numbered):
+                os.link(path, numbered)
             logging.info(f"Saved checkpoint at step {global_step}, {total_samples_trained} samples")
 
     # Metrics accumulation
