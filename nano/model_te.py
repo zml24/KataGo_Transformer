@@ -59,7 +59,6 @@ class TransformerBlockTE(nn.Module):
             bias=False,
             activation="swiglu",
             attn_input_format="bshd",
-            fuse_qkv_params=True,
         )
 
     def forward(self, x, rope):

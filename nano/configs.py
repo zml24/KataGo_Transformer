@@ -70,21 +70,29 @@ def migrate_config(old: ModelConfig) -> ModelConfig:
 # Predefined model configs
 # ---------------------------------------------------------------------------
 
-# ~5M params — tiny, for debugging
-b12c192 = make_config(12, 192, 6, ffn_dim=512)
+# ~5M params — ViT-Ti
+b12c192 = make_config(12, 192, 3, ffn_dim=512)
 
-# ~22M params
-b12c384 = make_config(12, 384, 12, ffn_dim=1024)
+# ~10M params — bsz 4096 fits in 2×H200
+b10c256 = make_config(10, 256, 4, ffn_dim=768)
 
-# ~85M params
+# ~22M params — ViT-S
+b12c384 = make_config(12, 384, 6, ffn_dim=1024)
+
+# ~80M params — bsz 1024 fits in 8×H200
+b22c512 = make_config(22, 512, 8, ffn_dim=1536)
+
+# ~90M params — ViT-B
 b12c768 = make_config(12, 768, 12, ffn_dim=2048)
 
-# ~300M params
+# ~330M params — ViT-L
 b24c1024 = make_config(24, 1024, 16, ffn_dim=3072)
 
 config_of_name = {
     "b12c192": b12c192,
+    "b10c256": b10c256,
     "b12c384": b12c384,
+    "b22c512": b22c512,
     "b12c768": b12c768,
     "b24c1024": b24c1024,
 }
