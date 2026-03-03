@@ -13,6 +13,7 @@ import logging
 import json
 import glob
 import signal
+import threading
 from datetime import timedelta
 import numpy as np
 
@@ -403,8 +404,16 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             logging.info("TensorBoard not available")
 
     # Save checkpoint (all ranks must call when ZeRO is active — gather is collective)
-    def save_checkpoint():
-        # Gather optimizer states (collective operations)
+    _async_save_thread = None
+
+    def save_checkpoint(async_save=True):
+        nonlocal _async_save_thread
+        # Wait for previous async save to complete
+        if _async_save_thread is not None:
+            _async_save_thread.join()
+            _async_save_thread = None
+
+        # Gather optimizer states (collective operations — all ranks must participate)
         if zero_adam is not None:
             adam_state_gathered = zero_adam.gather_state_for_save()
         else:
@@ -420,10 +429,12 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         else:
             shampoo_state_gathered = None
 
-        # Only rank 0 writes the file
+        # Only rank 0 assembles state_dict and writes the file
         if rank == 0:
+            # Deep-copy model weights to CPU (training continues modifying GPU tensors)
+            model_state_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
             state_dict = {
-                "model": model.state_dict(),
+                "model": model_state_cpu,
                 "config": model_config,
                 "global_step": global_step,
                 "total_samples_trained": total_samples_trained,
@@ -437,21 +448,38 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                 },
             }
             if zero_adam is not None:
-                state_dict["optimizer"] = adam_state_gathered  # name-based format
+                state_dict["optimizer"] = adam_state_gathered  # already on CPU from gather
             else:
-                state_dict["optimizer"] = inner_optimizer.state_dict()  # standard format
+                # fused AdamW keeps state on GPU — copy to CPU
+                sd = inner_optimizer.state_dict()
+                state_dict["optimizer"] = {
+                    "state": {k: {sk: sv.cpu() if torch.is_tensor(sv) else sv
+                                  for sk, sv in v.items()} for k, v in sd["state"].items()},
+                    "param_groups": sd["param_groups"],
+                }
             if muon_opt is not None:
                 state_dict["muon_state"] = muon_state_gathered if muon_state_gathered is not None else muon_opt.state_dict()
             if shampoo_opt is not None:
                 state_dict["shampoo_state"] = shampoo_state_gathered if shampoo_state_gathered is not None else shampoo_opt.state_dict()
-            path = os.path.join(args.traindir, "checkpoint.ckpt")
-            torch.save(state_dict, path + ".tmp")
-            os.replace(path + ".tmp", path)
-            # Keep a numbered copy
-            numbered = os.path.join(args.traindir, f"checkpoint-s{total_samples_trained}.ckpt")
-            if not os.path.exists(numbered):
-                os.link(path, numbered)
-            logging.info(f"Saved checkpoint at step {global_step}, {total_samples_trained} samples")
+
+            # Capture values for logging in background thread
+            _step, _samples = global_step, total_samples_trained
+
+            def _do_save():
+                path = os.path.join(args.traindir, "checkpoint.ckpt")
+                torch.save(state_dict, path + ".tmp")
+                os.replace(path + ".tmp", path)
+                # Keep a numbered copy
+                numbered = os.path.join(args.traindir, f"checkpoint-s{_samples}.ckpt")
+                if not os.path.exists(numbered):
+                    os.link(path, numbered)
+                logging.info(f"Saved checkpoint at step {_step}, {_samples} samples")
+
+            if async_save:
+                _async_save_thread = threading.Thread(target=_do_save, daemon=True)
+                _async_save_thread.start()
+            else:
+                _do_save()
 
     # Metrics accumulation
     _metric_keys = [
@@ -680,46 +708,54 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                     last_print_time += time.perf_counter() - t_save_start
                     last_save_samples = total_samples_trained
 
-                # Validation (rank 0 validates, all ranks sync)
+                # Validation (all ranks participate, all_reduce to aggregate metrics)
                 if total_samples_trained - last_val_samples >= args.val_every_samples:
-                    if rank == 0:
-                        t_val_start = time.perf_counter()
-                        val_files = sorted(glob.glob(os.path.join(val_dir, "*.npz")))
-                        if val_files:
-                            model.eval()
-                            val_metrics = {k: 0.0 for k in _metric_keys}
-                            val_metrics["count"] = 0
-                            with torch.no_grad():
-                                val_gen = data_processing.read_npz_training_data(
-                                    val_files[:3],
-                                    batch_size=batch_size,
-                                    world_size=1,
-                                    rank=0,
-                                    pos_len=pos_len,
-                                    device=device,
-                                    symmetry_type=None,
-                                    include_meta=False,
-                                    enable_history_matrices=args.enable_history_matrices,
-                                    model_config=model_config,
-                                    use_pin_memory=use_pin_memory,
+                    t_val_start = time.perf_counter()
+                    val_files = sorted(glob.glob(os.path.join(val_dir, "*.npz")))
+                    if val_files:
+                        model.eval()
+                        val_metrics = {k: 0.0 for k in _metric_keys}
+                        val_metrics["count"] = 0
+                        with torch.no_grad():
+                            val_gen = data_processing.read_npz_training_data(
+                                val_files[:3],
+                                batch_size=batch_size,
+                                world_size=world_size,
+                                rank=rank,
+                                pos_len=pos_len,
+                                device=device,
+                                symmetry_type=None,
+                                include_meta=False,
+                                enable_history_matrices=args.enable_history_matrices,
+                                model_config=model_config,
+                                use_pin_memory=use_pin_memory,
+                            )
+                            for val_batch in data_processing.prefetch_generator(val_gen, args.prefetch_batches):
+                                with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
+                                    outputs = model(val_batch["binaryInputNCHW"], val_batch["globalInputNC"])
+                                _, batch_metrics = compute_loss(
+                                    model, outputs, val_batch, pos_len,
+                                    is_training=False,
+                                    soft_policy_weight_scale=args.soft_policy_weight_scale,
+                                    value_loss_scale=args.value_loss_scale,
+                                    td_value_loss_scales=td_value_loss_scales,
+                                    seki_loss_scale=args.seki_loss_scale,
+                                    variance_time_loss_scale=args.variance_time_loss_scale,
+                                    disable_optimistic_policy=args.disable_optimistic_policy,
                                 )
-                                for val_batch in data_processing.prefetch_generator(val_gen, args.prefetch_batches):
-                                    with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
-                                        outputs = model(val_batch["binaryInputNCHW"], val_batch["globalInputNC"])
-                                    _, batch_metrics = compute_loss(
-                                        model, outputs, val_batch, pos_len,
-                                        is_training=False,
-                                        soft_policy_weight_scale=args.soft_policy_weight_scale,
-                                        value_loss_scale=args.value_loss_scale,
-                                        td_value_loss_scales=td_value_loss_scales,
-                                        seki_loss_scale=args.seki_loss_scale,
-                                        variance_time_loss_scale=args.variance_time_loss_scale,
-                                        disable_optimistic_policy=args.disable_optimistic_policy,
-                                    )
-                                    for k in batch_metrics:
-                                        val_metrics[k] += batch_metrics[k]
-                                    val_metrics["count"] += 1
+                                for k in batch_metrics:
+                                    val_metrics[k] += batch_metrics[k]
+                                val_metrics["count"] += 1
 
+                        # Aggregate metrics across all ranks
+                        if world_size > 1:
+                            agg_keys = _metric_keys + ["count"]
+                            agg_vals = torch.tensor([val_metrics[k] for k in agg_keys], device=device)
+                            torch.distributed.all_reduce(agg_vals, op=torch.distributed.ReduceOp.SUM)
+                            for i, k in enumerate(agg_keys):
+                                val_metrics[k] = agg_vals[i].item()
+
+                        if rank == 0:
                             weight_sum = max(val_metrics["wsum"], 1e-10)
                             batch_count = max(val_metrics["count"], 1)
                             logging.info(
@@ -734,17 +770,15 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                                 tb_writer.add_scalar("val/loss", val_metrics["loss"] / batch_count, total_samples_trained)
                                 for k in _per_sample_keys:
                                     tb_writer.add_scalar(f"val/{k}", val_metrics[k] / weight_sum, total_samples_trained)
-                            model.train()
-                        last_print_time += time.perf_counter() - t_val_start
-                    if world_size > 1:
-                        torch.distributed.barrier()
+                        model.train()
+                    last_print_time += time.perf_counter() - t_val_start
                     last_val_samples = total_samples_trained
 
                 if total_samples_trained >= args.max_training_samples:
                     break
 
-    # Final save (all ranks call for ZeRO gather; only rank 0 writes)
-    save_checkpoint()
+    # Final save (all ranks call for ZeRO gather; only rank 0 writes; sync to ensure completion)
+    save_checkpoint(async_save=False)
     logging.info(f"Training complete: {total_samples_trained} samples, {global_step} steps")
     if tb_writer is not None:
         tb_writer.close()
