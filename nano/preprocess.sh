@@ -27,13 +27,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Save all extra args for train
 ALL_ARGS=("$@")
 
-# Parse --pos-len and --workers for val (defaults if not provided)
+# Parse --pos-len, --workers, and history options for val (defaults if not provided)
 POS_LEN="19"
 WORKERS="4"
+ENABLE_HISTORY=""
+NUM_GLOBAL_FEATURES=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --pos-len) POS_LEN="$2"; shift 2 ;;
         --workers) WORKERS="$2"; shift 2 ;;
+        --enable-history-matrices) ENABLE_HISTORY="--enable-history-matrices"; shift ;;
+        --num-global-features) NUM_GLOBAL_FEATURES="--num-global-features $2"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -59,7 +63,8 @@ if [ -d "$val_dir" ]; then
         --output-dir "${OUTPUT_BASE}/val" \
         --pos-len "$POS_LEN" \
         --workers "$WORKERS" \
-        --symmetry-type none
+        --symmetry-type none \
+        $ENABLE_HISTORY $NUM_GLOBAL_FEATURES
 else
     echo "Skipping val/ (not found: ${val_dir})"
 fi

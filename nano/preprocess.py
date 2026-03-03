@@ -85,6 +85,77 @@ def get_allowed_symmetries(symmetry_type):
 
 
 # ---------------------------------------------------------------------------
+# History matrix helpers (from data.py — operates on CPU torch)
+# ---------------------------------------------------------------------------
+
+NUM_BIN_FEATURES = 22
+
+
+def build_history_matrices():
+    """Build h_base (1, 22, 22) and h_builder (5, 22, 22) on CPU."""
+    h_base = torch.diag(torch.tensor([
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # 0-8
+        0.0, 0.0, 0.0, 0.0, 0.0,  # 9-13: move history
+        1.0,  # 14: ladder
+        0.0, 0.0,  # 15-16: ladder history
+        1.0, 1.0, 1.0, 1.0, 1.0,  # 17-21
+    ]))
+    h_base[14, 15] = 1.0
+    h_base[14, 16] = 1.0
+
+    h0 = torch.zeros(NUM_BIN_FEATURES, NUM_BIN_FEATURES)
+    h0[9, 9] = 1.0
+    h0[14, 15] = -1.0
+    h0[14, 16] = -1.0
+    h0[15, 15] = 1.0
+    h0[15, 16] = 1.0
+
+    h1 = torch.zeros(NUM_BIN_FEATURES, NUM_BIN_FEATURES)
+    h1[10, 10] = 1.0
+    h1[15, 16] = -1.0
+    h1[16, 16] = 1.0
+
+    h2 = torch.zeros(NUM_BIN_FEATURES, NUM_BIN_FEATURES)
+    h2[11, 11] = 1.0
+
+    h3 = torch.zeros(NUM_BIN_FEATURES, NUM_BIN_FEATURES)
+    h3[12, 12] = 1.0
+
+    h4 = torch.zeros(NUM_BIN_FEATURES, NUM_BIN_FEATURES)
+    h4[13, 13] = 1.0
+
+    h_base = h_base.reshape(1, NUM_BIN_FEATURES, NUM_BIN_FEATURES)
+    h_builder = torch.stack((h0, h1, h2, h3, h4), dim=0)
+    return h_base, h_builder
+
+
+def apply_history_matrices_np(binaryInputNCHW, globalInputNC, globalTargetsNC,
+                              num_global_features, h_base, h_builder):
+    """Apply random history truncation. Inputs/outputs are numpy arrays.
+
+    binaryInputNCHW must be float32. globalInputNC must be float32.
+    Returns (binaryInputNCHW, globalInputNC) as float32 numpy arrays.
+    """
+    ref = globalTargetsNC[:, 36:41]  # (N, 5)
+    rng = np.random.default_rng()
+    should_stop = (rng.random(ref.shape, dtype=np.float32) >= 0.98)
+    include_history = (np.cumsum(should_stop, axis=1) <= 0.1).astype(np.float32)  # (N, 5)
+
+    inc_t = torch.from_numpy(include_history)
+    h_matrix = h_base + torch.einsum("bi,ijk->bjk", inc_t, h_builder)  # (N, 22, 22)
+
+    bin_t = torch.from_numpy(binaryInputNCHW)
+    bin_t = torch.einsum("bijk,bil->bljk", bin_t, h_matrix)
+
+    glob_t = torch.from_numpy(globalInputNC)
+    pad_width = num_global_features - include_history.shape[1]
+    mask = torch.nn.functional.pad(inc_t, (0, pad_width), value=1.0)
+    glob_t = glob_t * mask
+
+    return bin_t.numpy(), glob_t.numpy()
+
+
+# ---------------------------------------------------------------------------
 # Core preprocessing
 # ---------------------------------------------------------------------------
 
@@ -142,7 +213,9 @@ def build_output_dict(binaryInputNCHW, globalInputNC, policyTargetsNCMove,
     return d
 
 
-def preprocess_single_file(input_path, output_dir, pos_len, symmetry_type, symmetry_mode):
+def preprocess_single_file(input_path, output_dir, pos_len, symmetry_type, symmetry_mode,
+                           enable_history_matrices=False, num_global_features=19,
+                           h_base=None, h_builder=None):
     """
     Preprocess a single NPZ file.
 
@@ -169,6 +242,14 @@ def preprocess_single_file(input_path, output_dir, pos_len, symmetry_type, symme
     binaryInputNCHW = binaryInputNCHW.reshape(
         binaryInputNCHW.shape[0], binaryInputNCHW.shape[1], pos_len, pos_len
     )  # uint8
+
+    # 2.5. Apply history matrices (random history truncation)
+    if enable_history_matrices:
+        binaryInputNCHW = binaryInputNCHW.astype(np.float32)
+        globalInputNC = globalInputNC.astype(np.float32)
+        binaryInputNCHW, globalInputNC = apply_history_matrices_np(
+            binaryInputNCHW, globalInputNC, globalTargetsNC,
+            num_global_features, h_base, h_builder)
 
     # 3. Validate dimensions
     num_samples = binaryInputNCHW.shape[0]
@@ -260,9 +341,12 @@ def preprocess_single_file(input_path, output_dir, pos_len, symmetry_type, symme
 
 def _worker(args):
     """Wrapper for ProcessPoolExecutor."""
-    input_path, output_dir, pos_len, symmetry_type, symmetry_mode = args
+    (input_path, output_dir, pos_len, symmetry_type, symmetry_mode,
+     enable_history_matrices, num_global_features, h_base, h_builder) = args
     try:
-        files = preprocess_single_file(input_path, output_dir, pos_len, symmetry_type, symmetry_mode)
+        files = preprocess_single_file(
+            input_path, output_dir, pos_len, symmetry_type, symmetry_mode,
+            enable_history_matrices, num_global_features, h_base, h_builder)
         return input_path, files, None
     except Exception as e:
         return input_path, [], e
@@ -280,6 +364,10 @@ def main():
                         choices=["expand", "random"],
                         help="Symmetry mode: expand=generate all variants, random=one random per sample (default: expand)")
     parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers (default: 4)")
+    parser.add_argument("--enable-history-matrices", action="store_true",
+                        help="Apply random history truncation (2%% per-step cutoff)")
+    parser.add_argument("--num-global-features", type=int, default=19,
+                        help="Number of global input features (default: 19)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -297,7 +385,13 @@ def main():
     logging.info(f"Input: {args.input_dir} ({len(input_files)} files)")
     logging.info(f"Output: {args.output_dir}")
     logging.info(f"pos_len={args.pos_len}, symmetry_type={args.symmetry_type}, "
-                 f"symmetry_mode={args.symmetry_mode}, workers={args.workers}")
+                 f"symmetry_mode={args.symmetry_mode}, workers={args.workers}, "
+                 f"history_matrices={args.enable_history_matrices}")
+
+    h_base, h_builder = None, None
+    if args.enable_history_matrices:
+        h_base, h_builder = build_history_matrices()
+        logging.info(f"History matrices enabled (num_global_features={args.num_global_features})")
 
     allowed_symms = get_allowed_symmetries(args.symmetry_type)
     if args.symmetry_mode == "expand":
@@ -310,7 +404,8 @@ def main():
     total_output_files = 0
     errors = 0
 
-    tasks = [(f, args.output_dir, args.pos_len, args.symmetry_type, args.symmetry_mode)
+    tasks = [(f, args.output_dir, args.pos_len, args.symmetry_type, args.symmetry_mode,
+              args.enable_history_matrices, args.num_global_features, h_base, h_builder)
              for f in input_files]
 
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
