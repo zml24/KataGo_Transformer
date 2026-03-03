@@ -332,6 +332,9 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     if gpu_peak_tflops > 0:
         logging.info(f"GPU BF16 peak: {gpu_peak_tflops:.1f} TFLOPS")
 
+    # Head-wise polar_express for QKV projections
+    muon_num_heads = model_config["num_heads"] if args.muon_headwise else 0
+
     # Optimizers: ZeRO Stage 1 when multi-GPU, plain otherwise
     if world_size > 1:
         zero_adam = ZeROAdamW(
@@ -343,6 +346,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             muon_params, lr_multiplier=args.muon_lr_multiplier,
             momentum=args.muon_momentum, wd=args.wd,
             device=device, rank=rank, world_size=world_size, use_te=args.use_te,
+            num_heads=muon_num_heads,
         ) if muon_params else None
         shampoo_opt = ZeROShampoo(
             shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
@@ -360,6 +364,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         muon_opt = MuonOptimizer(
             muon_params, lr_multiplier=args.muon_lr_multiplier,
             momentum=args.muon_momentum, wd=args.wd, device=device, use_te=args.use_te,
+            num_heads=muon_num_heads,
         ) if muon_params else None
         shampoo_opt = ShampooOptimizer(
             shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
@@ -868,6 +873,8 @@ if __name__ == "__main__":
                         help="Muon scope: all=all 2D non-norm params, blocks=only blocks.* params, off=pure AdamW")
     parser.add_argument("--muon-momentum", type=float, default=0.95, help="Muon momentum beta")
     parser.add_argument("--muon-lr-multiplier", type=float, default=0.2, help="Muon LR multiplier over base lr")
+    parser.add_argument("--muon-headwise", action="store_true",
+                        help="Head-wise polar_express for QKV in Muon")
     parser.add_argument("--shampoo-scope", type=str, default="off", choices=["all", "blocks", "off"],
                         help="Shampoo scope: all=all 2D non-norm params, blocks=only blocks.* params, off=disabled")
     parser.add_argument("--shampoo-lr-multiplier", type=float, default=2.0, help="Shampoo LR multiplier over base lr")

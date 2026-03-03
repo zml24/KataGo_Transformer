@@ -47,13 +47,14 @@ def polar_express(G):
 class MuonOptimizer:
     """Muon optimizer: momentum + Newton-Schulz orthogonalization."""
 
-    def __init__(self, named_params, lr_multiplier, momentum, wd, device="cuda", use_te=False):
+    def __init__(self, named_params, lr_multiplier, momentum, wd, device="cuda", use_te=False, num_heads=0):
         self.named_params = named_params
         self.lr_multiplier = lr_multiplier
         self.momentum = momentum
         self.wd = wd
         self._device = device
         self.use_te = use_te
+        self.num_heads = num_heads
         self.last_update_rms = 0.0
         self.states = {name: self._init_state(p) for name, p in named_params.items()}
 
@@ -88,8 +89,25 @@ class MuonOptimizer:
                 if n_split > 0:
                     update = update.view(n_split, update.size(0) // n_split, update.size(-1))
 
+                # Head-wise split for attention projections (both TE and non-TE)
+                headwise_permuted = False
+                if self.num_heads > 0 and n_split == 0 and update.ndim == 2:
+                    if any(tag in name for tag in ("q_proj", "k_proj", "v_proj",
+                                                    "query_weight", "key_weight", "value_weight")):
+                        # QKV: dim0 = num_heads * head_dim, dim1 = hidden_size
+                        # (num_heads*head_dim, c_main) -> (num_heads, head_dim, c_main)
+                        update = update.view(self.num_heads, update.size(0) // self.num_heads, update.size(-1))
+                    elif "out_proj" in name or "self_attention.proj" in name:
+                        # out_proj: dim0 = c_main, dim1 = num_heads * head_dim
+                        # (c_main, num_heads*head_dim) -> (c_main, num_heads, head_dim) -> (num_heads, c_main, head_dim)
+                        update = update.view(update.size(0), self.num_heads, update.size(1) // self.num_heads)
+                        update = update.permute(1, 0, 2).contiguous()
+                        headwise_permuted = True
+
                 update = polar_express(update)
                 update = update * max(update.size(-2), update.size(-1)) ** 0.5
+                if headwise_permuted:
+                    update = update.permute(1, 0, 2).contiguous()
                 update = update.view(original_shape)
 
                 rms_sum += update.norm() * self.lr_multiplier / update.numel() ** 0.5
