@@ -33,6 +33,51 @@ from losses import compute_loss, postprocess_and_loss_core, _METRIC_KEYS, estima
 
 
 # ---------------------------------------------------------------------------
+# Step profiler (CUDA sync + perf_counter per stage)
+# ---------------------------------------------------------------------------
+class StepProfiler:
+    """Accumulates per-stage CUDA-synced timing across multiple steps."""
+
+    def __init__(self, device):
+        self._device = device
+        self._accum = {}   # name -> total_seconds
+        self._count = 0
+        self._t = None
+
+    def tick(self, name=None):
+        torch.cuda.synchronize(self._device)
+        now = time.perf_counter()
+        if name is not None and self._t is not None:
+            self._accum[name] = self._accum.get(name, 0.0) + (now - self._t)
+        self._t = now
+
+    def step_done(self):
+        self._count += 1
+
+    def report_and_reset(self):
+        if self._count == 0:
+            return None
+        total = sum(self._accum.values())
+        c = self._count
+        parts = []
+        for name, secs in self._accum.items():
+            pct = secs / total * 100.0 if total > 0 else 0.0
+            parts.append(f"{name}={secs/c*1000:.1f}ms({pct:.0f}%)")
+        line = f"PROFILE step_ms={total/c*1000:.1f} | " + " ".join(parts)
+        self._accum.clear()
+        self._count = 0
+        self._t = None
+        return line
+
+
+class _NullProfiler:
+    """Zero-overhead drop-in when profiling is disabled."""
+    def tick(self, name=None): pass
+    def step_done(self): pass
+    def report_and_reset(self): return None
+
+
+# ---------------------------------------------------------------------------
 # DDP helpers
 # ---------------------------------------------------------------------------
 def multiprocessing_setup(rank: int, world_size: int, master_port: int):
@@ -118,6 +163,11 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     logging.info(f"Device: {device}")
     if device.type == "cuda":
         logging.info(f"GPU: {torch.cuda.get_device_name()}")
+
+    # Step profiler
+    profiler = StepProfiler(device) if args.profile else _NullProfiler()
+    if args.profile:
+        logging.info("PROFILE mode enabled - cuda.synchronize() between every stage (adds overhead)")
 
     # AMP setup
     if device.type == "cuda":
@@ -536,6 +586,9 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             tb_writer.add_scalar("perf/tokens_per_sec", tokens_per_sec, total_samples_trained)
             tb_writer.add_scalar("perf/achieved_tflops_per_gpu", achieved_tflops_per_gpu, total_samples_trained)
             tb_writer.add_scalar("perf/mfu", mfu, total_samples_trained)
+        profile_line = profiler.report_and_reset()
+        if profile_line is not None:
+            logging.info(f"  {profile_line}")
 
     # Start training
     effective_batch = batch_size * world_size * grad_accum_steps
@@ -589,7 +642,10 @@ def main(rank, world_size, args, multi_gpu_device_ids):
             use_pin_memory=use_pin_memory,
             seed=args.seed + rank if args.seed is not None else None,
         )
+        profiler.tick()
         for batch in data_processing.prefetch_generator(train_gen, args.prefetch_batches):
+            profiler.tick("data")
+
             # Clear gradients at the start of each accumulation cycle
             if accum_step == 0:
                 for p in model.parameters():
@@ -603,6 +659,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                 with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
                     with fp8_ctx_fn():
                         outputs = ddp_model(batch["binaryInputNCHW"], batch["globalInputNC"])
+                profiler.tick("fwd")
 
                 # Compiled postprocess + loss (seki moving average computed inside as tensor ops)
                 moving_sum_t = torch.tensor(model.moving_unowned_proportion_sum, device=device)
@@ -619,9 +676,11 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                     variance_time_loss_scale=args.variance_time_loss_scale,
                     disable_optimistic_policy=args.disable_optimistic_policy,
                 )
+                profiler.tick("loss")
 
                 # Scale loss for gradient averaging across accumulation steps
                 (loss / grad_accum_steps).backward()
+            profiler.tick("bwd")
 
             # Accumulate micro-step metrics and seki moving average
             metrics = dict(zip(_METRIC_KEYS, metrics_stack.tolist()))
@@ -650,6 +709,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
 
                 # Gradient clipping + optimizer step
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                profiler.tick("clip")
                 if zero_adam is not None:
                     # Defer ZeRO param sync and do one coalesced sync after all optimizers step.
                     zero_adam.step(sync=False)
@@ -669,9 +729,12 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                         shampoo_opt.step(base_lr, sync=False)
                     else:
                         shampoo_opt.step(base_lr)
+                profiler.tick("optim")
                 if zero_adam is not None:
                     # Sync Adam + Muon/Shampoo owned parameters in a single collective pass.
                     sync_zero_params([zero_adam, muon_opt, shampoo_opt], rank=rank, world_size=world_size)
+                    profiler.tick("sync")
+                profiler.step_done()
                 global_step += 1
                 total_samples_trained += batch_size * world_size * grad_accum_steps
 
@@ -774,8 +837,12 @@ def main(rank, world_size, args, multi_gpu_device_ids):
                     last_print_time += time.perf_counter() - t_val_start
                     last_val_samples = total_samples_trained
 
+                profiler.tick()  # reset timer — exclude print/save/val overhead from next step
+
                 if total_samples_trained >= args.max_training_samples:
                     break
+            else:
+                profiler.tick()  # reset timer for intermediate micro-step
 
     # Final save (all ranks call for ZeRO gather; only rank 0 writes; sync to ensure completion)
     save_checkpoint(async_save=False)
@@ -832,6 +899,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--use-te", action="store_true", help="Use TransformerEngine model (model_te.py) for fused kernels")
     parser.add_argument("--use-fp8", action="store_true", help="Enable FP8 training (requires --use-te and Hopper/Ada GPU)")
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable per-stage CUDA-synced profiling (adds sync overhead)")
     args = parser.parse_args()
 
     # Validation

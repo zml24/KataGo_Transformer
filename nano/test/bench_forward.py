@@ -52,7 +52,7 @@ def main():
     # Model setup
     if args.use_te:
         from model_te import Model
-        model = Model(configs.config_of_name[args.model_kind], args.pos_len)
+        model = Model(configs.config_of_name[args.model_kind], args.pos_len, use_fp8=args.use_fp8)
     else:
         from model import Model
         model = Model(configs.config_of_name[args.model_kind], args.pos_len)
