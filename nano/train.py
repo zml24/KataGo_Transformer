@@ -866,6 +866,10 @@ def main(rank, world_size, args, gpu_id):
         tb_writer.close()
 
 
+def _mp_main(spawn_rank, world_size, args, device_ids):
+    main(spawn_rank, world_size, args, gpu_id=device_ids[spawn_rank])
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Minimal Transformer training for KataGo (nano)")
     parser.add_argument("--traindir", required=True, help="Training output directory")
@@ -956,9 +960,6 @@ if __name__ == "__main__":
         num_gpus_used = len(multi_gpu_device_ids)
 
         if num_gpus_used > 1:
-            def _mp_main(spawn_rank, world_size, args, device_ids):
-                main(spawn_rank, world_size, args, gpu_id=device_ids[spawn_rank])
-
             torch.multiprocessing.set_start_method("spawn")
             try:
                 torch.multiprocessing.spawn(
