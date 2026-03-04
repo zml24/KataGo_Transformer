@@ -326,7 +326,8 @@ class ZeROMuon:
 class ZeROShampoo:
     """ZeRO Stage 1 wrapper for ShampooOptimizer."""
 
-    def __init__(self, named_params, lr_multiplier, momentum, wd, beta2, device, rank, world_size):
+    def __init__(self, named_params, lr_multiplier, momentum, wd, beta2, device, rank, world_size,
+                 use_te=False, num_heads=0):
         self.rank = rank
         self.world_size = world_size
         self._all_params = named_params
@@ -336,7 +337,7 @@ class ZeROShampoo:
         self._local_numel = sum(p.numel() for p in my_params.values())
         self._local_opt = ShampooOptimizer(
             my_params, lr_multiplier=lr_multiplier, momentum=momentum,
-            wd=wd, beta2=beta2, device=device,
+            wd=wd, beta2=beta2, device=device, use_te=use_te, num_heads=num_heads,
         ) if my_params else None
 
         self.last_precond_rms = 0.0

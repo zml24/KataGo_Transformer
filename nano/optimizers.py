@@ -81,11 +81,12 @@ class MuonOptimizer:
                     update = update.view(update.size(0), -1)
 
                 # TE fused param split: fc1_weight [2*ffn, h] -> [2, ffn, h], fused QKV [3*h, h] -> [3, h, h]
+                # When headwise is also enabled, TE QKV splits further: [3*h, h] -> [3*num_heads, head_dim, h]
                 n_split = 0
                 if self.use_te and "fc1_weight" in name:
                     n_split = 2
                 elif self.use_te and "qkv" in name and update.size(0) == 3 * update.size(1):
-                    n_split = 3
+                    n_split = 3 * self.num_heads if self.num_heads > 0 else 3
                 if n_split > 0:
                     update = update.view(n_split, update.size(0) // n_split, update.size(-1))
 
@@ -130,8 +131,9 @@ class MuonOptimizer:
 
 @torch.compile
 def inv_quarter_sandwich(L, M, R):
-    """Newton-Schulz iteration for L^{-1/4} @ M @ R^{-1/4}, 4 steps, fp32."""
-    assert L.ndim == 2 and M.ndim == 2 and R.ndim == 2
+    """Newton-Schulz iteration for L^{-1/4} @ M @ R^{-1/4}, 4 steps, fp32.
+    Supports batched 3D input: L (B,m,m), M (B,m,n), R (B,n,n)."""
+    assert L.ndim in (2, 3) and M.ndim == L.ndim and R.ndim == L.ndim
     eps = 1e-4
     M = M.float()
 
@@ -140,8 +142,8 @@ def inv_quarter_sandwich(L, M, R):
     I_L = torch.eye(m, device=L.device)
     I_R = torch.eye(n, device=L.device)
 
-    tL = torch.sqrt((L * L.mT).sum())
-    tR = torch.sqrt((R * R.mT).sum())
+    tL = torch.sqrt((L * L.mT).sum(dim=(-2, -1), keepdim=True))
+    tR = torch.sqrt((R * R.mT).sum(dim=(-2, -1), keepdim=True))
     L = L / tL + eps * I_L
     R = R / tR + eps * I_R
 
@@ -166,7 +168,8 @@ def inv_quarter_sandwich(L, M, R):
 class ShampooOptimizer:
     """Shampoo optimizer: L/R preconditioner EMA + matrix inverse root."""
 
-    def __init__(self, named_params, lr_multiplier, momentum, wd, beta2=0.999, device="cuda"):
+    def __init__(self, named_params, lr_multiplier, momentum, wd, beta2=0.999, device="cuda",
+                 use_te=False, num_heads=0):
         self.named_params = named_params
         self.lr_multiplier = lr_multiplier
         self.momentum = momentum
@@ -174,20 +177,51 @@ class ShampooOptimizer:
         self.beta2 = beta2
         self.step_count = 0
         self._device = device
+        self.use_te = use_te
+        self.num_heads = num_heads
         self.last_precond_rms = 0.0
-        self.states = {name: self._init_state(p, device) for name, p in named_params.items()}
+        # Pre-compute split info and init state per param
+        self._split_info = {}
+        self.states = {}
+        for name, p in named_params.items():
+            if p.ndim >= 2:
+                m, n = p.shape[0], p.shape[1:].numel()
+            else:
+                m, n = p.shape[0], 1
+            self._split_info[name] = self._compute_split_info(name, m, n)
+            n_chunks, chunk_m, chunk_n, _ = self._split_info[name]
+            if n_chunks > 1:
+                state = {
+                    "momentum": torch.zeros_like(p),
+                    "L": torch.zeros(n_chunks, chunk_m, chunk_m, dtype=torch.float32, device=device),
+                    "R": torch.zeros(n_chunks, chunk_n, chunk_n, dtype=torch.float32, device=device),
+                }
+            else:
+                state = {
+                    "momentum": torch.zeros_like(p),
+                    "L": torch.zeros(m, m, dtype=torch.float32, device=device),
+                    "R": torch.zeros(n, n, dtype=torch.float32, device=device),
+                }
+            self.states[name] = state
 
-    @staticmethod
-    def _init_state(p, device):
-        if p.ndim >= 2:
-            m, n = p.shape[0], p.shape[1:].numel()
-        else:
-            m, n = p.shape[0], 1
-        return {
-            "momentum": torch.zeros_like(p),
-            "L": torch.zeros(m, m, dtype=torch.float32, device=device),
-            "R": torch.zeros(n, n, dtype=torch.float32, device=device),
-        }
+    def _compute_split_info(self, name, m, n):
+        """Returns (n_chunks, chunk_m, chunk_n, headwise_permuted)."""
+        # TE fused param split (fc1_weight, fused QKV)
+        if self.use_te and "fc1_weight" in name:
+            return (2, m // 2, n, False)
+        if self.use_te and "qkv" in name and m == 3 * n:
+            if self.num_heads > 0:
+                nc = 3 * self.num_heads
+                return (nc, m // nc, n, False)
+            return (3, m // 3, n, False)
+        # Head-wise split for non-TE attention projections
+        if self.num_heads > 0:
+            if any(tag in name for tag in ("q_proj", "k_proj", "v_proj",
+                                            "query_weight", "key_weight", "value_weight")):
+                return (self.num_heads, m // self.num_heads, n, False)
+            if "out_proj" in name or "self_attention.proj" in name:
+                return (self.num_heads, m, n // self.num_heads, True)
+        return (1, m, n, False)
 
     def step(self, base_lr):
         self.step_count += 1
@@ -215,16 +249,31 @@ class ShampooOptimizer:
                     momentum_2d = momentum_2d.view(momentum_2d.size(0), -1)
                 momentum_2d_hat = momentum_2d / bias_corr1
 
+                # Apply TE / head-wise split
+                n_chunks, chunk_m, chunk_n, headwise_permuted = self._split_info[name]
+                if headwise_permuted:
+                    # out_proj: (c_main, num_heads*head_dim) -> (num_heads, c_main, head_dim)
+                    grad_2d = grad_2d.view(grad_2d.size(0), n_chunks, chunk_n).permute(1, 0, 2).contiguous()
+                    momentum_2d_hat = momentum_2d_hat.view(momentum_2d_hat.size(0), n_chunks, chunk_n).permute(1, 0, 2).contiguous()
+                elif n_chunks > 1:
+                    # TE split or headwise QKV: view as (n_chunks, chunk_m, chunk_n)
+                    grad_2d = grad_2d.view(n_chunks, chunk_m, chunk_n)
+                    momentum_2d_hat = momentum_2d_hat.view(n_chunks, chunk_m, chunk_n)
+
                 state["L"].lerp_(grad_2d @ grad_2d.mT, 1 - self.beta2)
                 state["R"].lerp_(grad_2d.mT @ grad_2d, 1 - self.beta2)
 
                 precond = inv_quarter_sandwich(
                     state["L"] / bias_corr2, momentum_2d_hat, state["R"] / bias_corr2,
                 )
-                precond = precond * (precond.size(0) * precond.size(1)) ** 0.25
+                precond = precond * (precond.size(-2) * precond.size(-1)) ** 0.25
 
                 rms_sum += precond.norm() * self.lr_multiplier / precond.numel() ** 0.5
                 rms_cnt += 1
+
+                # Restore shape
+                if headwise_permuted:
+                    precond = precond.permute(1, 0, 2).contiguous()
                 precond = precond.view(original_shape)
 
                 p.mul_(1 - base_lr * self.wd)

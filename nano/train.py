@@ -332,8 +332,9 @@ def main(rank, world_size, args, multi_gpu_device_ids):
     if gpu_peak_tflops > 0:
         logging.info(f"GPU BF16 peak: {gpu_peak_tflops:.1f} TFLOPS")
 
-    # Head-wise polar_express for QKV projections
+    # Head-wise polar_express / preconditioner for QKV projections
     muon_num_heads = model_config["num_heads"] if args.muon_headwise else 0
+    shampoo_num_heads = model_config["num_heads"] if args.shampoo_headwise else 0
 
     # Optimizers: ZeRO Stage 1 when multi-GPU, plain otherwise
     if world_size > 1:
@@ -351,7 +352,8 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         shampoo_opt = ZeROShampoo(
             shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
             momentum=args.shampoo_momentum, wd=args.wd, beta2=args.shampoo_beta2,
-            device=device, rank=rank, world_size=world_size,
+            device=device, rank=rank, world_size=world_size, use_te=args.use_te,
+            num_heads=shampoo_num_heads,
         ) if shampoo_params else None
     else:
         zero_adam = None
@@ -369,6 +371,7 @@ def main(rank, world_size, args, multi_gpu_device_ids):
         shampoo_opt = ShampooOptimizer(
             shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
             momentum=args.shampoo_momentum, wd=args.wd, beta2=args.shampoo_beta2, device=device,
+            use_te=args.use_te, num_heads=shampoo_num_heads,
         ) if shampoo_params else None
 
     # Restore optimizer state
@@ -880,6 +883,8 @@ if __name__ == "__main__":
     parser.add_argument("--shampoo-lr-multiplier", type=float, default=2.0, help="Shampoo LR multiplier over base lr")
     parser.add_argument("--shampoo-momentum", type=float, default=0.9, help="Shampoo momentum beta")
     parser.add_argument("--shampoo-beta2", type=float, default=0.95, help="Shampoo L/R EMA coefficient")
+    parser.add_argument("--shampoo-headwise", action="store_true",
+                        help="Head-wise preconditioner for QKV in Shampoo")
     parser.add_argument("--init-std", type=float, default=0.02, help="Init std for weights (Megatron-LM style)")
     parser.add_argument("--max-training-samples", type=int, default=100000000, help="Total training samples")
     parser.add_argument("--save-every-samples", type=int, default=1000000, help="Save checkpoint every N samples")
