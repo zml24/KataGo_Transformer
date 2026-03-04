@@ -80,10 +80,13 @@ class _NullProfiler:
 # ---------------------------------------------------------------------------
 # DDP helpers
 # ---------------------------------------------------------------------------
-def multiprocessing_setup(rank: int, world_size: int, master_port: int):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = f'{master_port}'
-    logging.info(f"Running torch.distributed.init_process_group, rank={rank}, world_size={world_size}")
+def multiprocessing_setup(rank: int, world_size: int, master_port: int = 23456):
+    if 'MASTER_ADDR' not in os.environ:
+        os.environ['MASTER_ADDR'] = 'localhost'
+    if 'MASTER_PORT' not in os.environ:
+        os.environ['MASTER_PORT'] = str(master_port)
+    logging.info(f"Running torch.distributed.init_process_group, rank={rank}, world_size={world_size}, "
+                 f"master={os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}")
     torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size, timeout=timedelta(seconds=600))
     logging.info(f"Returned from init_process_group, rank={rank}")
 
@@ -94,7 +97,7 @@ def multiprocessing_cleanup():
 # ---------------------------------------------------------------------------
 # Training main loop
 # ---------------------------------------------------------------------------
-def main(rank, world_size, args, multi_gpu_device_ids):
+def main(rank, world_size, args, gpu_id):
     # Conditional model import
     if args.use_te:
         from model_te import Model, detect_checkpoint_format, convert_checkpoint_model_to_te
@@ -153,9 +156,8 @@ def main(rank, world_size, args, multi_gpu_device_ids):
 
     # Device selection
     if torch.cuda.is_available():
-        my_gpu_id = multi_gpu_device_ids[rank]
-        torch.cuda.set_device(my_gpu_id)
-        device = torch.device("cuda", my_gpu_id)
+        torch.cuda.set_device(gpu_id)
+        device = torch.device("cuda", gpu_id)
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
@@ -925,27 +927,42 @@ if __name__ == "__main__":
     if args.symmetry_type == "all" and args.batch_size % 8 != 0:
         parser.error("--batch-size must be divisible by 8 when --symmetry-type is 'all'")
 
-    # Parse multi-gpus
-    multi_gpu_device_ids = []
-    if args.multi_gpus is not None:
-        for piece in args.multi_gpus.split(","):
-            piece = piece.strip()
-            multi_gpu_device_ids.append(int(piece))
-    else:
-        multi_gpu_device_ids = [0]
+    # Detect torchrun launch (torchrun sets RANK, LOCAL_RANK, WORLD_SIZE env vars)
+    torchrun_rank = os.environ.get("RANK")
+    torchrun_local_rank = os.environ.get("LOCAL_RANK")
+    torchrun_world_size = os.environ.get("WORLD_SIZE")
 
-    num_gpus_used = len(multi_gpu_device_ids)
-
-    if num_gpus_used > 1:
-        torch.multiprocessing.set_start_method("spawn")
-        try:
-            torch.multiprocessing.spawn(
-                main,
-                nprocs=num_gpus_used,
-                args=(num_gpus_used, args, multi_gpu_device_ids),
-            )
-        except KeyboardInterrupt:
-            print("\nInterrupted. Killing all worker processes...", file=sys.stderr, flush=True)
-            os.killpg(os.getpgid(os.getpid()), signal.SIGKILL)
+    if torchrun_rank is not None and torchrun_local_rank is not None and torchrun_world_size is not None:
+        # Launched via torchrun (supports multi-node multi-GPU)
+        rank = int(torchrun_rank)
+        local_rank = int(torchrun_local_rank)
+        world_size = int(torchrun_world_size)
+        main(rank, world_size, args, gpu_id=local_rank)
     else:
-        main(0, 1, args, multi_gpu_device_ids)
+        # Legacy single-node launch via --multi-gpus or single GPU
+        multi_gpu_device_ids = []
+        if args.multi_gpus is not None:
+            for piece in args.multi_gpus.split(","):
+                piece = piece.strip()
+                multi_gpu_device_ids.append(int(piece))
+        else:
+            multi_gpu_device_ids = [0]
+
+        num_gpus_used = len(multi_gpu_device_ids)
+
+        if num_gpus_used > 1:
+            def _mp_main(spawn_rank, world_size, args, device_ids):
+                main(spawn_rank, world_size, args, gpu_id=device_ids[spawn_rank])
+
+            torch.multiprocessing.set_start_method("spawn")
+            try:
+                torch.multiprocessing.spawn(
+                    _mp_main,
+                    nprocs=num_gpus_used,
+                    args=(num_gpus_used, args, multi_gpu_device_ids),
+                )
+            except KeyboardInterrupt:
+                print("\nInterrupted. Killing all worker processes...", file=sys.stderr, flush=True)
+                os.killpg(os.getpgid(os.getpid()), signal.SIGKILL)
+        else:
+            main(0, 1, args, gpu_id=multi_gpu_device_ids[0])
