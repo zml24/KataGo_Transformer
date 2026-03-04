@@ -446,6 +446,11 @@ def main(rank, world_size, args, gpu_id):
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
 
+    if global_step > 0:
+        # Bypass: force initial_lr = args.lr so scheduler recomputes LR from scratch
+        for pg in inner_optimizer.param_groups:
+            pg["lr"] = args.lr
+            pg["initial_lr"] = args.lr
     scheduler = torch.optim.lr_scheduler.LambdaLR(inner_optimizer, lr_lambda, last_epoch=global_step - 1 if global_step > 0 else -1)
 
     # Data directories
