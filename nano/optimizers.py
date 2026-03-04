@@ -165,6 +165,29 @@ def inv_quarter_sandwich(L, M, R):
     return M
 
 
+def compute_split_info(name, m, n, use_te=False, num_heads=0):
+    """Compute how a parameter will be split for Muon/Shampoo processing.
+
+    Returns: (n_chunks, chunk_m, chunk_n, headwise_permuted)
+    """
+    # TE fused param split (fc1_weight, fused QKV)
+    if use_te and "fc1_weight" in name:
+        return (2, m // 2, n, False)
+    if use_te and "qkv" in name and m == 3 * n:
+        if num_heads > 0:
+            nc = 3 * num_heads
+            return (nc, m // nc, n, False)
+        return (3, m // 3, n, False)
+    # Head-wise split for non-TE attention projections
+    if num_heads > 0:
+        if any(tag in name for tag in ("q_proj", "k_proj", "v_proj",
+                                        "query_weight", "key_weight", "value_weight")):
+            return (num_heads, m // num_heads, n, False)
+        if "out_proj" in name or "self_attention.proj" in name:
+            return (num_heads, m, n // num_heads, True)
+    return (1, m, n, False)
+
+
 class ShampooOptimizer:
     """Shampoo optimizer: L/R preconditioner EMA + matrix inverse root."""
 
@@ -205,23 +228,7 @@ class ShampooOptimizer:
             self.states[name] = state
 
     def _compute_split_info(self, name, m, n):
-        """Returns (n_chunks, chunk_m, chunk_n, headwise_permuted)."""
-        # TE fused param split (fc1_weight, fused QKV)
-        if self.use_te and "fc1_weight" in name:
-            return (2, m // 2, n, False)
-        if self.use_te and "qkv" in name and m == 3 * n:
-            if self.num_heads > 0:
-                nc = 3 * self.num_heads
-                return (nc, m // nc, n, False)
-            return (3, m // 3, n, False)
-        # Head-wise split for non-TE attention projections
-        if self.num_heads > 0:
-            if any(tag in name for tag in ("q_proj", "k_proj", "v_proj",
-                                            "query_weight", "key_weight", "value_weight")):
-                return (self.num_heads, m // self.num_heads, n, False)
-            if "out_proj" in name or "self_attention.proj" in name:
-                return (self.num_heads, m, n // self.num_heads, True)
-        return (1, m, n, False)
+        return compute_split_info(name, m, n, self.use_te, self.num_heads)
 
     def step(self, base_lr):
         self.step_count += 1

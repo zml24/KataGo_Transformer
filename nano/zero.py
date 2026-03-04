@@ -4,32 +4,41 @@ import logging
 
 import torch
 import torch.distributed as dist
-from optimizers import MuonOptimizer, ShampooOptimizer
+from optimizers import MuonOptimizer, ShampooOptimizer, compute_split_info
 
 
 # ---------------------------------------------------------------------------
 # Cost estimation for load-balanced partitioning
 # ---------------------------------------------------------------------------
-def _muon_cost(p):
-    """Estimate compute cost of Muon's polar_express (5 NS iterations)."""
-    if p.ndim == 4:
-        m, n = p.shape[0], p.shape[1] * p.shape[2] * p.shape[3]
-    else:
-        m, n = p.shape
-    lo, hi = min(m, n), max(m, n)
-    # 5 NS iters, each ~3 matmuls of shape (lo, lo) @ (lo, hi)
-    return 5 * lo * lo * (2 * hi + lo)
+def _make_muon_cost(use_te=False, num_heads=0):
+    """Create a Muon cost function aware of TE/headwise splits."""
+    def cost_fn(name, p):
+        if p.ndim == 4:
+            m, n = p.shape[0], p.shape[1] * p.shape[2] * p.shape[3]
+        else:
+            m, n = p.shape
+        n_chunks, chunk_m, chunk_n, _ = compute_split_info(name, m, n, use_te, num_heads)
+        lo, hi = min(chunk_m, chunk_n), max(chunk_m, chunk_n)
+        # 5 NS iters, each ~3 matmuls of shape (lo, lo) @ (lo, hi)
+        return n_chunks * 5 * lo * lo * (2 * hi + lo)
+    return cost_fn
 
 
-def _shampoo_cost(p):
-    """Estimate compute cost of Shampoo's inv_quarter_sandwich (4 NS iters + L/R EMA)."""
-    if p.ndim >= 2:
-        m, n = p.shape[0], p.shape[1:].numel()
-    else:
-        m, n = p.shape[0], 1
-    # 4 NS iters: each does ~8 matmuls for L (m^3) and R (n^3) plus sandwich (m^2*n + m*n^2)
-    # Plus L/R EMA: grad @ grad.T (m^2*n) + grad.T @ grad (m*n^2)
-    return 4 * (8 * m**3 + 8 * n**3 + m*m*n + m*n*n) + (m*m*n + m*n*n)
+def _make_shampoo_cost(use_te=False, num_heads=0):
+    """Create a Shampoo cost function aware of TE/headwise splits."""
+    def cost_fn(name, p):
+        if p.ndim >= 2:
+            m, n = p.shape[0], p.shape[1:].numel()
+        else:
+            m, n = p.shape[0], 1
+        n_chunks, chunk_m, chunk_n, _ = compute_split_info(name, m, n, use_te, num_heads)
+        # 4 NS iters: each does ~8 matmuls for L (m^3) and R (n^3) plus sandwich (m^2*n + m*n^2)
+        # Plus L/R EMA: grad @ grad.T (m^2*n) + grad.T @ grad (m*n^2)
+        cm, cn = chunk_m, chunk_n
+        return n_chunks * (
+            4 * (8 * cm**3 + 8 * cn**3 + cm*cm*cn + cm*cn*cn) + (cm*cm*cn + cm*cn*cn)
+        )
+    return cost_fn
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +50,7 @@ def _lpt_partition(named_params, cost_fn, world_size):
     Returns: list of dicts, one per rank. Each dict is {name: param}.
     All ranks compute the same result deterministically.
     """
-    items = [(cost_fn(p), name, p) for name, p in named_params.items()]
+    items = [(cost_fn(name, p), name, p) for name, p in named_params.items()]
     # Sort by cost descending, break ties by name for determinism
     items.sort(key=lambda x: (-x[0], x[1]))
 
@@ -59,7 +68,7 @@ def _lpt_partition(named_params, cost_fn, world_size):
 
 def _numel_partition(named_params, world_size):
     """Partition named_params by numel using LPT."""
-    return _lpt_partition(named_params, lambda p: p.numel(), world_size)
+    return _lpt_partition(named_params, lambda name, p: p.numel(), world_size)
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +266,8 @@ class ZeROMuon:
         self.rank = rank
         self.world_size = world_size
         self._all_params = named_params
-        self.partitions = _lpt_partition(named_params, _muon_cost, world_size)
+        muon_cost = _make_muon_cost(use_te, num_heads)
+        self.partitions = _lpt_partition(named_params, muon_cost, world_size)
 
         my_params = self.partitions[rank]
         self._local_numel = sum(p.numel() for p in my_params.values())
@@ -269,8 +279,8 @@ class ZeROMuon:
         self.last_update_rms = 0.0
 
         total_numel = sum(p.numel() for p in named_params.values())
-        my_cost = sum(_muon_cost(p) for p in my_params.values())
-        total_cost = sum(_muon_cost(p) for p in named_params.values())
+        my_cost = sum(muon_cost(name, p) for name, p in my_params.items())
+        total_cost = sum(muon_cost(name, p) for name, p in named_params.items())
         logging.info(
             f"ZeROMuon rank {rank}: {len(my_params)}/{len(named_params)} params, "
             f"{self._local_numel:,}/{total_numel:,} elements, "
@@ -331,7 +341,8 @@ class ZeROShampoo:
         self.rank = rank
         self.world_size = world_size
         self._all_params = named_params
-        self.partitions = _lpt_partition(named_params, _shampoo_cost, world_size)
+        shampoo_cost = _make_shampoo_cost(use_te, num_heads)
+        self.partitions = _lpt_partition(named_params, shampoo_cost, world_size)
 
         my_params = self.partitions[rank]
         self._local_numel = sum(p.numel() for p in my_params.values())
@@ -343,8 +354,8 @@ class ZeROShampoo:
         self.last_precond_rms = 0.0
 
         total_numel = sum(p.numel() for p in named_params.values())
-        my_cost = sum(_shampoo_cost(p) for p in my_params.values())
-        total_cost = sum(_shampoo_cost(p) for p in named_params.values())
+        my_cost = sum(shampoo_cost(name, p) for name, p in my_params.items())
+        total_cost = sum(shampoo_cost(name, p) for name, p in named_params.items())
         logging.info(
             f"ZeROShampoo rank {rank}: {len(my_params)}/{len(named_params)} params, "
             f"{self._local_numel:,}/{total_numel:,} elements, "
