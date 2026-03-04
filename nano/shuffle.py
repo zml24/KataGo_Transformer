@@ -318,6 +318,40 @@ def md5_filter(file_rows, lbound, ubound):
     return filtered
 
 
+def select_val_files_fixed(file_rows, val_num_files, rows_per_file):
+    """Randomly select files for val to reach val_num_files * rows_per_file rows.
+
+    Args:
+        file_rows: List of (filename, num_rows) for all valid files.
+        val_num_files: Target number of val output files.
+        rows_per_file: Rows per output file.
+
+    Returns:
+        (val_file_rows, train_file_rows) — disjoint partition of file_rows.
+    """
+    target_rows = val_num_files * rows_per_file
+    total_rows = sum(nr for _, nr in file_rows)
+
+    if total_rows < target_rows:
+        print(f"WARNING: total rows ({total_rows}) < val target ({target_rows}). "
+              f"Using all data for val.", flush=True)
+
+    shuffled = list(file_rows)
+    np.random.shuffle(shuffled)
+
+    val_file_rows = []
+    train_file_rows = []
+    accumulated = 0
+    for filename, num_rows in shuffled:
+        if accumulated < target_rows:
+            val_file_rows.append((filename, num_rows))
+            accumulated += num_rows
+        else:
+            train_file_rows.append((filename, num_rows))
+
+    return val_file_rows, train_file_rows
+
+
 def process_split(split, num_processes, rows_per_file, worker_group_size,
                   keep_remainder=False, extra_rows=None):
     """Process a single split: shardify + sequential merge-repack + index.json.
@@ -491,11 +525,23 @@ def main():
     parser.add_argument("--split", type=parse_split, action="append", dest="splits",
                         metavar="name:md5_lo:md5_hi:out_dir:tmp_dir",
                         help="Define a split (repeatable). Format: name:md5_lo:md5_hi:out_dir:tmp_dir")
+    parser.add_argument("--val-num-files", type=int, default=None,
+                        help="Fixed number of val output files (val total = N * rows-per-file). "
+                             "Overrides MD5 bounds for val split.")
     args = parser.parse_args()
 
     if not args.splits:
         print("ERROR: at least one --split is required.", file=sys.stderr)
         sys.exit(1)
+
+    if args.val_num_files is not None:
+        if args.val_num_files <= 0:
+            print("ERROR: --val-num-files must be > 0.", file=sys.stderr)
+            sys.exit(1)
+        split_names = {s.name for s in args.splits}
+        if "val" not in split_names or "train" not in split_names:
+            print("ERROR: --val-num-files requires both 'val' and 'train' splits.", file=sys.stderr)
+            sys.exit(1)
 
     # Pre-check: fail fast if any output directory already exists
     for split in args.splits:
@@ -550,17 +596,44 @@ def main():
         print("No rows found, exiting.")
         sys.exit(0)
 
-    # --- Stage 3: MD5 split ---
-    for split in args.splits:
-        split.file_rows = md5_filter(file_rows, split.md5_lbound, split.md5_ubound)
-        split_rows = sum(nr for _, nr in split.file_rows)
-        print(f"Split '{split.name}': {len(split.file_rows)}/{len(file_rows)} files, "
-              f"{split_rows}/{total_rows} rows "
-              f"(MD5 [{split.md5_lbound:.2f}, {split.md5_ubound:.2f}))", flush=True)
+    # --- Stage 3: Split files into val/train ---
+    splits_by_name = {s.name: s for s in args.splits}
+
+    if args.val_num_files is not None:
+        # Fixed val size mode: randomly select files for val
+        val_file_rows, train_file_rows = select_val_files_fixed(
+            file_rows, args.val_num_files, rows_per_file,
+        )
+        splits_by_name["val"].file_rows = val_file_rows
+        splits_by_name["train"].file_rows = train_file_rows
+
+        val_rows = sum(nr for _, nr in val_file_rows)
+        train_rows = sum(nr for _, nr in train_file_rows)
+        print(f"Split 'val': {len(val_file_rows)}/{len(file_rows)} files, "
+              f"{val_rows}/{total_rows} rows "
+              f"(fixed {args.val_num_files} output files)", flush=True)
+        print(f"Split 'train': {len(train_file_rows)}/{len(file_rows)} files, "
+              f"{train_rows}/{total_rows} rows", flush=True)
+
+        # Other splits still use MD5
+        for split in args.splits:
+            if split.name not in ("train", "val"):
+                split.file_rows = md5_filter(file_rows, split.md5_lbound, split.md5_ubound)
+                split_rows = sum(nr for _, nr in split.file_rows)
+                print(f"Split '{split.name}': {len(split.file_rows)}/{len(file_rows)} files, "
+                      f"{split_rows}/{total_rows} rows "
+                      f"(MD5 [{split.md5_lbound:.2f}, {split.md5_ubound:.2f}))", flush=True)
+    else:
+        # Default: MD5 hash-based split
+        for split in args.splits:
+            split.file_rows = md5_filter(file_rows, split.md5_lbound, split.md5_ubound)
+            split_rows = sum(nr for _, nr in split.file_rows)
+            print(f"Split '{split.name}': {len(split.file_rows)}/{len(file_rows)} files, "
+                  f"{split_rows}/{total_rows} rows "
+                  f"(MD5 [{split.md5_lbound:.2f}, {split.md5_ubound:.2f}))", flush=True)
 
     # --- Stage 4: Process splits (val first, then train) ---
     # Val is processed first so its remainder rows can be added to train.
-    splits_by_name = {s.name: s for s in args.splits}
     val_split = splits_by_name.get("val")
     train_split = splits_by_name.get("train")
 

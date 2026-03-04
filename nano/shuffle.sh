@@ -3,6 +3,13 @@ set -o pipefail
 {
 # Shuffles all NPZ data for nano training, splitting into train/val sets.
 # Usage: bash shuffle.sh INPUTDIR OUTPUTDIR TMPDIR NTHREADS [extra shuffle.py args...]
+#
+# Examples:
+#   # Default: val = 5% of data (MD5 hash split)
+#   bash shuffle.sh /data/npz /out /tmp 8
+#
+#   # Fixed val size: val = 2 files (2 * 131072 rows)
+#   VAL_NUM_FILES=2 bash shuffle.sh /data/npz /out /tmp 8
 
 if [[ $# -lt 4 ]]; then
     echo "Usage: $0 INPUTDIR OUTPUTDIR TMPDIR NTHREADS [extra args...]"
@@ -23,6 +30,11 @@ shift
 
 SCRIPTDIR="$(cd "$(dirname "$0")" && pwd)"
 
+VAL_NUM_FILES_ARG=""
+if [[ -n "${VAL_NUM_FILES:-}" ]]; then
+    VAL_NUM_FILES_ARG="--val-num-files $VAL_NUM_FILES"
+fi
+
 #------------------------------------------------------------------------------
 
 mkdir -p "$OUTPUTDIR"
@@ -37,6 +49,7 @@ time python3 "$SCRIPTDIR"/shuffle.py \
      --rows-per-file 131072 \
      --split "train:0.00:0.95:$OUTPUTDIR/train:$TMPDIR/train" \
      --split "val:0.95:1.00:$OUTPUTDIR/val:$TMPDIR/val" \
+     $VAL_NUM_FILES_ARG \
      "$@" \
      2>&1 | tee "$OUTPUTDIR"/output.txt
 
