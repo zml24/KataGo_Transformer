@@ -95,6 +95,29 @@ def multiprocessing_cleanup():
 
 
 # ---------------------------------------------------------------------------
+# EMA (Exponential Moving Average) of model parameters
+# ---------------------------------------------------------------------------
+class ModelEMA:
+    def __init__(self, model, decay):
+        self.decay = decay
+        self.shadow = {name: p.data.clone() for name, p in model.named_parameters() if p.requires_grad}
+
+    @torch.no_grad()
+    def update(self, model):
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                self.shadow[name].lerp_(p.data, 1.0 - self.decay)
+
+    def state_dict(self):
+        return {name: t.cpu() for name, t in self.shadow.items()}
+
+    def load_state_dict(self, state, device):
+        for name, t in state.items():
+            if name in self.shadow:
+                self.shadow[name].copy_(t.to(device))
+
+
+# ---------------------------------------------------------------------------
 # Training main loop
 # ---------------------------------------------------------------------------
 def main(rank, world_size, args, gpu_id):
@@ -273,6 +296,11 @@ def main(rank, world_size, args, gpu_id):
 
     model.to(device)
 
+    # EMA (shadow copy of params on same device, before compile/DDP)
+    ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0 else None
+    if ema is not None:
+        logging.info(f"EMA enabled: decay={args.ema_decay}, shadow params: {sum(t.numel() for t in ema.shadow.values()):,}")
+
     # torch.compile
     if not args.no_compile and device.type != "mps":
         compiled_model = torch.compile(model, mode="default")
@@ -425,6 +453,11 @@ def main(rank, world_size, args, gpu_id):
             else:
                 shampoo_opt.load_state_dict(state["shampoo_state"], device)
             logging.info("Shampoo state loaded")
+        if "ema_shadow" in state and ema is not None:
+            ema.load_state_dict(state["ema_shadow"], device)
+            logging.info("EMA state loaded")
+        elif ema is not None:
+            logging.info("No EMA state in checkpoint, initialized from current params")
     # LR schedule: linear warmup + cosine decay
     grad_accum_steps = args.grad_accum_steps
     samples_per_step = batch_size * world_size * grad_accum_steps
@@ -526,6 +559,8 @@ def main(rank, world_size, args, gpu_id):
                 state_dict["muon_state"] = muon_state_gathered if muon_state_gathered is not None else muon_opt.state_dict()
             if shampoo_opt is not None:
                 state_dict["shampoo_state"] = shampoo_state_gathered if shampoo_state_gathered is not None else shampoo_opt.state_dict()
+            if ema is not None:
+                state_dict["ema_shadow"] = ema.state_dict()
 
             # Capture values for logging in background thread
             _step, _samples = global_step, total_samples_trained
@@ -749,6 +784,8 @@ def main(rank, world_size, args, gpu_id):
                     # Sync Adam + Muon/Shampoo owned parameters in a single collective pass.
                     sync_zero_params([zero_adam, muon_opt, shampoo_opt], rank=rank, world_size=world_size)
                     profiler.tick("sync")
+                if ema is not None:
+                    ema.update(model)
                 profiler.step_done()
                 global_step += 1
                 total_samples_trained += batch_size * world_size * grad_accum_steps
@@ -924,6 +961,8 @@ if __name__ == "__main__":
     parser.add_argument("--use-fp8", action="store_true", help="Enable FP8 training (requires --use-te and Hopper/Ada GPU)")
     parser.add_argument("--profile", action="store_true",
                         help="Enable per-stage CUDA-synced profiling (adds sync overhead)")
+    parser.add_argument("--ema-decay", type=float, default=0.0,
+                        help="EMA decay rate for model params (0=disabled, typical: 0.999 or 0.9999)")
     args = parser.parse_args()
 
     # Validation

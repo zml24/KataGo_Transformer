@@ -62,6 +62,15 @@ def export(args):
         if detect_checkpoint_format(model_state) == "te":
             print("Converting TE checkpoint to model.py format for ONNX export")
             model_state = convert_checkpoint_te_to_model(model_state)
+    if args.use_ema:
+        ema_shadow = state.get("ema_shadow")
+        if ema_shadow is None:
+            print("ERROR: --use-ema specified but checkpoint has no ema_shadow state")
+            sys.exit(1)
+        for name, tensor in ema_shadow.items():
+            if name in model_state:
+                model_state[name] = tensor
+        print(f"Using EMA weights ({len(ema_shadow)} parameters)")
     model = Model(config, args.pos_len, score_mode=args.score_mode)
     model.load_state_dict(model_state)
     model.eval()
@@ -154,6 +163,8 @@ def main():
     parser.add_argument("--verify", action="store_true", help="Verify exported model with onnxruntime")
     parser.add_argument("--use-te", action="store_true",
                         help="Checkpoint is from TE model — convert weights to model.py format before export")
+    parser.add_argument("--use-ema", action="store_true",
+                        help="Export EMA shadow weights instead of training weights")
     args = parser.parse_args()
 
     onnx_path, model, input_spatial, input_global = export(args)
