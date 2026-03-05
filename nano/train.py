@@ -356,7 +356,7 @@ def main(rank, world_size, args, gpu_id):
         logging.info(f"  [NoDecay] {name}: {list(p.shape)}")
 
     # FLOPs estimation
-    forward_flops = estimate_forward_flops(model_config, pos_len)
+    forward_flops = estimate_forward_flops(model_config, pos_len, score_mode=args.score_mode)
     train_flops_per_sample = 3 * forward_flops
     gpu_peak_tflops = get_gpu_peak_tflops(device)
     logging.info(f"FLOPs/sample (fwd): {forward_flops/1e9:.2f}G, (train): {train_flops_per_sample/1e9:.2f}G")

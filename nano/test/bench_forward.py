@@ -41,6 +41,9 @@ def main():
                         help="Use TransformerEngine model (model_te.py)")
     parser.add_argument("--use-fp8", action="store_true",
                         help="Enable FP8 inference (requires --use-te and Hopper/Ada GPU)")
+    parser.add_argument("--score-mode", type=str, default="simple",
+                        choices=["mixop", "mix", "simple"],
+                        help="Score head mode (default: simple)")
     args = parser.parse_args()
 
     assert torch.cuda.is_available(), "CUDA is required for this benchmark"
@@ -52,10 +55,12 @@ def main():
     # Model setup
     if args.use_te:
         from model_te import Model
-        model = Model(configs.config_of_name[args.model_kind], args.pos_len, use_fp8=args.use_fp8)
+        model = Model(configs.config_of_name[args.model_kind], args.pos_len,
+                      score_mode=args.score_mode, use_fp8=args.use_fp8)
     else:
         from model import Model
-        model = Model(configs.config_of_name[args.model_kind], args.pos_len)
+        model = Model(configs.config_of_name[args.model_kind], args.pos_len,
+                      score_mode=args.score_mode)
 
     model_config = configs.config_of_name[args.model_kind]
     model.initialize()
@@ -70,7 +75,7 @@ def main():
         compiled_model = model
 
     # FLOPs and GPU info
-    forward_flops = estimate_forward_flops(model_config, args.pos_len)
+    forward_flops = estimate_forward_flops(model_config, args.pos_len, score_mode=args.score_mode)
     gpu_peak_tflops = get_gpu_peak_tflops(device)
     gpu_name = torch.cuda.get_device_name(device)
 
@@ -87,6 +92,7 @@ def main():
     print(f"torch.compile:  {'OFF' if args.no_compile else 'ON'}")
     print(f"TransformerEngine: {'ON' if args.use_te else 'OFF'}")
     print(f"FP8:            {'ON' if args.use_fp8 else 'OFF'}")
+    print(f"Score mode:     {args.score_mode}")
     print(f"FLOPs/sample:   {forward_flops/1e9:.2f} GFLOPs")
     print(f"GPU:            {gpu_name}")
     print(f"GPU BF16 peak:  {gpu_peak_tflops:.1f} TFLOPS")

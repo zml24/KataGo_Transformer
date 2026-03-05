@@ -376,7 +376,7 @@ def compute_loss(
     return loss_sum, metrics
 
 
-def estimate_forward_flops(config, pos_len):
+def estimate_forward_flops(config, pos_len, score_mode="simple"):
     """Estimate forward-pass FLOPs for a single sample."""
     S = pos_len * pos_len
     D = config["hidden_size"]
@@ -402,8 +402,14 @@ def estimate_forward_flops(config, pos_len):
     value_sv_flops = 2 * S * D * 29
     num_scorebeliefs = config["num_scorebeliefs"]
     scorebelief_len = (S + EXTRA_SCORE_DISTR_RADIUS) * 2
-    score_mix_out = scorebelief_len * num_scorebeliefs + num_scorebeliefs
-    score_flops = 2 * D * score_mix_out
+    if score_mode == "simple":
+        score_flops = 2 * D * scorebelief_len
+    else:
+        score_mix_out = scorebelief_len * num_scorebeliefs + num_scorebeliefs
+        score_flops = 2 * D * score_mix_out
+        if score_mode == "mixop":
+            # offset linear (D -> 1) and parity linear (D -> 1)
+            score_flops += 2 * D * 2
 
     total = trunk_flops + conv_flops + global_flops + policy_flops + value_sv_flops + score_flops
     return total
