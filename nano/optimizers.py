@@ -57,6 +57,13 @@ class MuonOptimizer:
         self.num_heads = num_heads
         self.last_update_rms = 0.0
         self.states = {name: self._init_state(p) for name, p in named_params.items()}
+        self._split_info = {}
+        for name, p in named_params.items():
+            if p.ndim == 4:
+                m, n = p.shape[0], p.shape[1] * p.shape[2] * p.shape[3]
+            else:
+                m, n = p.shape
+            self._split_info[name] = compute_split_info(name, m, n, use_te, num_heads)
 
     @staticmethod
     def _init_state(p):
@@ -77,39 +84,14 @@ class MuonOptimizer:
 
                 state["momentum"].mul_(self.momentum).add_(grad)
                 update = state["momentum"]
-                if update.ndim == 4:
-                    update = update.view(update.size(0), -1)
 
-                # TE fused param split: fc1_weight [2*ffn, h] -> [2, ffn, h], fused QKV [3*h, h] -> [3, h, h]
-                # When headwise is also enabled, TE QKV splits further: [3*h, h] -> [3*num_heads, head_dim, h]
-                n_split = 0
-                if self.use_te and "fc1_weight" in name:
-                    n_split = 2
-                elif self.use_te and "qkv" in name and update.size(0) == 3 * update.size(1):
-                    n_split = 3 * self.num_heads if self.num_heads > 0 else 3
-                if n_split > 0:
-                    update = update.view(n_split, update.size(0) // n_split, update.size(-1))
-
-                # Head-wise split for attention projections (both TE and non-TE)
-                headwise_permuted = False
-                if self.num_heads > 0 and n_split == 0 and update.ndim == 2:
-                    if any(tag in name for tag in ("q_proj", "k_proj", "v_proj",
-                                                    "query_weight", "key_weight", "value_weight")):
-                        # QKV: dim0 = num_heads * head_dim, dim1 = hidden_size
-                        # (num_heads*head_dim, c_main) -> (num_heads, head_dim, c_main)
-                        update = update.view(self.num_heads, update.size(0) // self.num_heads, update.size(-1))
-                    elif "out_proj" in name or "self_attention.proj" in name:
-                        # out_proj: dim0 = c_main, dim1 = num_heads * head_dim
-                        # (c_main, num_heads*head_dim) -> (c_main, num_heads, head_dim) -> (num_heads, c_main, head_dim)
-                        update = update.view(update.size(0), self.num_heads, update.size(1) // self.num_heads)
-                        update = update.permute(1, 0, 2).contiguous()
-                        headwise_permuted = True
+                split_info = self._split_info[name]
+                update = flatten_and_split(update, split_info)
 
                 update = polar_express(update)
                 update = update * max(update.size(-2), update.size(-1)) ** 0.5
-                if headwise_permuted:
-                    update = update.permute(1, 0, 2).contiguous()
-                update = update.view(original_shape)
+
+                update = undo_split(update, original_shape, split_info[3])
 
                 rms_sum += update.norm() * self.lr_multiplier / update.numel() ** 0.5
                 rms_cnt += 1
@@ -188,6 +170,25 @@ def compute_split_info(name, m, n, use_te=False, num_heads=0):
     return (1, m, n, False)
 
 
+def flatten_and_split(tensor, split_info):
+    """4D->2D flatten + chunk/head split based on split_info."""
+    n_chunks, chunk_m, chunk_n, headwise_permuted = split_info
+    if tensor.ndim == 4:
+        tensor = tensor.view(tensor.size(0), -1)
+    if headwise_permuted:
+        tensor = tensor.view(tensor.size(0), n_chunks, chunk_n).permute(1, 0, 2).contiguous()
+    elif n_chunks > 1:
+        tensor = tensor.view(n_chunks, chunk_m, chunk_n)
+    return tensor
+
+
+def undo_split(tensor, original_shape, headwise_permuted):
+    """Undo flatten_and_split, restoring original shape."""
+    if headwise_permuted:
+        tensor = tensor.permute(1, 0, 2).contiguous()
+    return tensor.view(original_shape)
+
+
 class ShampooOptimizer:
     """Shampoo optimizer: L/R preconditioner EMA + matrix inverse root."""
 
@@ -211,7 +212,7 @@ class ShampooOptimizer:
                 m, n = p.shape[0], p.shape[1:].numel()
             else:
                 m, n = p.shape[0], 1
-            self._split_info[name] = self._compute_split_info(name, m, n)
+            self._split_info[name] = compute_split_info(name, m, n, use_te, num_heads)
             n_chunks, chunk_m, chunk_n, _ = self._split_info[name]
             if n_chunks > 1:
                 state = {
@@ -226,9 +227,6 @@ class ShampooOptimizer:
                     "R": torch.zeros(n, n, dtype=torch.float32, device=device),
                 }
             self.states[name] = state
-
-    def _compute_split_info(self, name, m, n):
-        return compute_split_info(name, m, n, self.use_te, self.num_heads)
 
     def step(self, base_lr):
         self.step_count += 1
@@ -245,27 +243,11 @@ class ShampooOptimizer:
                 state = self.states[name]
                 grad = p.grad
                 original_shape = grad.shape
-                if grad.ndim == 4:
-                    grad_2d = grad.view(grad.size(0), -1)
-                else:
-                    grad_2d = grad
+                split_info = self._split_info[name]
 
                 state["momentum"].lerp_(grad, 1 - self.momentum)
-                momentum_2d = state["momentum"]
-                if momentum_2d.ndim == 4:
-                    momentum_2d = momentum_2d.view(momentum_2d.size(0), -1)
-                momentum_2d_hat = momentum_2d / bias_corr1
-
-                # Apply TE / head-wise split
-                n_chunks, chunk_m, chunk_n, headwise_permuted = self._split_info[name]
-                if headwise_permuted:
-                    # out_proj: (c_main, num_heads*head_dim) -> (num_heads, c_main, head_dim)
-                    grad_2d = grad_2d.view(grad_2d.size(0), n_chunks, chunk_n).permute(1, 0, 2).contiguous()
-                    momentum_2d_hat = momentum_2d_hat.view(momentum_2d_hat.size(0), n_chunks, chunk_n).permute(1, 0, 2).contiguous()
-                elif n_chunks > 1:
-                    # TE split or headwise QKV: view as (n_chunks, chunk_m, chunk_n)
-                    grad_2d = grad_2d.view(n_chunks, chunk_m, chunk_n)
-                    momentum_2d_hat = momentum_2d_hat.view(n_chunks, chunk_m, chunk_n)
+                grad_2d = flatten_and_split(grad, split_info)
+                momentum_2d_hat = flatten_and_split(state["momentum"], split_info) / bias_corr1
 
                 state["L"].lerp_(grad_2d @ grad_2d.mT, 1 - self.beta2)
                 state["R"].lerp_(grad_2d.mT @ grad_2d, 1 - self.beta2)
@@ -278,10 +260,7 @@ class ShampooOptimizer:
                 rms_sum += precond.norm() * self.lr_multiplier / precond.numel() ** 0.5
                 rms_cnt += 1
 
-                # Restore shape
-                if headwise_permuted:
-                    precond = precond.permute(1, 0, 2).contiguous()
-                precond = precond.view(original_shape)
+                precond = undo_split(precond, original_shape, split_info[3])
 
                 p.mul_(1 - base_lr * self.wd)
                 p.add_(precond.to(p.dtype), alpha=-shampoo_lr)
