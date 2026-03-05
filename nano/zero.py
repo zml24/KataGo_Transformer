@@ -78,7 +78,9 @@ def _coalesced_broadcast(partitions, rank, world_size):
     """Broadcast updated parameters from each owner rank to all others.
 
     partitions: list of dicts [{name: param}, ...], one per rank.
+    All broadcasts are issued asynchronously and waited on at the end.
     """
+    pending = []  # (handle, flat, bucket) for non-source ranks that need unpacking
     for src_rank in range(world_size):
         params = list(partitions[src_rank].values())
         if not params:
@@ -98,15 +100,84 @@ def _coalesced_broadcast(partitions, rank, world_size):
             else:
                 total_numel = sum(p.numel() for p in bucket)
                 flat = torch.empty(total_numel, dtype=dtype, device=dev)
-            dist.broadcast(flat, src=src_rank)
+            handle = dist.broadcast(flat, src=src_rank, async_op=True)
             if rank != src_rank:
-                # Unpack back into param tensors.
-                with torch.no_grad():
-                    offset = 0
-                    for p in bucket:
-                        numel = p.numel()
-                        p.copy_(flat[offset:offset + numel].reshape_as(p))
-                        offset += numel
+                pending.append((handle, flat, bucket))
+            else:
+                pending.append((handle, None, None))
+
+    # Wait for all broadcasts and unpack received tensors.
+    for handle, flat, bucket in pending:
+        handle.wait()
+        if bucket is not None:
+            with torch.no_grad():
+                offset = 0
+                for p in bucket:
+                    numel = p.numel()
+                    p.copy_(flat[offset:offset + numel].reshape_as(p))
+                    offset += numel
+
+
+def _coalesced_reduce(partitions, rank, world_size):
+    """Reduce gradients to each owner rank (async pipelined).
+
+    For each owner rank, flattens the gradients of its parameters into one
+    tensor, reduces (averages) across all ranks, and writes the result back.
+    Non-owner ranks have their gradients freed (set to None).
+
+    partitions: list of dicts [{name: param}, ...], one per rank.
+    """
+    pending = []  # (handle, flat, bucket, owner_rank)
+    for owner_rank in range(world_size):
+        params = list(partitions[owner_rank].values())
+        if not params:
+            continue
+        # Group by (device, dtype).
+        buckets = {}
+        for p in params:
+            if p.grad is None:
+                continue
+            key = (p.device, p.grad.dtype)
+            if key not in buckets:
+                buckets[key] = []
+            buckets[key].append(p)
+
+        for (dev, dtype), bucket in buckets.items():
+            flat = torch.cat([p.grad.detach().reshape(-1) for p in bucket], dim=0).contiguous()
+            handle = dist.reduce(flat, dst=owner_rank, op=dist.ReduceOp.AVG, async_op=True)
+            pending.append((handle, flat, bucket, owner_rank))
+
+    for handle, flat, bucket, owner_rank in pending:
+        handle.wait()
+        if rank == owner_rank:
+            # Unpack reduced gradients back into param .grad tensors.
+            with torch.no_grad():
+                offset = 0
+                for p in bucket:
+                    numel = p.numel()
+                    p.grad = flat[offset:offset + numel].reshape_as(p)
+                    offset += numel
+        else:
+            # Free non-owned gradients.
+            for p in bucket:
+                p.grad = None
+
+
+def reduce_zero_grads(optimizers, rank, world_size):
+    """Reduce gradients for all ZeRO optimizers in one pass.
+
+    Merges partitions from multiple optimizers and calls _coalesced_reduce
+    so that each rank only retains reduced gradients for its own parameters.
+    """
+    merged = [{} for _ in range(world_size)]
+    for opt in optimizers:
+        if opt is None:
+            continue
+        parts = opt.partitions
+        for r in range(world_size):
+            for name, p in parts[r].items():
+                merged[r][name] = p
+    _coalesced_reduce(merged, rank, world_size)
 
 
 def sync_zero_params(optimizers, rank, world_size):

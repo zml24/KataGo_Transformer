@@ -28,7 +28,7 @@ import atexit
 import configs
 import data as data_processing
 from optimizers import MuonOptimizer, ShampooOptimizer
-from zero import ZeROAdamW, ZeROMuon, ZeROShampoo, sync_zero_params
+from zero import ZeROAdamW, ZeROMuon, ZeROShampoo, sync_zero_params, reduce_zero_grads
 from losses import compute_loss, postprocess_and_loss_core, _METRIC_KEYS, estimate_forward_flops, get_gpu_peak_tflops
 
 
@@ -309,8 +309,9 @@ def main(rank, world_size, args, gpu_id):
         compiled_model = model
         compiled_loss_fn = postprocess_and_loss_core
 
-    # DDP wrapper
-    if world_size > 1:
+    # DDP wrapper (skipped in zero dp-mode where we reduce gradients manually)
+    dp_zero = (args.dp_mode == "zero") and world_size > 1
+    if world_size > 1 and not dp_zero:
         ddp_model = DistributedDataParallel(compiled_model, device_ids=[device])
     else:
         ddp_model = compiled_model
@@ -701,9 +702,13 @@ def main(rank, world_size, args, gpu_id):
                 for p in model.parameters():
                     p.grad = None
 
-            # DDP no_sync: skip all-reduce for intermediate micro-steps
+            # DDP no_sync: skip all-reduce for intermediate micro-steps.
+            # In zero dp-mode there is no DDP, so no_sync is unnecessary.
             is_last_micro = (accum_step + 1 == grad_accum_steps)
-            ctx = contextlib.nullcontext() if (is_last_micro or world_size == 1) else ddp_model.no_sync()
+            if dp_zero:
+                ctx = contextlib.nullcontext()
+            else:
+                ctx = contextlib.nullcontext() if (is_last_micro or world_size == 1) else ddp_model.no_sync()
 
             with ctx:
                 with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
@@ -757,8 +762,31 @@ def main(rank, world_size, args, gpu_id):
                 accum_moving_sum = 0.0
                 accum_moving_weight = 0.0
 
+                # In zero dp-mode, reduce gradients to owner ranks before clipping.
+                if dp_zero:
+                    reduce_zero_grads([zero_adam, muon_opt, shampoo_opt], rank=rank, world_size=world_size)
+                    profiler.tick("reduce")
+
                 # Gradient clipping + optimizer step
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if dp_zero:
+                    # Distributed clip: each rank only has its partition's gradients.
+                    owned_params = [
+                        p for opt in [zero_adam, muon_opt, shampoo_opt]
+                        if opt is not None
+                        for p in opt.partitions[rank].values()
+                        if p.grad is not None
+                    ]
+                    local_norm_sq = sum(p.grad.norm() ** 2 for p in owned_params)
+                    global_norm_sq = torch.tensor([local_norm_sq], device=device)
+                    torch.distributed.all_reduce(global_norm_sq)
+                    grad_norm = global_norm_sq.sqrt()
+                    clip_coef = torch.clamp(1.0 / (grad_norm + 1e-6), max=1.0)
+                    if clip_coef < 1.0:
+                        for p in owned_params:
+                            p.grad.mul_(clip_coef)
+                    grad_norm = grad_norm.item()
+                else:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 profiler.tick("clip")
                 if zero_adam is not None:
                     # Defer ZeRO param sync and do one coalesced sync after all optimizers step.
@@ -794,7 +822,7 @@ def main(rank, world_size, args, gpu_id):
                 for k in _metric_keys:
                     running[k] += micro_metrics_accum[k] / grad_accum_steps
                     micro_metrics_accum[k] = 0.0
-                running["grad_norm"] += grad_norm.item()
+                running["grad_norm"] += grad_norm if isinstance(grad_norm, float) else grad_norm.item()
                 if muon_opt is not None:
                     running["muon_update_rms"] += muon_opt.last_update_rms
                 if shampoo_opt is not None:
@@ -951,6 +979,8 @@ if __name__ == "__main__":
     parser.add_argument("--seki-loss-scale", type=float, default=1.0, help="Seki loss coeff")
     parser.add_argument("--variance-time-loss-scale", type=float, default=1.0, help="Variance time loss coeff")
     parser.add_argument("--disable-optimistic-policy", action="store_true", help="Disable optimistic policy")
+    parser.add_argument("--dp-mode", type=str, default="ddp", choices=["ddp", "zero"],
+                        help="Data parallel mode: ddp (standard DDP) or zero (manual gradient reduce, saves memory)")
     parser.add_argument("--multi-gpus", type=str, default=None, help="Comma-separated GPU device ids for DDP (e.g. 0,1,2,3)")
     parser.add_argument("--master-port", type=int, default=23456, help="Localhost port for DDP communication")
     parser.add_argument("--prefetch-batches", type=int, default=64, help="Prefetch queue depth (0=off)")
