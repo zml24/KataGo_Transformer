@@ -41,10 +41,7 @@ REQUIRED_KEYS = [
     "scoreDistrN",
     "valueTargetsNCHW",
 ]
-OPTIONAL_KEYS = [
-    "qValueTargetsNCMove",
-    "metadataInputNC",
-]
+OPTIONAL_KEYS = []
 
 POS_LEN = 19
 PACKED_BYTES = (POS_LEN * POS_LEN + 7) // 8  # 46

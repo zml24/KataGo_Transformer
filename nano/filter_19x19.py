@@ -32,10 +32,7 @@ REQUIRED_KEYS = [
     "scoreDistrN",
     "valueTargetsNCHW",
 ]
-OPTIONAL_KEYS = [
-    "qValueTargetsNCMove",
-    "metadataInputNC",
-]
+OPTIONAL_KEYS = []
 
 
 def is_19x19_mask(packed):
