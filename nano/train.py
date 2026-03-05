@@ -776,8 +776,9 @@ def main(rank, world_size, args, gpu_id):
                         for p in opt.partitions[rank].values()
                         if p.grad is not None
                     ]
-                    local_norm_sq = sum(p.grad.norm() ** 2 for p in owned_params)
-                    global_norm_sq = torch.tensor([local_norm_sq], device=device)
+                    local_norm_sq = sum((p.grad.norm() ** 2 for p in owned_params),
+                                        torch.tensor(0.0, device=device))
+                    global_norm_sq = local_norm_sq.unsqueeze(0)
                     torch.distributed.all_reduce(global_norm_sq)
                     grad_norm = global_norm_sq.sqrt()
                     clip_coef = torch.clamp(1.0 / (grad_norm + 1e-6), max=1.0)

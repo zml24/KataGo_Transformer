@@ -78,9 +78,9 @@ def _coalesced_broadcast(partitions, rank, world_size):
     """Broadcast updated parameters from each owner rank to all others.
 
     partitions: list of dicts [{name: param}, ...], one per rank.
-    All broadcasts are issued asynchronously and waited on at the end.
+    Each src_rank is fully processed (broadcast + unpack) before moving to the
+    next, so at most one flat buffer is live at a time per (device, dtype).
     """
-    pending = []  # (handle, flat, bucket) for non-source ranks that need unpacking
     for src_rank in range(world_size):
         params = list(partitions[src_rank].values())
         if not params:
@@ -100,34 +100,30 @@ def _coalesced_broadcast(partitions, rank, world_size):
             else:
                 total_numel = sum(p.numel() for p in bucket)
                 flat = torch.empty(total_numel, dtype=dtype, device=dev)
-            handle = dist.broadcast(flat, src=src_rank, async_op=True)
+            dist.broadcast(flat, src=src_rank)
             if rank != src_rank:
-                pending.append((handle, flat, bucket))
-            else:
-                pending.append((handle, None, None))
-
-    # Wait for all broadcasts and unpack received tensors.
-    for handle, flat, bucket in pending:
-        handle.wait()
-        if bucket is not None:
-            with torch.no_grad():
-                offset = 0
-                for p in bucket:
-                    numel = p.numel()
-                    p.copy_(flat[offset:offset + numel].reshape_as(p))
-                    offset += numel
+                # Unpack back into param tensors.
+                with torch.no_grad():
+                    offset = 0
+                    for p in bucket:
+                        numel = p.numel()
+                        p.copy_(flat[offset:offset + numel].reshape_as(p))
+                        offset += numel
 
 
 def _coalesced_reduce(partitions, rank, world_size):
-    """Reduce gradients to each owner rank (async pipelined).
+    """Reduce gradients to each owner rank.
 
     For each owner rank, flattens the gradients of its parameters into one
     tensor, reduces (averages) across all ranks, and writes the result back.
     Non-owner ranks have their gradients freed (set to None).
 
+    Each owner_rank is fully processed before moving to the next, so at most
+    one flat copy is live at a time per (device, dtype), and non-owned
+    gradients are freed progressively.
+
     partitions: list of dicts [{name: param}, ...], one per rank.
     """
-    pending = []  # (handle, flat, bucket, owner_rank)
     for owner_rank in range(world_size):
         params = list(partitions[owner_rank].values())
         if not params:
@@ -144,23 +140,19 @@ def _coalesced_reduce(partitions, rank, world_size):
 
         for (dev, dtype), bucket in buckets.items():
             flat = torch.cat([p.grad.detach().reshape(-1) for p in bucket], dim=0).contiguous()
-            handle = dist.reduce(flat, dst=owner_rank, op=dist.ReduceOp.AVG, async_op=True)
-            pending.append((handle, flat, bucket, owner_rank))
-
-    for handle, flat, bucket, owner_rank in pending:
-        handle.wait()
-        if rank == owner_rank:
-            # Unpack reduced gradients back into param .grad tensors.
-            with torch.no_grad():
-                offset = 0
+            dist.reduce(flat, dst=owner_rank, op=dist.ReduceOp.AVG)
+            if rank == owner_rank:
+                # Unpack reduced gradients back into param .grad tensors.
+                with torch.no_grad():
+                    offset = 0
+                    for p in bucket:
+                        numel = p.numel()
+                        p.grad = flat[offset:offset + numel].reshape_as(p)
+                        offset += numel
+            else:
+                # Free non-owned gradients immediately.
                 for p in bucket:
-                    numel = p.numel()
-                    p.grad = flat[offset:offset + numel].reshape_as(p)
-                    offset += numel
-        else:
-            # Free non-owned gradients.
-            for p in bucket:
-                p.grad = None
+                    p.grad = None
 
 
 def reduce_zero_grads(optimizers, rank, world_size):
@@ -174,8 +166,12 @@ def reduce_zero_grads(optimizers, rank, world_size):
         if opt is None:
             continue
         parts = opt.partitions
+        if len(parts) != world_size:
+            raise ValueError("Inconsistent world_size across ZeRO optimizers")
         for r in range(world_size):
             for name, p in parts[r].items():
+                if name in merged[r]:
+                    raise ValueError(f"Parameter '{name}' appears in multiple ZeRO optimizers on rank {r}")
                 merged[r][name] = p
     _coalesced_reduce(merged, rank, world_size)
 
