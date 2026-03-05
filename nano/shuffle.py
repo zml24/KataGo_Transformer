@@ -190,7 +190,7 @@ def shardify(input_idx, file_group, num_out_files, out_tmp_dirs):
             continue
         shard = {key: merged[key][start:stop] for key in keys}
         out_path = os.path.join(out_tmp_dirs[out_idx], f"{input_idx}.npz")
-        np.savez_compressed(out_path, **shard)
+        np.savez(out_path, **shard)  # uncompressed: temp files, deleted after merge
 
     return num_rows
 
@@ -290,6 +290,239 @@ def sequential_merge_repack(num_shards, out_tmp_dirs, out_dir, rows_per_file,
     return written_files, remainder
 
 
+def merge_one_bucket(bucket_idx, tmp_dir, num_shards, out_dir,
+                     out_file_idx, rows_per_file, remainder_path,
+                     extra_rows_path=None):
+    """Merge all shard files in one bucket, write output files, save remainder.
+
+    Args:
+        bucket_idx: Index of this bucket (for logging).
+        tmp_dir: The temp directory for this bucket (e.g., tmp.shuf3/).
+        num_shards: Number of shard files to look for (0..num_shards-1).
+        out_dir: Final output directory.
+        out_file_idx: Starting output file index for this bucket.
+        rows_per_file: Exact number of rows per output file.
+        remainder_path: Path to save remainder as NPZ (if any leftover rows).
+        extra_rows_path: Optional path to NPZ file with extra rows to inject.
+
+    Returns:
+        (written_files, remainder_rows)
+        - written_files: list of (filepath, num_rows)
+        - remainder_rows: int, number of leftover rows saved to remainder_path
+    """
+    np.random.seed([int.from_bytes(os.urandom(4), byteorder="little") for _ in range(5)])
+
+    all_data = {}
+    total_rows = 0
+
+    # Inject extra rows (e.g. val remainder) if provided
+    if extra_rows_path is not None and os.path.exists(extra_rows_path):
+        with np.load(extra_rows_path) as npz:
+            for key in npz.keys():
+                all_data[key] = [npz[key]]
+            total_rows = npz["binaryInputNCHWPacked"].shape[0]
+            print(f"  Bucket {bucket_idx}: injected {total_rows} extra rows", flush=True)
+
+    # Read all shard files in this bucket (randomized order)
+    shard_files = []
+    for shard_idx in range(num_shards):
+        path = os.path.join(tmp_dir, f"{shard_idx}.npz")
+        if os.path.exists(path):
+            shard_files.append(path)
+    np.random.shuffle(shard_files)
+
+    for path in shard_files:
+        try:
+            with np.load(path) as npz:
+                for key in npz.keys():
+                    if key not in all_data:
+                        all_data[key] = []
+                    all_data[key].append(npz[key])
+                total_rows += npz["binaryInputNCHWPacked"].shape[0]
+        except Exception as e:
+            print(f"WARNING: error reading shard {path}: {e}")
+            continue
+
+    if total_rows == 0:
+        return [], 0
+
+    # Concatenate all data
+    merged = {key: np.concatenate(arrs) for key, arrs in all_data.items()}
+    keys = list(merged.keys())
+
+    # Write full output files
+    written_files = []
+    file_idx = out_file_idx
+    offset = 0
+
+    while offset + rows_per_file <= total_rows:
+        chunk = {key: merged[key][offset:offset + rows_per_file] for key in keys}
+        arrays = joint_shuffle([chunk[k] for k in keys])
+        chunk = dict(zip(keys, arrays))
+
+        out_path = os.path.join(out_dir, f"data{file_idx}.npz")
+        np.savez_compressed(out_path, **chunk)
+        written_files.append((out_path, rows_per_file))
+        file_idx += 1
+        offset += rows_per_file
+
+    # Save remainder to temp file (avoid pickling large arrays through IPC)
+    remainder_rows = total_rows - offset
+    if remainder_rows > 0:
+        remainder = {key: merged[key][offset:] for key in keys}
+        np.savez(remainder_path, **remainder)  # uncompressed, temp file
+
+    return written_files, remainder_rows
+
+
+def parallel_merge_repack(num_shards, out_tmp_dirs, out_dir, rows_per_file,
+                          num_processes, keep_remainder=False,
+                          extra_rows=None, tmp_base_dir=None):
+    """Parallel merge: each bucket processed independently by a worker.
+
+    Args:
+        num_shards: Number of shard files per bucket (= num worker groups).
+        out_tmp_dirs: List of bucket temp directories.
+        out_dir: Final output directory.
+        rows_per_file: Exact number of rows per output file.
+        num_processes: Number of parallel workers.
+        keep_remainder: If True, don't write the last partial chunk; return it.
+        extra_rows: Optional dict of arrays to inject (e.g. val remainder for train).
+        tmp_base_dir: Temp directory for remainder files and extra_rows file.
+
+    Returns:
+        (written_files, remainder) -- same contract as sequential_merge_repack
+    """
+    num_buckets = len(out_tmp_dirs)
+
+    # --- Phase 1: Scan bucket row counts (header-only, no data loading) ---
+    bucket_row_counts = []
+    for tmp_dir in out_tmp_dirs:
+        total = 0
+        for shard_idx in range(num_shards):
+            path = os.path.join(tmp_dir, f"{shard_idx}.npz")
+            if os.path.exists(path):
+                try:
+                    headers = get_numpy_npz_headers(path)
+                    if headers:
+                        for key in headers:
+                            if key in ("binaryInputNCHWPacked",
+                                       "binaryInputNCHWPacked.npy"):
+                                total += headers[key][0][0]
+                                break
+                except Exception:
+                    pass
+        bucket_row_counts.append(total)
+
+    # Save extra_rows to temp file for IPC
+    extra_rows_path = None
+    extra_count = 0
+    if extra_rows is not None:
+        extra_count = extra_rows["binaryInputNCHWPacked"].shape[0]
+        if extra_count > 0:
+            extra_rows_path = os.path.join(tmp_base_dir, "extra_rows.npz")
+            np.savez(extra_rows_path, **extra_rows)
+
+    # --- Phase 2: Pre-allocate output file indices ---
+    # Add extra_rows to bucket 0
+    effective_counts = list(bucket_row_counts)
+    if extra_count > 0:
+        effective_counts[0] += extra_count
+
+    out_file_starts = []
+    cumulative = 0
+    for count in effective_counts:
+        out_file_starts.append(cumulative)
+        cumulative += count // rows_per_file
+
+    # --- Phase 3: Parallel merge ---
+    remainder_dir = os.path.join(tmp_base_dir, "tmp.remainders")
+    os.makedirs(remainder_dir, exist_ok=True)
+
+    tasks = []
+    for bucket_idx, tmp_dir in enumerate(out_tmp_dirs):
+        remainder_path = os.path.join(remainder_dir, f"rem_{bucket_idx}.npz")
+        inject_path = extra_rows_path if bucket_idx == 0 else None
+        tasks.append((
+            bucket_idx, tmp_dir, num_shards, out_dir,
+            out_file_starts[bucket_idx], rows_per_file,
+            remainder_path, inject_path,
+        ))
+
+    with multiprocessing.Pool(num_processes) as pool:
+        results = pool.starmap(merge_one_bucket, tasks)
+
+    # --- Phase 4: Collect results and handle remainders ---
+    all_written = []
+    all_remainder_paths = []
+    total_remainder_rows = 0
+
+    for bucket_idx, (written_files, rem_rows) in enumerate(results):
+        all_written.extend(written_files)
+        if rem_rows > 0:
+            rem_path = os.path.join(remainder_dir, f"rem_{bucket_idx}.npz")
+            all_remainder_paths.append(rem_path)
+            total_remainder_rows += rem_rows
+
+    # Determine next file index
+    next_file_idx = cumulative  # from the pre-allocation
+
+    # Merge all remainders
+    remainder = None
+    if total_remainder_rows > 0:
+        combined = {}
+        for rem_path in all_remainder_paths:
+            try:
+                with np.load(rem_path) as npz:
+                    for key in npz.keys():
+                        if key not in combined:
+                            combined[key] = []
+                        combined[key].append(npz[key])
+            except Exception as e:
+                print(f"WARNING: error reading remainder {rem_path}: {e}")
+
+        if combined:
+            merged_rem = {key: np.concatenate(arrs) for key, arrs in combined.items()}
+            keys = list(merged_rem.keys())
+            total_rem = merged_rem[keys[0]].shape[0]
+
+            # Produce full files from merged remainders
+            offset = 0
+            while offset + rows_per_file <= total_rem:
+                chunk = {key: merged_rem[key][offset:offset + rows_per_file] for key in keys}
+                arrays = joint_shuffle([chunk[k] for k in keys])
+                chunk = dict(zip(keys, arrays))
+                out_path = os.path.join(out_dir, f"data{next_file_idx}.npz")
+                np.savez_compressed(out_path, **chunk)
+                all_written.append((out_path, rows_per_file))
+                next_file_idx += 1
+                offset += rows_per_file
+
+            # Final remainder
+            final_rem_rows = total_rem - offset
+            if final_rem_rows > 0:
+                if keep_remainder:
+                    remainder = {key: merged_rem[key][offset:] for key in keys}
+                    print(f"  Remainder: {final_rem_rows} rows -> train", flush=True)
+                else:
+                    chunk = {key: merged_rem[key][offset:] for key in keys}
+                    arrays = joint_shuffle([chunk[k] for k in keys])
+                    chunk = dict(zip(keys, arrays))
+                    out_path = os.path.join(out_dir, f"data{next_file_idx}.npz")
+                    np.savez_compressed(out_path, **chunk)
+                    all_written.append((out_path, final_rem_rows))
+
+    # Cleanup temp files
+    shutil.rmtree(remainder_dir, ignore_errors=True)
+    if extra_rows_path and os.path.exists(extra_rows_path):
+        os.remove(extra_rows_path)
+
+    # Sort by file path for consistent ordering
+    all_written.sort(key=lambda x: x[0])
+
+    return all_written, remainder
+
+
 class Timer:
     def __init__(self, desc):
         self.desc = desc
@@ -351,7 +584,7 @@ def select_val_files_fixed(file_rows, val_num_files, rows_per_file):
 
 def process_split(split, num_processes, rows_per_file, worker_group_size,
                   keep_remainder=False, extra_rows=None):
-    """Process a single split: shardify + sequential merge-repack + index.json.
+    """Process a single split: shardify + parallel merge-repack + index.json.
 
     Args:
         split: SplitConfig with file_rows populated.
@@ -430,15 +663,17 @@ def process_split(split, num_processes, rows_per_file, worker_group_size,
         num_worker_groups = 0
         total_sharded = 0
 
-    # Stage 2: Sequential merge + repack
-    with Timer(f"Merge+repack ({split.name})"):
-        written_files, remainder = sequential_merge_repack(
+    # Stage 2: Parallel merge + repack
+    with Timer(f"Parallel merge+repack ({split.name})"):
+        written_files, remainder = parallel_merge_repack(
             num_shards=num_worker_groups,
             out_tmp_dirs=out_tmp_dirs,
             out_dir=split.out_dir,
             rows_per_file=rows_per_file,
+            num_processes=num_processes,
             keep_remainder=keep_remainder,
             extra_rows=extra_rows,
+            tmp_base_dir=split.tmp_dir,
         )
 
     # Write index.json
