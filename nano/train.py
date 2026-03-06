@@ -331,13 +331,9 @@ def main(rank, world_size, args, gpu_id):
             continue
         if p.dim() < 2 or name.endswith("layer_norm_weight") or name.endswith("layer_norm_bias"):
             no_decay_params[name] = p
-        elif args.muon_scope == "all":
+        elif args.optimizer == "muon" and "blocks." in name:
             muon_params[name] = p
-        elif args.muon_scope == "blocks" and "blocks." in name:
-            muon_params[name] = p
-        elif args.shampoo_scope == "all":
-            shampoo_params[name] = p
-        elif args.shampoo_scope == "blocks" and "blocks." in name:
+        elif args.optimizer == "shampoo" and "blocks." in name:
             shampoo_params[name] = p
         else:
             adam_params[name] = p
@@ -363,9 +359,7 @@ def main(rank, world_size, args, gpu_id):
     if gpu_peak_tflops > 0:
         logging.info(f"GPU BF16 peak: {gpu_peak_tflops:.1f} TFLOPS")
 
-    # Head-wise polar_express / preconditioner for QKV projections
-    muon_num_heads = model_config["num_heads"] if args.muon_headwise else 0
-    shampoo_num_heads = model_config["num_heads"] if args.shampoo_headwise else 0
+    num_heads = model_config["num_heads"]
 
     # Optimizers: ZeRO Stage 1 when multi-GPU, plain otherwise
     if world_size > 1:
@@ -375,16 +369,16 @@ def main(rank, world_size, args, gpu_id):
         )
         inner_optimizer = zero_adam.optimizer
         muon_opt = ZeROMuon(
-            muon_params, lr_multiplier=args.muon_lr_multiplier,
-            momentum=args.muon_momentum, wd=args.wd,
+            muon_params, lr_multiplier=0.2,
+            momentum=0.95, wd=args.wd,
             device=device, rank=rank, world_size=world_size, use_te=args.use_te,
-            num_heads=muon_num_heads,
+            num_heads=num_heads,
         ) if muon_params else None
         shampoo_opt = ZeROShampoo(
             shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
-            momentum=args.shampoo_momentum, wd=args.wd, beta2=args.shampoo_beta2,
+            momentum=0.9, wd=args.wd, beta2=0.95,
             device=device, rank=rank, world_size=world_size, use_te=args.use_te,
-            num_heads=shampoo_num_heads,
+            num_heads=num_heads,
         ) if shampoo_params else None
     else:
         zero_adam = None
@@ -395,14 +389,14 @@ def main(rank, world_size, args, gpu_id):
             adam_param_groups.append({"params": list(adam_params.values()), "weight_decay": args.wd})
         inner_optimizer = torch.optim.AdamW(adam_param_groups, lr=args.lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
         muon_opt = MuonOptimizer(
-            muon_params, lr_multiplier=args.muon_lr_multiplier,
-            momentum=args.muon_momentum, wd=args.wd, device=device, use_te=args.use_te,
-            num_heads=muon_num_heads,
+            muon_params, lr_multiplier=0.2,
+            momentum=0.95, wd=args.wd, device=device, use_te=args.use_te,
+            num_heads=num_heads,
         ) if muon_params else None
         shampoo_opt = ShampooOptimizer(
             shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
-            momentum=args.shampoo_momentum, wd=args.wd, beta2=args.shampoo_beta2, device=device,
-            use_te=args.use_te, num_heads=shampoo_num_heads,
+            momentum=0.9, wd=args.wd, beta2=0.95, device=device,
+            use_te=args.use_te, num_heads=num_heads,
         ) if shampoo_params else None
 
     # Restore optimizer state
@@ -949,19 +943,9 @@ if __name__ == "__main__":
     parser.add_argument("--num-heads", type=int, default=6, help="Number of attention heads")
     parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate")
     parser.add_argument("--wd", type=float, default=0.1, help="Weight decay")
-    parser.add_argument("--muon-scope", type=str, default="off", choices=["all", "blocks", "off"],
-                        help="Muon scope: all=all 2D non-norm params, blocks=only blocks.* params, off=pure AdamW")
-    parser.add_argument("--muon-momentum", type=float, default=0.95, help="Muon momentum beta")
-    parser.add_argument("--muon-lr-multiplier", type=float, default=0.2, help="Muon LR multiplier over base lr")
-    parser.add_argument("--muon-headwise", action="store_true",
-                        help="Head-wise polar_express for QKV in Muon")
-    parser.add_argument("--shampoo-scope", type=str, default="off", choices=["all", "blocks", "off"],
-                        help="Shampoo scope: all=all 2D non-norm params, blocks=only blocks.* params, off=disabled")
+    parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "muon", "shampoo"],
+                        help="Optimizer: adam (pure AdamW), muon (Muon for blocks + AdamW), shampoo (Shampoo for blocks + AdamW)")
     parser.add_argument("--shampoo-lr-multiplier", type=float, default=2.0, help="Shampoo LR multiplier over base lr")
-    parser.add_argument("--shampoo-momentum", type=float, default=0.9, help="Shampoo momentum beta")
-    parser.add_argument("--shampoo-beta2", type=float, default=0.95, help="Shampoo L/R EMA coefficient")
-    parser.add_argument("--shampoo-headwise", action="store_true",
-                        help="Head-wise preconditioner for QKV in Shampoo")
     parser.add_argument("--init-std", type=float, default=0.02, help="Init std for weights (Megatron-LM style)")
     parser.add_argument("--max-training-samples", type=int, default=100000000, help="Total training samples")
     parser.add_argument("--save-every-samples", type=int, default=1000000, help="Save checkpoint every N samples")
@@ -1001,8 +985,6 @@ if __name__ == "__main__":
         parser.error("--grad-accum-steps must be >= 1")
     if args.print_every < 1:
         parser.error("--print-every must be >= 1")
-    if args.muon_scope != "off" and args.shampoo_scope != "off":
-        parser.error("muon-scope and shampoo-scope cannot both be enabled. Set one to 'off'.")
     if args.symmetry_type == "all" and args.batch_size % 8 != 0:
         parser.error("--batch-size must be divisible by 8 when --symmetry-type is 'all'")
 
