@@ -165,8 +165,6 @@ def compute_split_info(name, m, n, use_te=False, num_heads=0):
         if any(tag in name for tag in ("q_proj", "k_proj", "v_proj",
                                         "query_weight", "key_weight", "value_weight")):
             return (num_heads, m // num_heads, n, False)
-        if "out_proj" in name or "self_attention.proj" in name:
-            return (num_heads, m, n // num_heads, True)
     return (1, m, n, False)
 
 
