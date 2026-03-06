@@ -28,7 +28,7 @@ import atexit
 import configs
 import data as data_processing
 from optimizers import MuonOptimizer, ShampooOptimizer
-from zero import ZeROAdamW, ZeROMuon, ZeROShampoo, sync_zero_params, reduce_zero_grads
+from zero import ZeROAdamW, ZeROMuon, ZeROShampoo, sync_zero_params, reduce_zero_grads, ZeROGradReducer
 from losses import compute_loss, postprocess_and_loss_core, _METRIC_KEYS, estimate_forward_flops, get_gpu_peak_tflops
 
 
@@ -453,6 +453,14 @@ def main(rank, world_size, args, gpu_id):
             logging.info("EMA state loaded")
         elif ema is not None:
             logging.info("No EMA state in checkpoint, initialized from current params")
+    # ZeRO gradient reducer: overlap reduce with backward
+    if dp_zero and args.overlap_reduce:
+        grad_reducer = ZeROGradReducer(
+            [zero_adam, muon_opt, shampoo_opt], model, rank=rank, world_size=world_size,
+        )
+    else:
+        grad_reducer = None
+
     # LR schedule: linear warmup + cosine decay
     grad_accum_steps = args.grad_accum_steps
     samples_per_step = batch_size * world_size * grad_accum_steps
@@ -728,6 +736,8 @@ def main(rank, world_size, args, gpu_id):
                 profiler.tick("loss")
 
                 # Scale loss for gradient averaging across accumulation steps
+                if grad_reducer is not None and is_last_micro:
+                    grad_reducer.enable()
                 (loss / grad_accum_steps).backward()
             profiler.tick("bwd")
 
@@ -757,7 +767,10 @@ def main(rank, world_size, args, gpu_id):
                 accum_moving_weight = 0.0
 
                 # In zero dp-mode, reduce gradients to owner ranks before clipping.
-                if dp_zero:
+                if grad_reducer is not None:
+                    grad_reducer.finalize()
+                    profiler.tick("reduce")
+                elif dp_zero:
                     reduce_zero_grads([zero_adam, muon_opt, shampoo_opt], rank=rank, world_size=world_size)
                     profiler.tick("reduce")
 
@@ -966,6 +979,8 @@ if __name__ == "__main__":
     parser.add_argument("--disable-optimistic-policy", action="store_true", help="Disable optimistic policy")
     parser.add_argument("--dp-mode", type=str, default="ddp", choices=["ddp", "zero"],
                         help="Data parallel mode: ddp (standard DDP) or zero (manual gradient reduce, saves memory)")
+    parser.add_argument("--overlap-reduce", action="store_true",
+                        help="Overlap gradient reduce with backward (ZeRO mode only)")
     parser.add_argument("--multi-gpus", type=str, default=None, help="Comma-separated GPU device ids for DDP (e.g. 0,1,2,3)")
     parser.add_argument("--master-port", type=int, default=23456, help="Localhost port for DDP communication")
     parser.add_argument("--prefetch-batches", type=int, default=64, help="Prefetch queue depth (0=off)")

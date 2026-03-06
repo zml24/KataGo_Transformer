@@ -1,6 +1,7 @@
 """ZeRO Stage 1: optimizer state partitioning across GPUs."""
 
 import logging
+from collections import defaultdict
 
 import torch
 import torch.distributed as dist
@@ -468,3 +469,246 @@ class ZeROShampoo:
     def load_state_distributed(self, saved_state, device):
         if self._local_opt is not None:
             self._local_opt.load_state_dict(saved_state, device)
+
+
+# ---------------------------------------------------------------------------
+# ZeROGradReducer: overlap gradient reduce with backward computation
+# ---------------------------------------------------------------------------
+class ZeROGradReducer:
+    """Overlap gradient reduction with backward pass using post-accumulate-grad hooks.
+
+    Two-phase strategy:
+    - warmup: record true gradient ready order, fall back to sync _coalesced_reduce.
+    - steady state: use recorded order to build buckets, launch async reduce as
+      buckets become ready during backward.
+    """
+
+    def __init__(self, optimizers, model, rank, world_size, bucket_size_mb=25, debug=False):
+        self._rank = rank
+        self._world_size = world_size
+        self._bucket_size_bytes = bucket_size_mb * 1024 * 1024
+        self._debug = debug
+        self._debug_step_count = 0
+
+        # Merge partitions (same validation as reduce_zero_grads)
+        self._merged = [{} for _ in range(world_size)]
+        for opt in optimizers:
+            if opt is None:
+                continue
+            parts = opt.partitions
+            if len(parts) != world_size:
+                raise ValueError("Inconsistent world_size across ZeRO optimizers")
+            for r in range(world_size):
+                for name, p in parts[r].items():
+                    if name in self._merged[r]:
+                        raise ValueError(f"Parameter '{name}' appears in multiple ZeRO optimizers on rank {r}")
+                    self._merged[r][name] = p
+
+        # Build param_id -> owner_rank mapping, register hooks only on managed params
+        self._param_to_owner = {}
+        self._all_managed_ids = set()
+        self._id_to_param = {}
+        self._hooks = []
+        for r in range(world_size):
+            for name, p in self._merged[r].items():
+                pid = id(p)
+                self._param_to_owner[pid] = r
+                self._all_managed_ids.add(pid)
+                self._id_to_param[pid] = p
+                handle = p.register_post_accumulate_grad_hook(self._grad_hook)
+                self._hooks.append(handle)
+
+        # State
+        self._enabled = False
+        self._warmup_done = False
+        self._recording_order = []
+        self._observed_dtypes = {}
+
+    def _grad_hook(self, p):
+        if not self._enabled:
+            return
+        pid = id(p)
+        if not self._warmup_done:
+            self._recording_order.append(pid)
+            self._observed_dtypes[pid] = (p.device, p.grad.dtype)
+            return
+        # Steady state: check if this param completes a bucket
+        bucket_idx = self._param_to_bucket_idx.get(pid)
+        if bucket_idx is None:
+            return
+        self._pending[bucket_idx] -= 1
+        if self._pending[bucket_idx] == 0:
+            self._launch_bucket(bucket_idx)
+
+    def _launch_bucket(self, bucket_idx):
+        owner, params = self._buckets[bucket_idx]
+        flat = torch.cat([p.grad.detach().reshape(-1) for p in params]).contiguous()
+        # Free original grads immediately on all ranks
+        for p in params:
+            p.grad = None
+        work = dist.reduce(flat, dst=owner, op=dist.ReduceOp.AVG, async_op=True)
+        self._flat_buffers[bucket_idx] = flat
+        self._works[bucket_idx] = work
+        if self._debug:
+            self._debug_launch_seq.append((bucket_idx, "async"))
+
+    def enable(self):
+        """Call before the last micro-step's backward pass."""
+        self._enabled = True
+        if self._warmup_done:
+            self._pending = list(self._initial_pending)
+            self._flat_buffers = [None] * len(self._buckets)
+            self._works = [None] * len(self._buckets)
+            self._finalize_params = {}
+            if self._debug:
+                self._debug_launch_seq = []
+        else:
+            self._recording_order = []
+            self._observed_dtypes = {}
+
+    def finalize(self):
+        """Call after backward completes. Waits for async ops, unpacks grads to owners."""
+        self._enabled = False
+
+        if not self._warmup_done:
+            # Warmup: sync reduce (reuse existing _coalesced_reduce)
+            _coalesced_reduce(self._merged, self._rank, self._world_size)
+            # Validate: all managed params observed?
+            observed = set(self._recording_order)
+            missing = self._all_managed_ids - observed
+            if missing:
+                logging.warning(
+                    f"ZeROGradReducer: {len(missing)} params not observed in warmup, "
+                    "staying in sync mode"
+                )
+                return  # _warmup_done stays False
+            self._rebuild_buckets()
+            self._warmup_done = True
+            return
+
+        # Steady state:
+        # 1. Fallback: sync reduce for buckets not yet launched
+        for bucket_idx in range(len(self._buckets)):
+            if self._works[bucket_idx] is not None:
+                continue  # Already launched async
+            owner, params = self._buckets[bucket_idx]
+            graded = [p for p in params if p.grad is not None]
+            if not graded:
+                continue
+            flat = torch.cat([p.grad.detach().reshape(-1) for p in graded]).contiguous()
+            for p in graded:
+                p.grad = None
+            dist.reduce(flat, dst=owner, op=dist.ReduceOp.AVG)  # sync
+            self._flat_buffers[bucket_idx] = flat
+            self._works[bucket_idx] = "sync"
+            self._finalize_params[bucket_idx] = graded
+            if self._debug:
+                self._debug_launch_seq.append((bucket_idx, "sync"))
+
+        # 2. Wait for all async ops in bucket order
+        for bucket_idx in range(len(self._buckets)):
+            work = self._works[bucket_idx]
+            if work is not None and work != "sync":
+                work.wait()
+
+        # 3. Unpack: owner rank writes reduced grads back to p.grad
+        for bucket_idx in range(len(self._buckets)):
+            flat = self._flat_buffers[bucket_idx]
+            if flat is None:
+                continue
+            owner, params = self._buckets[bucket_idx]
+            actual_params = self._finalize_params.get(bucket_idx, params)
+            if self._rank == owner:
+                with torch.no_grad():
+                    offset = 0
+                    for p in actual_params:
+                        numel = p.numel()
+                        p.grad = flat[offset:offset + numel].reshape_as(p)
+                        offset += numel
+
+        # 4. Debug: check NCCL call sequence consistency
+        if self._debug:
+            self._debug_step_count += 1
+            if self._debug_step_count <= 3:
+                logging.info(
+                    f"ZeROGradReducer rank {self._rank} step {self._debug_step_count} "
+                    f"nccl seq: {self._debug_launch_seq}"
+                )
+            if hasattr(self, '_prev_launch_seq') and self._debug_launch_seq != self._prev_launch_seq:
+                logging.warning(
+                    f"ZeROGradReducer rank {self._rank}: NCCL call sequence changed "
+                    f"at step {self._debug_step_count}! prev={self._prev_launch_seq} "
+                    f"curr={self._debug_launch_seq}"
+                )
+            self._prev_launch_seq = list(self._debug_launch_seq)
+
+        # 5. Cleanup
+        self._flat_buffers = [None] * len(self._buckets)
+        self._works = [None] * len(self._buckets)
+        self._finalize_params = {}
+
+    def _rebuild_buckets(self):
+        """Build buckets from warmup-recorded gradient ready order."""
+        # Deduplicate, preserving first-seen order
+        seen = set()
+        ordered_ids = []
+        for pid in self._recording_order:
+            if pid not in seen:
+                seen.add(pid)
+                ordered_ids.append(pid)
+
+        # Group by (owner, device, grad_dtype), ordered by warmup first appearance
+        groups = defaultdict(list)       # (owner, device, dtype) -> [param, ...]
+        group_first_seen = {}            # (owner, device, dtype) -> first index
+        for i, pid in enumerate(ordered_ids):
+            p = self._id_to_param[pid]
+            owner = self._param_to_owner[pid]
+            dev, dtype = self._observed_dtypes[pid]
+            key = (owner, dev, dtype)
+            groups[key].append(p)
+            if key not in group_first_seen:
+                group_first_seen[key] = i
+
+        # Sort groups by warmup first appearance (avoids comparing torch.device/dtype)
+        sorted_keys = sorted(groups.keys(), key=lambda k: group_first_seen[k])
+
+        # Split into buckets
+        bucket_size_bytes = self._bucket_size_bytes
+        self._buckets = []
+        self._param_to_bucket_idx = {}
+        for key in sorted_keys:
+            params = groups[key]
+            owner = key[0]
+            grad_dtype = key[2]
+            grad_elem_size = torch.empty((), dtype=grad_dtype).element_size()
+            current = []
+            current_bytes = 0
+            for p in params:
+                current.append(p)
+                current_bytes += p.numel() * grad_elem_size
+                if current_bytes >= bucket_size_bytes:
+                    idx = len(self._buckets)
+                    self._buckets.append((owner, current))
+                    for bp in current:
+                        self._param_to_bucket_idx[id(bp)] = idx
+                    current = []
+                    current_bytes = 0
+            if current:
+                idx = len(self._buckets)
+                self._buckets.append((owner, current))
+                for bp in current:
+                    self._param_to_bucket_idx[id(bp)] = idx
+
+        self._initial_pending = [len(params) for (_, params) in self._buckets]
+        self._finalize_params = {}
+
+        logging.info(
+            f"ZeROGradReducer rank {self._rank}: warmup done, "
+            f"{len(self._buckets)} buckets from {len(ordered_ids)} params"
+        )
+
+    def remove_hooks(self):
+        """Remove all registered gradient hooks."""
+        for handle in self._hooks:
+            handle.remove()
+        self._hooks.clear()
