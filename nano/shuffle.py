@@ -295,6 +295,10 @@ def merge_one_bucket(bucket_idx, tmp_dir, num_shards, out_dir,
                      extra_rows_path=None):
     """Merge all shard files in one bucket, write output files, save remainder.
 
+    Uses streaming buffer: loads one shard at a time and flushes when the buffer
+    reaches rows_per_file, so memory stays O(rows_per_file + single_shard_size)
+    instead of O(entire_bucket_size).
+
     Args:
         bucket_idx: Index of this bucket (for logging).
         tmp_dir: The temp directory for this bucket (e.g., tmp.shuf3/).
@@ -312,16 +316,42 @@ def merge_one_bucket(bucket_idx, tmp_dir, num_shards, out_dir,
     """
     np.random.seed([int.from_bytes(os.urandom(4), byteorder="little") for _ in range(5)])
 
-    all_data = {}
-    total_rows = 0
+    buffer = {}  # key -> list of arrays
+    buffer_rows = 0
+    file_idx = out_file_idx
+    written_files = []
+
+    def flush_buffer(n_rows):
+        nonlocal buffer, buffer_rows, file_idx
+
+        merged = {key: np.concatenate(arrs) for key, arrs in buffer.items()}
+        keys = list(merged.keys())
+
+        take = {key: merged[key][:n_rows] for key in keys}
+        remain = {key: merged[key][n_rows:] for key in keys}
+
+        arrays = joint_shuffle([take[k] for k in keys])
+        take = dict(zip(keys, arrays))
+
+        out_path = os.path.join(out_dir, f"data{file_idx}.npz")
+        np.savez_compressed(out_path, **take)
+        written_files.append((out_path, n_rows))
+        file_idx += 1
+
+        remain_rows = remain[keys[0]].shape[0]
+        if remain_rows > 0:
+            buffer = {key: [arr] for key, arr in remain.items()}
+        else:
+            buffer = {}
+        buffer_rows = remain_rows
 
     # Inject extra rows (e.g. val remainder) if provided
     if extra_rows_path is not None and os.path.exists(extra_rows_path):
         with np.load(extra_rows_path) as npz:
             for key in npz.keys():
-                all_data[key] = [npz[key]]
-            total_rows = npz["binaryInputNCHWPacked"].shape[0]
-            print(f"  Bucket {bucket_idx}: injected {total_rows} extra rows", flush=True)
+                buffer[key] = [npz[key]]
+            buffer_rows = npz["binaryInputNCHWPacked"].shape[0]
+            print(f"  Bucket {bucket_idx}: injected {buffer_rows} extra rows", flush=True)
 
     # Read all shard files in this bucket (randomized order)
     shard_files = []
@@ -335,44 +365,24 @@ def merge_one_bucket(bucket_idx, tmp_dir, num_shards, out_dir,
         try:
             with np.load(path) as npz:
                 for key in npz.keys():
-                    if key not in all_data:
-                        all_data[key] = []
-                    all_data[key].append(npz[key])
-                total_rows += npz["binaryInputNCHWPacked"].shape[0]
+                    if key not in buffer:
+                        buffer[key] = []
+                    buffer[key].append(npz[key])
+                buffer_rows += npz["binaryInputNCHWPacked"].shape[0]
         except Exception as e:
             print(f"WARNING: error reading shard {path}: {e}")
             continue
 
-    if total_rows == 0:
-        return [], 0
-
-    # Concatenate all data
-    merged = {key: np.concatenate(arrs) for key, arrs in all_data.items()}
-    keys = list(merged.keys())
-
-    # Write full output files
-    written_files = []
-    file_idx = out_file_idx
-    offset = 0
-
-    while offset + rows_per_file <= total_rows:
-        chunk = {key: merged[key][offset:offset + rows_per_file] for key in keys}
-        arrays = joint_shuffle([chunk[k] for k in keys])
-        chunk = dict(zip(keys, arrays))
-
-        out_path = os.path.join(out_dir, f"data{file_idx}.npz")
-        np.savez_compressed(out_path, **chunk)
-        written_files.append((out_path, rows_per_file))
-        file_idx += 1
-        offset += rows_per_file
+        # Flush as buffer accumulates
+        while buffer_rows >= rows_per_file:
+            flush_buffer(rows_per_file)
 
     # Save remainder to temp file (avoid pickling large arrays through IPC)
-    remainder_rows = total_rows - offset
-    if remainder_rows > 0:
-        remainder = {key: merged[key][offset:] for key in keys}
+    if buffer_rows > 0:
+        remainder = {key: np.concatenate(arrs) for key, arrs in buffer.items()}
         np.savez(remainder_path, **remainder)  # uncompressed, temp file
 
-    return written_files, remainder_rows
+    return written_files, buffer_rows
 
 
 def parallel_merge_repack(num_shards, out_tmp_dirs, out_dir, rows_per_file,
