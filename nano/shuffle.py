@@ -190,7 +190,7 @@ def shardify(input_idx, file_group, num_out_files, out_tmp_dirs):
             continue
         shard = {key: merged[key][start:stop] for key in keys}
         out_path = os.path.join(out_tmp_dirs[out_idx], f"{input_idx}.npz")
-        np.savez(out_path, **shard)  # uncompressed: temp files, deleted after merge
+        np.savez_compressed(out_path, **shard)
 
     return num_rows
 
@@ -614,8 +614,10 @@ def process_split(split, num_processes, rows_per_file, worker_group_size,
 
     os.makedirs(split.out_dir)
 
-    # Number of intermediate shard buckets (only affects shardify parallelism)
-    num_shards_buckets = max(1, round(total_rows / rows_per_file)) if total_rows > 0 else 1
+    # Use fewer, larger buckets so each produces many full output files.
+    # This keeps the serial remainder phase small (≈ num_buckets × rows_per_file / 2).
+    num_output_files = max(1, round(total_rows / rows_per_file)) if total_rows > 0 else 1
+    num_shards_buckets = min(num_output_files, max(1, num_processes * 2))
     out_tmp_dirs = [os.path.join(split.tmp_dir, f"tmp.shuf{i}") for i in range(num_shards_buckets)]
 
     print(f"  Intermediate shard buckets: {num_shards_buckets}", flush=True)
