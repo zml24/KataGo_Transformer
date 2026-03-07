@@ -56,7 +56,10 @@ class TEOfficialExportWrapper(nn.Module):
         self.model = model
 
     def forward(self, input_spatial, input_global):
-        return self.model.forward_for_onnx_export(input_spatial, input_global)
+        export_forward = getattr(self.model, "forward_for_onnx_export", None)
+        if export_forward is None:
+            return self.model(input_spatial, input_global)
+        return export_forward(input_spatial, input_global)
 
 
 def _load_checkpoint(args):
@@ -185,6 +188,12 @@ def _make_legacy_fallback_args(args):
     return fallback_args
 
 
+def _make_te_decomposed_fallback_args(args):
+    fallback_args = argparse.Namespace(**vars(args))
+    fallback_args.method = "te-decomposed"
+    return fallback_args
+
+
 def _export_legacy(args, state, config):
     model_state = _resolve_model_state(state, args.use_ema)
     if args.use_te:
@@ -276,14 +285,96 @@ def _export_te_official(args, state, config):
     return output_path, wrapper, input_spatial, input_global
 
 
+def _export_te_decomposed(args, state, config):
+    te, te_onnx_export, te_translation_table = _resolve_te_support()
+    from model_te import (
+        ModelDecomposedExport,
+        convert_checkpoint_model_to_te_decomposed,
+        convert_checkpoint_te_to_model,
+        detect_checkpoint_format,
+    )
+
+    device = _resolve_te_device(args.device)
+    model_state = _resolve_model_state(state, args.use_ema)
+    if detect_checkpoint_format(model_state) == "te":
+        print("Converting TE checkpoint to model.py format for decomposed TE ONNX export")
+        model_state = convert_checkpoint_te_to_model(model_state)
+
+    model_state = convert_checkpoint_model_to_te_decomposed(model_state)
+    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode)
+    load_result = model.load_state_dict(model_state, strict=False)
+    _validate_te_load_result(load_result)
+    model.eval()
+    model.to(device)
+    _print_param_count(model)
+
+    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device=device)
+    wrapper = TEOfficialExportWrapper(model).eval()
+    output_path = _resolve_output_path(args)
+
+    export_kwargs = {
+        "input_names": INPUT_NAMES,
+        "output_names": OUTPUT_NAMES,
+        "dynamo": True,
+        "fallback": False,
+        "custom_translation_table": te_translation_table,
+    }
+    if args.dynamic_batch:
+        export_kwargs["dynamic_shapes"] = _te_dynamic_shapes()
+    if args.opset is not None:
+        export_kwargs["opset_version"] = args.opset
+
+    print("Running one decomposed TE eager forward pass before export ...")
+    with torch.no_grad(), te.autocast(enabled=False):
+        wrapper(input_spatial, input_global)
+
+    opset_desc = f"opset {args.opset}" if args.opset is not None else "PyTorch default opset"
+    print(f"Exporting ONNX with decomposed Transformer Engine exporter ({opset_desc}) ...")
+    with torch.no_grad(), te.autocast(enabled=False):
+        with te_onnx_export(enabled=True):
+            torch.onnx.export(
+                wrapper,
+                (input_spatial, input_global),
+                output_path,
+                **export_kwargs,
+            )
+
+    _save_summary(output_path)
+    return output_path, wrapper, input_spatial, input_global
+
+
 def export(args):
     state, config = _load_checkpoint(args)
     if args.method == "legacy":
         return _export_legacy(args, state, config)
+    if args.method == "te-decomposed":
+        try:
+            return _export_te_decomposed(args, state, config)
+        except RuntimeError as exc:
+            if getattr(args, "fallback_to_legacy_on_te_export_error", False):
+                print("\nWARNING: te-decomposed export failed, falling back to legacy export.")
+                print(f"  original error: {exc}")
+                return _export_legacy(_make_legacy_fallback_args(args), state, config)
+            raise
     if args.method == "te-official":
         try:
             return _export_te_official(args, state, config)
         except RuntimeError as exc:
+            if getattr(args, "fallback_to_te_decomposed_on_te_export_error", False):
+                print("\nWARNING: te-official export failed, falling back to decomposed TE export.")
+                print(f"  original error: {exc}")
+                try:
+                    return _export_te_decomposed(_make_te_decomposed_fallback_args(args), state, config)
+                except RuntimeError as decomposed_exc:
+                    if getattr(args, "fallback_to_legacy_on_te_export_error", False):
+                        print("\nWARNING: te-decomposed export failed, falling back to legacy export.")
+                        print(f"  original error: {decomposed_exc}")
+                        return _export_legacy(_make_legacy_fallback_args(args), state, config)
+                    raise RuntimeError(
+                        "Both te-official and te-decomposed exports failed.\n"
+                        f"te-official error: {exc}\n"
+                        f"te-decomposed error: {decomposed_exc}"
+                    ) from decomposed_exc
             if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                 print("\nWARNING: te-official export failed, falling back to legacy export.")
                 print(f"  original error: {exc}")
@@ -333,8 +424,8 @@ def main():
     parser = argparse.ArgumentParser(description="Export KataGo nano model to ONNX")
     parser.add_argument("--checkpoint", required=True, help="Path to checkpoint.ckpt")
     parser.add_argument("--output", default=None, help="Output .onnx path (default: <checkpoint_dir>/model.onnx)")
-    parser.add_argument("--method", type=str, default="legacy", choices=["legacy", "te-official"],
-                        help="Export method: legacy=model.py path, te-official=Transformer Engine official ONNX export")
+    parser.add_argument("--method", type=str, default="legacy", choices=["legacy", "te-official", "te-decomposed"],
+                        help="Export method: legacy=model.py path, te-official=Transformer Engine official ONNX export, te-decomposed=TE modules with manual RoPE")
     parser.add_argument("--device", default=None,
                         help="Torch device for te-official export (default: cuda if available)")
     parser.add_argument("--pos-len", type=int, default=19, help="Board size (default: 19)")
@@ -347,8 +438,10 @@ def main():
     parser.add_argument("--verify", action="store_true", help="Verify exported model with onnxruntime")
     parser.add_argument("--ort-provider", type=str, default="CPUExecutionProvider",
                         help="onnxruntime provider used by --verify (default: CPUExecutionProvider)")
+    parser.add_argument("--fallback-to-te-decomposed-on-te-export-error", action="store_true",
+                        help="If te-official export fails, retry with a decomposed TE export path that applies RoPE via plain PyTorch ops")
     parser.add_argument("--fallback-to-legacy-on-te-export-error", action="store_true",
-                        help="If te-official export fails, fall back to legacy export by converting the checkpoint to model.py format")
+                        help="If TE-based export fails, fall back to legacy export by converting the checkpoint to model.py format")
     parser.add_argument("--use-te", action="store_true",
                         help="Legacy exporter only: checkpoint is from TE model and should be converted to model.py first")
     parser.add_argument("--use-ema", action="store_true",

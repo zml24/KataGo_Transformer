@@ -28,6 +28,7 @@ from configs import get_num_bin_input_features, get_num_global_input_features
 from model import (
     EXTRA_SCORE_DISTR_RADIUS,
     SoftPlusWithGradientFloor,
+    apply_rotary_emb,
     cross_entropy,
     precompute_freqs_cos_sin_2d,
     PolicyHead,
@@ -67,6 +68,47 @@ class TransformerBlockTE(nn.Module):
         rope: (L, 1, 1, dim_half) raw RoPE embeddings for TE
         """
         return self.layer(x, rotary_pos_emb=rope)
+
+
+class TransformerBlockTEDecomposed(nn.Module):
+    """Export-only TE block with manual RoPE outside TE custom fused kernels."""
+
+    def __init__(self, c_main: int, num_heads: int, ffn_dim: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = c_main // num_heads
+        self.ln_qkv = te.LayerNormLinear(
+            c_main,
+            3 * c_main,
+            eps=1e-6,
+            bias=False,
+            normalization="RMSNorm",
+        )
+        self.attention = te.DotProductAttention(
+            num_attention_heads=num_heads,
+            kv_channels=self.head_dim,
+            attention_dropout=0.0,
+            attn_mask_type="no_mask",
+            qkv_format="bshd",
+        )
+        self.proj = te.Linear(c_main, c_main, bias=False)
+        self.ln_mlp = te.LayerNormMLP(
+            c_main,
+            ffn_dim,
+            eps=1e-6,
+            bias=False,
+            normalization="RMSNorm",
+            activation="swiglu",
+        )
+
+    def forward(self, x, rope_cos, rope_sin):
+        batch_size, seq_len, _ = x.shape
+        residual = x
+        qkv = self.ln_qkv(x).view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
+        x = residual + self.proj(self.attention(q, k, v))
+        return x + self.ln_mlp(x)
 
 
 def _replace_nn_linear_with_te(module):
@@ -257,6 +299,77 @@ class Model(nn.Module):
         )
 
 
+class ModelDecomposedExport(nn.Module):
+    """Export-only TE model that keeps TE modules but applies RoPE via plain PyTorch ops."""
+
+    def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop"):
+        super().__init__()
+        self.config = config
+        self.pos_len = pos_len
+        self.c_trunk = config["hidden_size"]
+        num_bin_features = get_num_bin_input_features(config)
+        num_global_features = get_num_global_input_features(config)
+
+        num_heads = config["num_heads"]
+        ffn_dim = config["ffn_dim"]
+        head_dim = self.c_trunk // num_heads
+
+        self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
+        self.linear_global = te.Linear(num_global_features, self.c_trunk, bias=False)
+
+        emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)
+        emb_expanded = torch.cat([emb, emb], dim=-1)
+        self.register_buffer("rope_cos", emb_expanded.cos(), persistent=False)
+        self.register_buffer("rope_sin", emb_expanded.sin(), persistent=False)
+
+        self.blocks = nn.ModuleList([
+            TransformerBlockTEDecomposed(
+                c_main=self.c_trunk,
+                num_heads=num_heads,
+                ffn_dim=ffn_dim,
+            )
+            for _ in range(config["num_layers"])
+        ])
+        self.norm_final = te.RMSNorm(self.c_trunk, eps=1e-6)
+
+        num_scorebeliefs = config["num_scorebeliefs"]
+        self.policy_head = PolicyHead(self.c_trunk, pos_len)
+        self.value_head = ValueHead(self.c_trunk, num_scorebeliefs, pos_len, score_mode=score_mode)
+        _replace_nn_linear_with_te(self.policy_head)
+        _replace_nn_linear_with_te(self.value_head)
+
+        self.moving_unowned_proportion_sum = 0.0
+        self.moving_unowned_proportion_weight = 0.0
+
+    def _run_trunk_impl(self, x):
+        for block in self.blocks:
+            x = block(x, self.rope_cos, self.rope_sin)
+        return self.norm_final(x)
+
+    def forward(self, input_spatial, input_global):
+        batch_size = input_spatial.shape[0]
+        seq_len = self.pos_len * self.pos_len
+
+        x_spatial = self.conv_spatial(input_spatial)
+        x_global = self.linear_global(input_global)
+        x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
+        x = x.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
+        x = self._run_trunk_impl(x)
+
+        out_policy = self.policy_head(x)
+        (
+            out_value, out_misc, out_moremisc,
+            out_ownership, out_scoring, out_futurepos, out_seki,
+            out_scorebelief,
+        ) = self.value_head(x, input_global[:, -1:])
+
+        return (
+            out_policy.float(), out_value.float(), out_misc.float(), out_moremisc.float(),
+            out_ownership.float(), out_scoring.float(), out_futurepos.float(), out_seki.float(),
+            out_scorebelief.float(),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint format detection and conversion
 # ---------------------------------------------------------------------------
@@ -284,6 +397,8 @@ def convert_checkpoint_model_to_te(state_dict):
             new_sd[key.replace(".norm1.norm.weight", ".layer.self_attention.layernorm_qkv.layer_norm_weight")] = value
         elif ".norm2.norm.weight" in key:
             new_sd[key.replace(".norm2.norm.weight", ".layer.layernorm_mlp.layer_norm_weight")] = value
+        elif key == "norm_final.norm.weight":
+            new_sd["norm_final.weight"] = value
         elif ".norm_final.norm.weight" in key:
             new_sd[key.replace(".norm_final.norm.weight", ".norm_final.weight")] = value
         elif ".norm1.weight" in key:
@@ -302,6 +417,47 @@ def convert_checkpoint_model_to_te(state_dict):
             new_sd[key.replace(".v_proj.weight", ".layer.self_attention.layernorm_qkv.value_weight")] = value
         elif ".out_proj.weight" in key:
             new_sd[key.replace(".out_proj.weight", ".layer.self_attention.proj.weight")] = value
+        else:
+            new_sd[key] = value
+    return new_sd
+
+
+def convert_checkpoint_model_to_te_decomposed(state_dict):
+    """Convert model.py state_dict to the export-only decomposed TE format."""
+    new_sd = {}
+    for key, value in state_dict.items():
+        if ".ffn_w1.weight" in key:
+            block_prefix = key.rsplit(".ffn_w1.weight", 1)[0]
+            wgate_key = block_prefix + ".ffn_wgate.weight"
+            new_sd[block_prefix + ".ln_mlp.fc1_weight"] = torch.cat([value, state_dict[wgate_key]], dim=0)
+        elif ".ffn_wgate.weight" in key:
+            continue
+        elif ".ffn_w2.weight" in key:
+            new_sd[key.replace(".ffn_w2.weight", ".ln_mlp.fc2_weight")] = value
+        elif ".norm1.norm.weight" in key:
+            new_sd[key.replace(".norm1.norm.weight", ".ln_qkv.layer_norm_weight")] = value
+        elif ".norm2.norm.weight" in key:
+            new_sd[key.replace(".norm2.norm.weight", ".ln_mlp.layer_norm_weight")] = value
+        elif key == "norm_final.norm.weight":
+            new_sd["norm_final.weight"] = value
+        elif ".norm_final.norm.weight" in key:
+            new_sd[key.replace(".norm_final.norm.weight", ".norm_final.weight")] = value
+        elif ".norm1.weight" in key:
+            new_sd[key.replace(".norm1.weight", ".ln_qkv.layer_norm_weight")] = value
+        elif ".norm2.weight" in key:
+            new_sd[key.replace(".norm2.weight", ".ln_mlp.layer_norm_weight")] = value
+        elif ".q_proj.weight" in key:
+            block_prefix = key.rsplit(".q_proj.weight", 1)[0]
+            qkv_weight = torch.cat([
+                value,
+                state_dict[block_prefix + ".k_proj.weight"],
+                state_dict[block_prefix + ".v_proj.weight"],
+            ], dim=0)
+            new_sd[block_prefix + ".ln_qkv.weight"] = qkv_weight
+        elif ".k_proj.weight" in key or ".v_proj.weight" in key:
+            continue
+        elif ".out_proj.weight" in key:
+            new_sd[key.replace(".out_proj.weight", ".proj.weight")] = value
         else:
             new_sd[key] = value
     return new_sd
