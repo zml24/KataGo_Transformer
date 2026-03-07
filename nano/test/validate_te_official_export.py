@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a random TransformerEngine checkpoint and validate official ONNX export.
+"""Generate a random TransformerEngine checkpoint and export ONNX in multiple modes.
 
 Usage:
     python test/validate_te_official_export.py
@@ -21,12 +21,32 @@ sys.path.insert(0, ROOT)
 import configs
 from export_onnx import export, verify
 
+DEFAULT_MODES = ["te-official", "te-decomposed", "legacy"]
 
-def _make_export_args(args, checkpoint_path, onnx_path):
+
+def _mode_slug(mode):
+    return mode.replace("-", "_")
+
+
+def _resolve_mode_artifact_path(base_path, output_dir, config_name, mode, ext, single_mode):
+    mode_suffix = _mode_slug(mode)
+    if base_path is None:
+        return os.path.join(output_dir, f"{config_name}_{mode_suffix}{ext}")
+
+    root, current_ext = os.path.splitext(base_path)
+    if not current_ext:
+        root = base_path
+        current_ext = ext
+    if single_mode:
+        return root + current_ext
+    return f"{root}_{mode_suffix}{current_ext}"
+
+
+def _make_export_args(args, checkpoint_path, onnx_path, method, enable_nested_fallbacks):
     return argparse.Namespace(
         checkpoint=checkpoint_path,
         output=onnx_path,
-        method="te-official",
+        method=method,
         device=args.device,
         pos_len=args.pos_len,
         score_mode=args.score_mode,
@@ -34,8 +54,12 @@ def _make_export_args(args, checkpoint_path, onnx_path):
         dynamic_batch=args.dynamic_batch,
         verify=False,
         ort_provider=args.ort_provider,
-        fallback_to_te_decomposed_on_te_export_error=args.fallback_to_te_decomposed_on_te_export_error,
-        fallback_to_legacy_on_te_export_error=args.fallback_to_legacy_on_te_export_error,
+        fallback_to_te_decomposed_on_te_export_error=(
+            enable_nested_fallbacks and args.fallback_to_te_decomposed_on_te_export_error
+        ),
+        fallback_to_legacy_on_te_export_error=(
+            enable_nested_fallbacks and args.fallback_to_legacy_on_te_export_error
+        ),
         use_te=False,
         use_ema=False,
     )
@@ -75,14 +99,14 @@ def _save_random_te_checkpoint(args, checkpoint_path):
     return model_config
 
 
-def _maybe_run_trtexec(args, onnx_path, engine_path, model_config):
+def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
     if args.skip_trtexec:
-        print("Skipping TensorRT build validation because --skip-trtexec was set")
+        print(f"Skipping TensorRT build validation for {mode} because --skip-trtexec was set")
         return
 
     trtexec_path = shutil.which(args.trtexec_bin)
     if trtexec_path is None:
-        print(f"Skipping TensorRT build validation because {args.trtexec_bin!r} was not found in PATH")
+        print(f"Skipping TensorRT build validation for {mode} because {args.trtexec_bin!r} was not found in PATH")
         return
 
     num_bin = configs.get_num_bin_input_features(model_config)
@@ -102,15 +126,32 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config):
         "--skipInference",
     ]
 
-    print("Running TensorRT build validation:")
+    print(f"Running TensorRT build validation for {mode}:")
     print("  " + " ".join(cmd))
     subprocess.run(cmd, check=True)
     print(f"TensorRT engine saved to: {engine_path}")
 
 
+def _verify_export(args, mode, onnx_path, model, input_spatial, input_global):
+    if not args.verify_onnxruntime:
+        return
+
+    atol = 1e-5 if mode == "legacy" else 1e-4
+    rtol = 1e-5 if mode == "legacy" else 1e-4
+    verify(
+        onnx_path,
+        model,
+        input_spatial,
+        input_global,
+        provider=args.ort_provider,
+        atol=atol,
+        rtol=rtol,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate a random TE checkpoint and validate official TE ONNX export"
+        description="Generate a random TE checkpoint and export ONNX with multiple methods"
     )
     parser.add_argument("--config", default="b24c1024", choices=list(configs.config_of_name.keys()),
                         help="Model config to generate (default: b24c1024)")
@@ -119,9 +160,11 @@ def main():
     parser.add_argument("--checkpoint", default=None,
                         help="Output checkpoint path (default: <output-dir>/<config>_te_random.ckpt)")
     parser.add_argument("--output", default=None,
-                        help="Output ONNX path (default: <output-dir>/<config>_te_official.onnx)")
+                        help="Output ONNX path. With multiple modes, mode suffixes are appended automatically")
     parser.add_argument("--engine", default=None,
-                        help="TensorRT engine path (default: <output-dir>/<config>_te_official.plan)")
+                        help="TensorRT engine path. With multiple modes, mode suffixes are appended automatically")
+    parser.add_argument("--modes", nargs="+", choices=DEFAULT_MODES, default=DEFAULT_MODES,
+                        help="Export modes to run in order (default: te-official te-decomposed legacy)")
     parser.add_argument("--device", default="cuda",
                         help="Torch device for official TE export (default: cuda)")
     parser.add_argument("--pos-len", type=int, default=19, help="Board size (default: 19)")
@@ -152,29 +195,40 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     checkpoint_path = args.checkpoint or os.path.join(args.output_dir, f"{args.config}_te_random.ckpt")
-    onnx_path = args.output or os.path.join(args.output_dir, f"{args.config}_te_official.onnx")
-    engine_path = args.engine or os.path.join(args.output_dir, f"{args.config}_te_official.plan")
-
     model_config = _save_random_te_checkpoint(args, checkpoint_path)
-    export_args = _make_export_args(args, checkpoint_path, onnx_path)
-    try:
-        onnx_path, model, input_spatial, input_global = export(export_args)
-    except RuntimeError as exc:
-        print(f"ERROR: {exc}")
-        raise SystemExit(1) from exc
+    enable_nested_fallbacks = len(args.modes) == 1
 
-    if args.verify_onnxruntime:
-        verify(
-            onnx_path,
-            model,
-            input_spatial,
-            input_global,
-            provider=args.ort_provider,
-            atol=1e-4,
-            rtol=1e-4,
+    results = []
+    for mode in args.modes:
+        onnx_path = _resolve_mode_artifact_path(
+            args.output, args.output_dir, args.config, mode, ".onnx", single_mode=enable_nested_fallbacks
+        )
+        engine_path = _resolve_mode_artifact_path(
+            args.engine, args.output_dir, args.config, mode, ".plan", single_mode=enable_nested_fallbacks
         )
 
-    _maybe_run_trtexec(args, onnx_path, engine_path, model_config)
+        print(f"\n=== Export mode: {mode} ===")
+        export_args = _make_export_args(args, checkpoint_path, onnx_path, mode, enable_nested_fallbacks)
+        try:
+            onnx_path, model, input_spatial, input_global = export(export_args)
+            _verify_export(args, mode, onnx_path, model, input_spatial, input_global)
+            _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode)
+            results.append((mode, "OK", onnx_path))
+        except RuntimeError as exc:
+            print(f"ERROR: mode {mode} failed")
+            print(exc)
+            results.append((mode, "FAILED", str(exc)))
+
+    print("\nExport summary:")
+    any_success = False
+    for mode, status, detail in results:
+        print(f"  {mode:14s} {status:7s} {detail}")
+        if status == "OK":
+            any_success = True
+
+    if not any_success:
+        raise SystemExit(1)
+
     print("Validation flow finished")
 
 
