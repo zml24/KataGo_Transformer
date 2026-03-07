@@ -9,6 +9,8 @@ Usage:
 import argparse
 import os
 import random
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -99,24 +101,95 @@ def _save_random_te_checkpoint(args, checkpoint_path):
     return model_config
 
 
-def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
-    if args.skip_trtexec:
-        print(f"Skipping TensorRT build validation for {mode} because --skip-trtexec was set")
-        return
-
-    trtexec_path = shutil.which(args.trtexec_bin)
-    if trtexec_path is None:
-        print(f"Skipping TensorRT build validation for {mode} because {args.trtexec_bin!r} was not found in PATH")
-        return
-
+def _shape_spec(args, model_config):
     num_bin = configs.get_num_bin_input_features(model_config)
     num_global = configs.get_num_global_input_features(model_config)
     batch = args.batch_size
-    shapes = (
+    return (
         f"input_spatial:{batch}x{num_bin}x{args.pos_len}x{args.pos_len},"
         f"input_global:{batch}x{num_global}"
     )
-    cmd = [
+
+
+def _run_trtexec(cmd, description):
+    print(description)
+    print("  " + " ".join(shlex.quote(part) for part in cmd))
+    completed = subprocess.run(cmd, text=True, capture_output=True)
+    if completed.returncode != 0:
+        stdout = completed.stdout.strip()
+        stderr = completed.stderr.strip()
+        lines = [f"trtexec failed with exit code {completed.returncode}"]
+        if stdout:
+            lines.append("stdout:")
+            lines.append(stdout)
+        if stderr:
+            lines.append("stderr:")
+            lines.append(stderr)
+        raise RuntimeError("\n".join(lines))
+    return completed.stdout + ("\n" + completed.stderr if completed.stderr else "")
+
+
+def _parse_trtexec_benchmark(output_text):
+    metrics = {}
+
+    throughput_match = re.search(r"Throughput:\s*([0-9.]+)\s*qps", output_text)
+    if throughput_match:
+        metrics["throughput_qps"] = float(throughput_match.group(1))
+
+    latency_match = re.search(
+        r"Latency:\s*min =\s*([0-9.]+)\s*ms,\s*max =\s*([0-9.]+)\s*ms,\s*"
+        r"mean =\s*([0-9.]+)\s*ms,\s*median =\s*([0-9.]+)\s*ms,\s*"
+        r"percentile\(99%\) =\s*([0-9.]+)\s*ms",
+        output_text,
+    )
+    if latency_match:
+        metrics["latency_min_ms"] = float(latency_match.group(1))
+        metrics["latency_max_ms"] = float(latency_match.group(2))
+        metrics["latency_mean_ms"] = float(latency_match.group(3))
+        metrics["latency_median_ms"] = float(latency_match.group(4))
+        metrics["latency_p99_ms"] = float(latency_match.group(5))
+
+    gpu_match = re.search(
+        r"GPU Compute Time:\s*min =\s*([0-9.]+)\s*ms,\s*max =\s*([0-9.]+)\s*ms,\s*"
+        r"mean =\s*([0-9.]+)\s*ms,\s*median =\s*([0-9.]+)\s*ms,\s*"
+        r"percentile\(99%\) =\s*([0-9.]+)\s*ms",
+        output_text,
+    )
+    if gpu_match:
+        metrics["gpu_mean_ms"] = float(gpu_match.group(3))
+        metrics["gpu_p99_ms"] = float(gpu_match.group(5))
+
+    return metrics
+
+
+def _format_trtexec_benchmark(metrics):
+    if not metrics:
+        return "benchmark completed (metrics not parsed)"
+
+    parts = []
+    if "throughput_qps" in metrics:
+        parts.append(f"{metrics['throughput_qps']:.2f} qps")
+    if "latency_mean_ms" in metrics:
+        parts.append(f"latency_mean={metrics['latency_mean_ms']:.3f} ms")
+    if "latency_p99_ms" in metrics:
+        parts.append(f"latency_p99={metrics['latency_p99_ms']:.3f} ms")
+    if "gpu_mean_ms" in metrics:
+        parts.append(f"gpu_mean={metrics['gpu_mean_ms']:.3f} ms")
+    return ", ".join(parts)
+
+
+def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
+    if args.skip_trtexec:
+        print(f"Skipping TensorRT build/benchmark for {mode} because --skip-trtexec was set")
+        return None
+
+    trtexec_path = shutil.which(args.trtexec_bin)
+    if trtexec_path is None:
+        print(f"Skipping TensorRT build/benchmark for {mode} because {args.trtexec_bin!r} was not found in PATH")
+        return None
+
+    shapes = _shape_spec(args, model_config)
+    build_cmd = [
         trtexec_path,
         f"--onnx={onnx_path}",
         f"--saveEngine={engine_path}",
@@ -126,10 +199,26 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
         "--skipInference",
     ]
 
-    print(f"Running TensorRT build validation for {mode}:")
-    print("  " + " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    _run_trtexec(build_cmd, f"Running TensorRT engine build for {mode}:")
     print(f"TensorRT engine saved to: {engine_path}")
+
+    if args.skip_trtexec_benchmark:
+        print(f"Skipping TensorRT benchmark for {mode} because --skip-trtexec-benchmark was set")
+        return None
+
+    benchmark_cmd = [
+        trtexec_path,
+        f"--loadEngine={engine_path}",
+        f"--shapes={shapes}",
+        f"--warmUp={args.trtexec_warmup_ms}",
+        f"--duration={args.trtexec_duration_s}",
+        f"--avgRuns={args.trtexec_avg_runs}",
+    ]
+    benchmark_output = _run_trtexec(benchmark_cmd, f"Running TensorRT benchmark for {mode}:")
+    metrics = _parse_trtexec_benchmark(benchmark_output)
+    summary = _format_trtexec_benchmark(metrics)
+    print(f"TensorRT benchmark for {mode}: {summary}")
+    return summary
 
 
 def _verify_export(args, mode, onnx_path, model, input_spatial, input_global):
@@ -178,7 +267,7 @@ def main():
     parser.add_argument("--init-std", type=float, default=0.02,
                         help="Initialization std passed to model.initialize() (default: 0.02)")
     parser.add_argument("--batch-size", type=int, default=1,
-                        help="TensorRT validation batch size (default: 1)")
+                        help="TensorRT build/benchmark batch size (default: 1)")
     parser.add_argument("--verify-onnxruntime", action="store_true",
                         help="Also compare PyTorch and ONNX outputs with onnxruntime")
     parser.add_argument("--ort-provider", default="CPUExecutionProvider",
@@ -186,7 +275,15 @@ def main():
     parser.add_argument("--trtexec-bin", default="trtexec",
                         help="trtexec binary name or absolute path (default: trtexec)")
     parser.add_argument("--skip-trtexec", action="store_true",
-                        help="Do not run TensorRT build validation")
+                        help="Do not run TensorRT build or benchmark")
+    parser.add_argument("--skip-trtexec-benchmark", action="store_true",
+                        help="Build TensorRT engines but skip runtime benchmarking")
+    parser.add_argument("--trtexec-warmup-ms", type=int, default=200,
+                        help="Warmup time passed to trtexec --warmUp (default: 200)")
+    parser.add_argument("--trtexec-duration-s", type=int, default=10,
+                        help="Benchmark duration passed to trtexec --duration (default: 10)")
+    parser.add_argument("--trtexec-avg-runs", type=int, default=100,
+                        help="Average runs passed to trtexec --avgRuns (default: 100)")
     parser.add_argument("--fallback-to-te-decomposed-on-te-export-error", action="store_true",
                         help="If the official TE export fails, retry with a decomposed TE export path before considering legacy export")
     parser.add_argument("--fallback-to-legacy-on-te-export-error", action="store_true",
@@ -212,8 +309,11 @@ def main():
         try:
             onnx_path, model, input_spatial, input_global = export(export_args)
             _verify_export(args, mode, onnx_path, model, input_spatial, input_global)
-            _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode)
-            results.append((mode, "OK", onnx_path))
+            benchmark_summary = _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode)
+            detail = onnx_path
+            if benchmark_summary is not None:
+                detail = f"{onnx_path} | TRT {benchmark_summary}"
+            results.append((mode, "OK", detail))
         except RuntimeError as exc:
             print(f"ERROR: mode {mode} failed")
             print(exc)
