@@ -134,14 +134,16 @@ def _resolve_te_support():
     except ImportError as exc:
         raise RuntimeError(
             "Transformer Engine is required for --method te-official. "
-            "Install transformer-engine[pytorch] on a CUDA machine first."
+            "Install transformer-engine[pytorch] on a CUDA machine first. "
+            f"Original import error: {exc}"
         ) from exc
 
     try:
         from transformer_engine.pytorch.export import te_translation_table
     except ImportError as exc:
         raise RuntimeError(
-            "This Transformer Engine build does not expose transformer_engine.pytorch.export.te_translation_table."
+            "This Transformer Engine build does not expose "
+            f"transformer_engine.pytorch.export.te_translation_table. Original import error: {exc}"
         ) from exc
 
     te_onnx_export = getattr(te, "onnx_export", None)

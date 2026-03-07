@@ -43,8 +43,10 @@ def _save_random_te_checkpoint(args, checkpoint_path):
         from model_te import Model as TEModel
     except ImportError as exc:
         print(
-            "ERROR: test/validate_te_official_export.py requires Transformer Engine. "
-            "Run it on a machine with transformer-engine[pytorch] installed."
+            "ERROR: failed to import model_te / transformer_engine.pytorch for TE validation.\n"
+            f"Original import error: {exc}\n"
+            "Hint: top-level `import transformer_engine` is not enough. "
+            "This script needs `import transformer_engine.pytorch as te` to work."
         )
         raise SystemExit(1) from exc
 
