@@ -21,17 +21,20 @@ Usage:
 """
 
 import argparse
+import heapq
 import hashlib
 import itertools
 import json
 import multiprocessing
 import os
+import random
 import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -50,6 +53,7 @@ PACKED_BYTES = (POS_LEN * POS_LEN + 7) // 8  # 46
 SCAN_CACHE_KEY_NONE = -1
 SCAN_CACHE_PROCESS_CHUNK_SIZE = 8192
 SCAN_CACHE_QUERY_BATCH_SIZE = 512
+MANIFEST_SEPARATOR = "\0"
 
 
 def format_duration(seconds):
@@ -64,6 +68,18 @@ def format_duration(seconds):
     return f"{secs:d}s"
 
 
+def format_wall_time(ts=None):
+    """Format a wall-clock timestamp for log lines."""
+    if ts is None:
+        ts = time.time()
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def log(message, *, file=sys.stdout):
+    """Print one timestamped log line."""
+    print(f"[{format_wall_time()}] {message}", file=file, flush=True)
+
+
 class ProgressLogger:
     """Periodic progress logger with throughput and ETA."""
 
@@ -74,6 +90,7 @@ class ProgressLogger:
         self.interval_sec = max(1.0, float(interval_sec))
         self.t0 = time.time()
         self.last_report_time = self.t0
+        self.last_completed = 0
 
     def maybe_report(self, completed, extra=""):
         now = time.time()
@@ -86,11 +103,13 @@ class ProgressLogger:
 
     def _report(self, completed, now, extra):
         elapsed = max(1e-9, now - self.t0)
-        rate = completed / elapsed
+        avg_rate = completed / elapsed
+        interval_elapsed = max(1e-9, now - self.last_report_time)
+        recent_rate = (completed - self.last_completed) / interval_elapsed
         if self.total > 0:
             pct = 100.0 * completed / self.total
             if completed > 0 and completed < self.total:
-                eta = (self.total - completed) / rate
+                eta = (self.total - completed) / max(1e-9, recent_rate)
                 eta_text = f", ETA {format_duration(eta)}"
             else:
                 eta_text = ""
@@ -101,11 +120,60 @@ class ProgressLogger:
             pct_text = ""
             eta_text = ""
 
-        rate_text = f", {rate:.2f} {self.unit}/s" if rate > 0 else ""
+        rate_text = ""
+        if avg_rate > 0:
+            rate_text = f", avg {avg_rate:.2f} {self.unit}/s"
+        if recent_rate > 0:
+            rate_text += f", recent {recent_rate:.2f} {self.unit}/s"
         extra_text = f", {extra}" if extra else ""
-        print(f"  Progress [{self.desc}]: {completed}{total_text} {self.unit}{pct_text}"
-              f"{rate_text}{eta_text}{extra_text}", flush=True)
+        log(f"  Progress [{self.desc}]: {completed}{total_text} {self.unit}{pct_text}"
+            f"{rate_text}{eta_text}{extra_text}")
         self.last_report_time = now
+        self.last_completed = completed
+
+
+def write_manifest_entry(handle, filename, num_rows):
+    """Write one (filename, num_rows) entry to a manifest file."""
+    handle.write(f"{filename}{MANIFEST_SEPARATOR}{num_rows}\n")
+
+
+def iter_manifest_entries(manifest_path):
+    """Yield (filename, num_rows) pairs from a manifest file."""
+    with open(manifest_path, "r", encoding="utf-8", newline="") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            filename, num_rows_str = line.rsplit(MANIFEST_SEPARATOR, 1)
+            yield filename, int(num_rows_str)
+
+
+class FixedValSelector:
+    """Streaming selector for a random val prefix by cumulative row count."""
+
+    def __init__(self, target_rows):
+        self.target_rows = max(0, int(target_rows))
+        self.total_rows = 0
+        self._heap = []  # max-heap by random key via negated key
+        seed = int.from_bytes(os.urandom(16), byteorder="little")
+        self._rng = np.random.default_rng(seed=seed)
+
+    def add(self, filename, num_rows):
+        """Consider one file for the selected val set."""
+        if self.target_rows <= 0:
+            return
+
+        rand_key = int(self._rng.integers(0, 1 << 63, dtype=np.int64))
+        heapq.heappush(self._heap, (-rand_key, num_rows, filename))
+        self.total_rows += num_rows
+
+        while self._heap and self.total_rows - self._heap[0][1] >= self.target_rows:
+            _, popped_rows, _ = heapq.heappop(self._heap)
+            self.total_rows -= popped_rows
+
+    def selected_paths(self):
+        """Return the selected file paths as a set."""
+        return {filename for _, _, filename in self._heap}
 
 
 def board_size_cache_key(board_size):
@@ -189,17 +257,31 @@ def store_scan_cache_entries(conn, board_size, scan_results):
     conn.commit()
 
 
-def apply_scan_result(filename, num_rows, ok, file_rows, total_rows, bad_files, filtered_by_board):
+def apply_scan_result(filename, num_rows, ok, total_rows, bad_files, filtered_by_board):
     """Accumulate one scan result into summary counters."""
     if num_rows is None or num_rows <= 0:
         bad_files += 1
     elif not ok:
         filtered_by_board += 1
     else:
-        file_rows.append((filename, num_rows))
         total_rows += num_rows
 
     return total_rows, bad_files, filtered_by_board
+
+
+def choose_scan_tmp_root(splits):
+    """Choose a temp root directory for scan manifests."""
+    if not splits:
+        return tempfile.gettempdir()
+
+    tmp_dirs = [os.path.abspath(split.tmp_dir) for split in splits]
+    try:
+        common = os.path.commonpath(tmp_dirs)
+    except ValueError:
+        common = os.path.dirname(tmp_dirs[0])
+    if os.path.isdir(common):
+        return common
+    return os.path.dirname(common)
 
 
 @dataclass
@@ -209,7 +291,10 @@ class SplitConfig:
     md5_ubound: float
     out_dir: str
     tmp_dir: str
-    file_rows: list = field(default_factory=list)
+    file_rows: list | None = None
+    manifest_path: str | None = None
+    num_files: int = 0
+    total_rows: int = 0
 
 
 def scan_file(args):
@@ -226,7 +311,7 @@ def scan_file(args):
     try:
         npheaders = get_numpy_npz_headers(filename)
     except (PermissionError, zipfile.BadZipFile) as e:
-        print(f"WARNING: {e}: {filename}")
+        log(f"WARNING: {e}: {filename}")
         return (filename, None, False)
     if npheaders is None or len(npheaders) == 0:
         return (filename, None, False)
@@ -266,7 +351,7 @@ def get_numpy_npz_headers(filename):
             try:
                 version = np.lib.format.read_magic(npyfile)
             except ValueError:
-                print(f"WARNING: bad array in {filename}: {subfilename}")
+                log(f"WARNING: bad array in {filename}: {subfilename}")
                 return None
             (shape, is_fortran, dtype) = np.lib.format._read_array_header(npyfile, version)
             npzheaders[subfilename] = (shape, is_fortran, dtype)
@@ -348,7 +433,7 @@ def log_memory_estimates(sample_file, worker_group_size, rows_per_file,
     """Print rough memory estimates for current shuffle settings."""
     bytes_per_row = estimate_required_bytes_per_row(sample_file)
     if bytes_per_row is None:
-        print("Memory estimate: unavailable (could not read sample NPZ headers)", flush=True)
+        log("Memory estimate: unavailable (could not read sample NPZ headers)")
         return
 
     shard_raw = bytes_per_row * worker_group_size
@@ -362,27 +447,27 @@ def log_memory_estimates(sample_file, worker_group_size, rows_per_file,
     shard_peak_total = shard_peak_per_worker * shard_processes
     merge_peak_total = merge_peak_per_worker * merge_processes
 
-    print("Memory estimate (rough, for required arrays only):", flush=True)
-    print(f"  Sample file: {sample_file}", flush=True)
-    print(f"  Bytes per row: {bytes_per_row:.0f} ({format_bytes(bytes_per_row)})", flush=True)
-    print(f"  Shardify per worker: ~{format_bytes(shard_peak_per_worker)} "
-          f"(worker_group_size={worker_group_size})", flush=True)
-    print(f"  Shardify total: ~{format_bytes(shard_peak_total)} "
-          f"({shard_processes} workers)", flush=True)
-    print(f"  Merge per worker: ~{format_bytes(merge_peak_per_worker)} "
-          f"(rows_per_file={rows_per_file})", flush=True)
-    print(f"  Merge total: ~{format_bytes(merge_peak_total)} "
-          f"({merge_processes} workers)", flush=True)
+    log("Memory estimate (rough, for required arrays only):")
+    log(f"  Sample file: {sample_file}")
+    log(f"  Bytes per row: {bytes_per_row:.0f} ({format_bytes(bytes_per_row)})")
+    log(f"  Shardify per worker: ~{format_bytes(shard_peak_per_worker)} "
+        f"(worker_group_size={worker_group_size})")
+    log(f"  Shardify total: ~{format_bytes(shard_peak_total)} "
+        f"({shard_processes} workers)")
+    log(f"  Merge per worker: ~{format_bytes(merge_peak_per_worker)} "
+        f"(rows_per_file={rows_per_file})")
+    log(f"  Merge total: ~{format_bytes(merge_peak_total)} "
+        f"({merge_processes} workers)")
 
     total_mem = get_total_memory_bytes()
     if total_mem is not None:
-        print(f"  Host RAM: {format_bytes(total_mem)}", flush=True)
+        log(f"  Host RAM: {format_bytes(total_mem)}")
         if shard_peak_total > total_mem * 0.70:
-            print("WARNING: shardify memory estimate exceeds 70% of host RAM. "
-                  "Reduce --worker-group-size and/or --shard-processes.", flush=True)
+            log("WARNING: shardify memory estimate exceeds 70% of host RAM. "
+                "Reduce --worker-group-size and/or --shard-processes.")
         if merge_peak_total > total_mem * 0.70:
-            print("WARNING: merge memory estimate exceeds 70% of host RAM. "
-                  "Reduce --merge-processes and/or --rows-per-file.", flush=True)
+            log("WARNING: merge memory estimate exceeds 70% of host RAM. "
+                "Reduce --merge-processes and/or --rows-per-file.")
 
 
 def md5_hash_float(s):
@@ -397,7 +482,7 @@ def load_npz_arrays(filename):
             data = {}
             for key in REQUIRED_KEYS:
                 if key not in npz:
-                    print(f"WARNING: missing key {key} in {filename}")
+                    log(f"WARNING: missing key {key} in {filename}")
                     return None
                 data[key] = npz[key]
             for key in OPTIONAL_KEYS:
@@ -405,7 +490,7 @@ def load_npz_arrays(filename):
                     data[key] = npz[key]
             return data
     except Exception as e:
-        print(f"WARNING: error loading {filename}: {e}")
+        log(f"WARNING: error loading {filename}: {e}")
         return None
 
 
@@ -532,7 +617,7 @@ def sequential_merge_repack(num_shards, out_tmp_dirs, out_dir, rows_per_file,
             for key, arr in extra_rows.items():
                 buffer[key] = [arr]
             buffer_rows = n
-            print(f"  Injected {n} extra rows into buffer", flush=True)
+            log(f"  Injected {n} extra rows into buffer")
 
     # Collect all shard file paths and randomize read order
     all_shard_files = []
@@ -552,7 +637,7 @@ def sequential_merge_repack(num_shards, out_tmp_dirs, out_dir, rows_per_file,
                     buffer[key].append(npz[key])
                 buffer_rows += npz["binaryInputNCHWPacked"].shape[0]
         except Exception as e:
-            print(f"WARNING: error reading shard {shard_path}: {e}")
+            log(f"WARNING: error reading shard {shard_path}: {e}")
             continue
 
         # Flush full files as buffer accumulates
@@ -564,7 +649,7 @@ def sequential_merge_repack(num_shards, out_tmp_dirs, out_dir, rows_per_file,
     if buffer_rows > 0:
         if keep_remainder:
             remainder = {key: np.concatenate(arrs) for key, arrs in buffer.items()}
-            print(f"  Remainder: {buffer_rows} rows -> train", flush=True)
+            log(f"  Remainder: {buffer_rows} rows -> train")
         else:
             flush_buffer(buffer_rows)
 
@@ -632,7 +717,7 @@ def merge_one_bucket(bucket_idx, tmp_dir, num_shards, out_dir,
             for key in npz.keys():
                 buffer[key] = [npz[key]]
             buffer_rows = npz["binaryInputNCHWPacked"].shape[0]
-            print(f"  Bucket {bucket_idx}: injected {buffer_rows} extra rows", flush=True)
+            log(f"  Bucket {bucket_idx}: injected {buffer_rows} extra rows")
 
     # Read all shard files in this bucket (randomized order)
     shard_files = []
@@ -653,7 +738,7 @@ def merge_one_bucket(bucket_idx, tmp_dir, num_shards, out_dir,
                     buffer[key].append(npz[key])
                 buffer_rows += npz["binaryInputNCHWPacked"].shape[0]
         except Exception as e:
-            print(f"WARNING: error reading shard {path}: {e}")
+            log(f"WARNING: error reading shard {path}: {e}")
             continue
 
         # Flush as buffer accumulates
@@ -663,9 +748,8 @@ def merge_one_bucket(bucket_idx, tmp_dir, num_shards, out_dir,
         now = time.time()
         if processed_shards < total_shard_files and now - last_progress_time >= progress_interval_sec:
             pct = 100.0 * processed_shards / total_shard_files if total_shard_files > 0 else 100.0
-            print(f"  Bucket {bucket_idx}: read {processed_shards}/{total_shard_files} shard files "
-                  f"({pct:.1f}%), wrote {len(written_files)} files, buffered {buffer_rows} rows",
-                  flush=True)
+            log(f"  Bucket {bucket_idx}: read {processed_shards}/{total_shard_files} shard files "
+                f"({pct:.1f}%), wrote {len(written_files)} files, buffered {buffer_rows} rows")
             last_progress_time = now
 
     # Save remainder to temp file (avoid pickling large arrays through IPC)
@@ -673,8 +757,8 @@ def merge_one_bucket(bucket_idx, tmp_dir, num_shards, out_dir,
         remainder = {key: np.concatenate(arrs) for key, arrs in buffer.items()}
         np.savez(remainder_path, **remainder)  # uncompressed, temp file
 
-    print(f"  Bucket {bucket_idx}: finished {total_shard_files}/{total_shard_files} shard files, "
-          f"wrote {len(written_files)} files, remainder {buffer_rows} rows", flush=True)
+    log(f"  Bucket {bucket_idx}: finished {total_shard_files}/{total_shard_files} shard files, "
+        f"wrote {len(written_files)} files, remainder {buffer_rows} rows")
     return bucket_idx, written_files, buffer_rows
 
 
@@ -807,7 +891,7 @@ def parallel_merge_repack(num_shards, out_tmp_dirs, out_dir, rows_per_file,
                             combined[key] = []
                         combined[key].append(npz[key])
             except Exception as e:
-                print(f"WARNING: error reading remainder {rem_path}: {e}")
+                log(f"WARNING: error reading remainder {rem_path}: {e}")
 
         if combined:
             merged_rem = {key: np.concatenate(arrs) for key, arrs in combined.items()}
@@ -831,7 +915,7 @@ def parallel_merge_repack(num_shards, out_tmp_dirs, out_dir, rows_per_file,
             if final_rem_rows > 0:
                 if keep_remainder:
                     remainder = {key: merged_rem[key][offset:] for key in keys}
-                    print(f"  Remainder: {final_rem_rows} rows -> train", flush=True)
+                    log(f"  Remainder: {final_rem_rows} rows -> train")
                 else:
                     chunk = {key: merged_rem[key][offset:] for key in keys}
                     arrays = joint_shuffle([chunk[k] for k in keys])
@@ -856,58 +940,79 @@ class Timer:
         self.desc = desc
 
     def __enter__(self):
-        print(f"Beginning: {self.desc}", flush=True)
+        log(f"Beginning: {self.desc}")
         self.t0 = time.time()
         return self
 
     def __exit__(self, *args):
         elapsed = time.time() - self.t0
-        print(f"Finished: {self.desc} in {elapsed:.1f}s", flush=True)
+        log(f"Finished: {self.desc} in {elapsed:.1f}s")
 
 
-def md5_filter(file_rows, lbound, ubound):
-    """Filter file_rows by MD5 hash of basename into [lbound, ubound)."""
-    filtered = []
-    for filename, num_rows in file_rows:
-        h = md5_hash_float(os.path.basename(filename))
-        if h < lbound or h >= ubound:
-            continue
-        filtered.append((filename, num_rows))
-    return filtered
+def iter_split_file_rows(split):
+    """Yield (filename, num_rows) pairs for a split."""
+    if split.manifest_path is not None:
+        yield from iter_manifest_entries(split.manifest_path)
+        return
+
+    if split.file_rows is not None:
+        yield from split.file_rows
 
 
-def select_val_files_fixed(file_rows, val_num_files, rows_per_file):
-    """Randomly select files for val to reach val_num_files * rows_per_file rows.
+def split_num_files(split):
+    """Return the number of input files in a split."""
+    if split.manifest_path is not None:
+        return split.num_files
+    if split.file_rows is not None:
+        return len(split.file_rows)
+    return 0
 
-    Args:
-        file_rows: List of (filename, num_rows) for all valid files.
-        val_num_files: Target number of val output files.
-        rows_per_file: Rows per output file.
 
-    Returns:
-        (val_file_rows, train_file_rows) — disjoint partition of file_rows.
-    """
-    target_rows = val_num_files * rows_per_file
-    total_rows = sum(nr for _, nr in file_rows)
+def split_total_rows(split):
+    """Return the total input rows in a split."""
+    if split.manifest_path is not None:
+        return split.total_rows
+    if split.file_rows is not None:
+        return sum(nr for _, nr in split.file_rows)
+    return 0
 
-    if total_rows < target_rows:
-        print(f"WARNING: total rows ({total_rows}) < val target ({target_rows}). "
-              f"Using all data for val.", flush=True)
 
-    shuffled = list(file_rows)
-    np.random.shuffle(shuffled)
+def count_worker_groups(split, worker_group_size):
+    """Count how many worker groups a split will produce."""
+    groups = 0
+    group_rows = 0
+    for _, num_rows in iter_split_file_rows(split):
+        group_rows += num_rows
+        if group_rows >= worker_group_size:
+            groups += 1
+            group_rows = 0
+    if group_rows > 0:
+        groups += 1
+    return groups
 
-    val_file_rows = []
-    train_file_rows = []
-    accumulated = 0
-    for filename, num_rows in shuffled:
-        if accumulated < target_rows:
-            val_file_rows.append((filename, num_rows))
-            accumulated += num_rows
-        else:
-            train_file_rows.append((filename, num_rows))
 
-    return val_file_rows, train_file_rows
+def iter_worker_groups(split, worker_group_size, group_shuffle_rng):
+    """Yield lists of filenames grouped by approximate row count."""
+    group = []
+    group_rows = 0
+    for filename, num_rows in iter_split_file_rows(split):
+        group.append(filename)
+        group_rows += num_rows
+        if group_rows >= worker_group_size:
+            group_shuffle_rng.shuffle(group)
+            yield group
+            group = []
+            group_rows = 0
+    if group:
+        group_shuffle_rng.shuffle(group)
+        yield group
+
+
+def append_split_entry(split, handle, filename, num_rows):
+    """Append one file entry to a split manifest and update counters."""
+    write_manifest_entry(handle, filename, num_rows)
+    split.num_files += 1
+    split.total_rows += num_rows
 
 
 def process_split(split, shard_processes, merge_processes, rows_per_file, worker_group_size,
@@ -929,19 +1034,20 @@ def process_split(split, shard_processes, merge_processes, rows_per_file, worker
     Returns:
         remainder: dict of arrays (< rows_per_file) or None.
     """
-    file_rows = split.file_rows
-    total_rows = sum(nr for _, nr in file_rows)
+    num_files = split_num_files(split)
+    total_rows = split_total_rows(split)
     extra_count = extra_rows["binaryInputNCHWPacked"].shape[0] if extra_rows is not None else 0
 
-    print(f"\n{'='*60}", flush=True)
-    print(f"Processing split '{split.name}': {len(file_rows)} files, {total_rows} rows", flush=True)
+    print("", flush=True)
+    log(f"{'='*60}")
+    log(f"Processing split '{split.name}': {num_files} files, {total_rows} rows")
     if extra_count > 0:
-        print(f"  + {extra_count} extra rows from val remainder", flush=True)
-    print(f"  out_dir: {split.out_dir}", flush=True)
-    print(f"  tmp_dir: {split.tmp_dir}", flush=True)
+        log(f"  + {extra_count} extra rows from val remainder")
+    log(f"  out_dir: {split.out_dir}")
+    log(f"  tmp_dir: {split.tmp_dir}")
 
-    if not file_rows and extra_count == 0:
-        print(f"  No data for split '{split.name}', skipping.", flush=True)
+    if num_files == 0 and extra_count == 0:
+        log(f"  No data for split '{split.name}', skipping.")
         return None
 
     os.makedirs(split.out_dir)
@@ -953,10 +1059,10 @@ def process_split(split, shard_processes, merge_processes, rows_per_file, worker
         num_shards_buckets = min(num_output_files, max(1, merge_processes))
     out_tmp_dirs = [os.path.join(split.tmp_dir, f"tmp.shuf{i}") for i in range(num_shards_buckets)]
 
-    print(f"  Intermediate shard buckets: {num_shards_buckets}", flush=True)
-    print(f"  Rows per file: {rows_per_file}", flush=True)
-    print(f"  Shard workers: {shard_processes}", flush=True)
-    print(f"  Merge workers: {merge_processes}", flush=True)
+    log(f"  Intermediate shard buckets: {num_shards_buckets}")
+    log(f"  Rows per file: {rows_per_file}")
+    log(f"  Shard workers: {shard_processes}")
+    log(f"  Merge workers: {merge_processes}")
 
     # Clean and create tmp dirs
     for d in out_tmp_dirs:
@@ -964,30 +1070,15 @@ def process_split(split, shard_processes, merge_processes, rows_per_file, worker
             shutil.rmtree(d)
         os.makedirs(d)
 
-    # Group files for sharding
-    np.random.seed()
-    shuffled = list(file_rows)
-    np.random.shuffle(shuffled)
-
-    groups = []
-    group = []
-    group_rows = 0
-    for filename, num_rows in shuffled:
-        group.append(filename)
-        group_rows += num_rows
-        if group_rows >= worker_group_size:
-            groups.append(group)
-            group = []
-            group_rows = 0
-    if group:
-        groups.append(group)
-
-    num_worker_groups = len(groups)
-    print(f"  Grouped into {num_worker_groups} worker groups", flush=True)
+    # Group files for sharding in two streaming passes over the manifest/list:
+    # one lightweight pass counts groups for progress and shard indexing, and
+    # one pass yields the actual filename lists to workers.
+    num_worker_groups = count_worker_groups(split, worker_group_size)
+    log(f"  Grouped into {num_worker_groups} worker groups")
 
     # Stage 1: Shardify (parallel)
     bucket_row_counts = np.zeros(num_shards_buckets, dtype=np.int64)
-    if groups:
+    if num_worker_groups > 0:
         with multiprocessing.Pool(shard_processes) as pool:
             with Timer(f"Sharding ({split.name})"):
                 progress = ProgressLogger(
@@ -997,11 +1088,14 @@ def process_split(split, shard_processes, merge_processes, rows_per_file, worker
                     interval_sec=progress_interval_sec,
                 )
                 total_sharded = 0
-                shard_tasks = [
-                    (idx, groups[idx], num_shards_buckets, out_tmp_dirs,
+                group_shuffle_rng = random.Random(int.from_bytes(os.urandom(16), byteorder="little"))
+                shard_tasks = (
+                    (group_idx, group, num_shards_buckets, out_tmp_dirs,
                      compress_shards, shard_chunk_size)
-                    for idx in range(num_worker_groups)
-                ]
+                    for group_idx, group in enumerate(
+                        iter_worker_groups(split, worker_group_size, group_shuffle_rng)
+                    )
+                )
                 for completed_groups, counts in enumerate(pool.imap_unordered(shardify_star, shard_tasks), start=1):
                     bucket_row_counts += counts
                     total_sharded += int(counts.sum())
@@ -1009,7 +1103,7 @@ def process_split(split, shard_processes, merge_processes, rows_per_file, worker
                         completed_groups,
                         extra=f"rows={total_sharded}",
                     )
-                print(f"  Sharded {total_sharded} rows", flush=True)
+                log(f"  Sharded {total_sharded} rows")
     else:
         num_worker_groups = 0
         total_sharded = 0
@@ -1049,24 +1143,24 @@ def process_split(split, shard_processes, merge_processes, rows_per_file, worker
     if index_entries:
         row_counts = [e["num_rows"] for e in index_entries]
         if len(set(row_counts)) == 1:
-            print(f"  {len(index_entries)} files, all {row_counts[0]} rows", flush=True)
+            log(f"  {len(index_entries)} files, all {row_counts[0]} rows")
         else:
             full_count = sum(1 for r in row_counts[:-1] if r == row_counts[0])
-            print(f"  {full_count} full files ({row_counts[0]} rows each), "
-                  f"last file: {row_counts[-1]} rows", flush=True)
+            log(f"  {full_count} full files ({row_counts[0]} rows each), "
+                f"last file: {row_counts[-1]} rows")
 
     remainder_count = remainder["binaryInputNCHWPacked"].shape[0] if remainder else 0
     total_input = total_sharded + extra_count
     discarded = total_input - total_written - remainder_count
-    print(f"  Total rows written: {total_written}" +
-          (f" (discarded: {discarded})" if discarded > 0 else ""), flush=True)
-    print(f"  Index written to: {index_path}", flush=True)
+    log(f"  Total rows written: {total_written}" +
+        (f" (discarded: {discarded})" if discarded > 0 else ""))
+    log(f"  Index written to: {index_path}")
 
     # Cleanup tmp dirs
     for d in out_tmp_dirs:
         if os.path.exists(d):
             shutil.rmtree(d)
-    print(f"  Temp dirs cleaned up for '{split.name}'.", flush=True)
+    log(f"  Temp dirs cleaned up for '{split.name}'.")
 
     return remainder
 
@@ -1133,26 +1227,26 @@ def main():
     args = parser.parse_args()
 
     if not args.splits:
-        print("ERROR: at least one --split is required.", file=sys.stderr)
+        log("ERROR: at least one --split is required.", file=sys.stderr)
         sys.exit(1)
 
     if args.val_num_files is not None:
         if args.val_num_files <= 0:
-            print("ERROR: --val-num-files must be > 0.", file=sys.stderr)
+            log("ERROR: --val-num-files must be > 0.", file=sys.stderr)
             sys.exit(1)
         split_names = {s.name for s in args.splits}
         if "val" not in split_names or "train" not in split_names:
-            print("ERROR: --val-num-files requires both 'val' and 'train' splits.", file=sys.stderr)
+            log("ERROR: --val-num-files requires both 'val' and 'train' splits.", file=sys.stderr)
             sys.exit(1)
 
     if args.filter_board_size is not None and args.filter_board_size <= 0:
-        print("ERROR: --filter-board-size must be > 0.", file=sys.stderr)
+        log("ERROR: --filter-board-size must be > 0.", file=sys.stderr)
         sys.exit(1)
 
     # Pre-check: fail fast if any output directory already exists
     for split in args.splits:
         if os.path.exists(split.out_dir):
-            print(f"ERROR: Output directory already exists: {split.out_dir}", file=sys.stderr)
+            log(f"ERROR: Output directory already exists: {split.out_dir}", file=sys.stderr)
             sys.exit(1)
 
     num_processes = args.num_processes
@@ -1173,18 +1267,28 @@ def main():
                 for f in files:
                     if f.endswith(".npz"):
                         all_files.append(os.path.join(root, f))
-    print(f"Found {len(all_files)} NPZ files", flush=True)
+    log(f"Found {len(all_files)} NPZ files")
 
     if not all_files:
-        print("No files found, exiting.")
+        log("No files found, exiting.")
         sys.exit(0)
+
+    scan_tmp_dir = tempfile.mkdtemp(
+        prefix="shuffle.scan.",
+        dir=choose_scan_tmp_root(args.splits),
+    )
+    master_manifest_path = os.path.join(scan_tmp_dir, "all_valid.manifest")
 
     # --- Stage 2: Scan files (row counts + optional board size filter) ---
     board_size = args.filter_board_size
-    file_rows = []
+    valid_files = 0
     total_rows = 0
     bad_files = 0
     filtered_by_board = 0
+    sample_file = None
+    fixed_val_selector = None
+    if args.val_num_files is not None:
+        fixed_val_selector = FixedValSelector(args.val_num_files * rows_per_file)
     if board_size is not None:
         scan_desc = f"Scanning files (row counts + {board_size}x{board_size} filter)"
     else:
@@ -1195,134 +1299,181 @@ def main():
         cache_misses = 0
         if scan_cache_path is not None:
             cache_conn = open_scan_cache(scan_cache_path)
-            print(f"  Scan cache: {scan_cache_path}", flush=True)
+            log(f"  Scan cache: {scan_cache_path}")
 
         try:
-            with multiprocessing.Pool(num_processes) as pool:
-                progress = ProgressLogger(
-                    desc="scan files",
-                    total=len(all_files),
-                    unit="files",
-                    interval_sec=progress_interval_sec,
-                )
-                scanned_files = 0
+            with open(master_manifest_path, "w", encoding="utf-8", newline="") as master_manifest:
+                with multiprocessing.Pool(num_processes) as pool:
+                    progress = ProgressLogger(
+                        desc="scan files",
+                        total=len(all_files),
+                        unit="files",
+                        interval_sec=progress_interval_sec,
+                    )
+                    scanned_files = 0
 
-                if cache_conn is None:
-                    scan_iter = zip(all_files, itertools.repeat(board_size))
-                    for filename, num_rows, ok in pool.imap_unordered(scan_file, scan_iter, chunksize=64):
+                    def handle_scan_result(filename, num_rows, ok):
+                        nonlocal valid_files, total_rows, bad_files, filtered_by_board, sample_file
+
+                        is_valid = num_rows is not None and num_rows > 0 and ok
                         total_rows, bad_files, filtered_by_board = apply_scan_result(
                             filename, num_rows, ok,
-                            file_rows, total_rows, bad_files, filtered_by_board,
+                            total_rows, bad_files, filtered_by_board,
                         )
-                        scanned_files += 1
-                        progress.maybe_report(
-                            scanned_files,
-                            extra=f"valid={len(file_rows)}, bad={bad_files}, "
-                                  f"filtered={filtered_by_board}, rows={total_rows}",
-                        )
-                else:
-                    for chunk_start in range(0, len(all_files), SCAN_CACHE_PROCESS_CHUNK_SIZE):
-                        chunk_files = all_files[chunk_start:chunk_start + SCAN_CACHE_PROCESS_CHUNK_SIZE]
-                        cached_results = fetch_scan_cache_entries(cache_conn, board_size, chunk_files)
+                        if is_valid:
+                            valid_files += 1
+                            if sample_file is None:
+                                sample_file = filename
+                            write_manifest_entry(master_manifest, filename, num_rows)
+                            if fixed_val_selector is not None:
+                                fixed_val_selector.add(filename, num_rows)
 
-                        for filename in chunk_files:
-                            entry = cached_results.get(filename)
-                            if entry is None:
+                    if cache_conn is None:
+                        scan_iter = zip(all_files, itertools.repeat(board_size))
+                        for filename, num_rows, ok in pool.imap_unordered(scan_file, scan_iter, chunksize=64):
+                            handle_scan_result(filename, num_rows, ok)
+                            scanned_files += 1
+                            progress.maybe_report(
+                                scanned_files,
+                                extra=f"valid={valid_files}, bad={bad_files}, "
+                                      f"filtered={filtered_by_board}, rows={total_rows}",
+                            )
+                    else:
+                        for chunk_start in range(0, len(all_files), SCAN_CACHE_PROCESS_CHUNK_SIZE):
+                            chunk_files = all_files[chunk_start:chunk_start + SCAN_CACHE_PROCESS_CHUNK_SIZE]
+                            cached_results = fetch_scan_cache_entries(cache_conn, board_size, chunk_files)
+
+                            for filename in chunk_files:
+                                entry = cached_results.get(filename)
+                                if entry is None:
+                                    continue
+                                num_rows, ok = entry
+                                handle_scan_result(filename, num_rows, ok)
+                                scanned_files += 1
+                                cache_hits += 1
+                                progress.maybe_report(
+                                    scanned_files,
+                                    extra=f"valid={valid_files}, bad={bad_files}, "
+                                          f"filtered={filtered_by_board}, rows={total_rows}, "
+                                          f"cache_hits={cache_hits}, cache_misses={cache_misses}",
+                                )
+
+                            missing = [filename for filename in chunk_files if filename not in cached_results]
+                            if not missing:
                                 continue
-                            num_rows, ok = entry
-                            total_rows, bad_files, filtered_by_board = apply_scan_result(
-                                filename, num_rows, ok,
-                                file_rows, total_rows, bad_files, filtered_by_board,
-                            )
-                            scanned_files += 1
-                            cache_hits += 1
-                            progress.maybe_report(
-                                scanned_files,
-                                extra=f"valid={len(file_rows)}, bad={bad_files}, "
-                                      f"filtered={filtered_by_board}, rows={total_rows}, "
-                                      f"cache_hits={cache_hits}, cache_misses={cache_misses}",
-                            )
 
-                        missing = [filename for filename in chunk_files if filename not in cached_results]
-                        if not missing:
-                            continue
+                            to_store = []
+                            miss_iter = zip(missing, itertools.repeat(board_size))
+                            for filename, num_rows, ok in pool.imap_unordered(scan_file, miss_iter, chunksize=64):
+                                handle_scan_result(filename, num_rows, ok)
+                                scanned_files += 1
+                                cache_misses += 1
+                                to_store.append((filename, num_rows, ok))
+                                progress.maybe_report(
+                                    scanned_files,
+                                    extra=f"valid={valid_files}, bad={bad_files}, "
+                                          f"filtered={filtered_by_board}, rows={total_rows}, "
+                                          f"cache_hits={cache_hits}, cache_misses={cache_misses}",
+                                )
 
-                        to_store = []
-                        miss_iter = zip(missing, itertools.repeat(board_size))
-                        for filename, num_rows, ok in pool.imap_unordered(scan_file, miss_iter, chunksize=64):
-                            total_rows, bad_files, filtered_by_board = apply_scan_result(
-                                filename, num_rows, ok,
-                                file_rows, total_rows, bad_files, filtered_by_board,
-                            )
-                            scanned_files += 1
-                            cache_misses += 1
-                            to_store.append((filename, num_rows, ok))
-                            progress.maybe_report(
-                                scanned_files,
-                                extra=f"valid={len(file_rows)}, bad={bad_files}, "
-                                      f"filtered={filtered_by_board}, rows={total_rows}, "
-                                      f"cache_hits={cache_hits}, cache_misses={cache_misses}",
-                            )
-
-                        store_scan_cache_entries(cache_conn, board_size, to_store)
+                            store_scan_cache_entries(cache_conn, board_size, to_store)
         finally:
             if cache_conn is not None:
                 cache_conn.close()
 
-    print(f"Valid files: {len(file_rows)}, bad/empty: {bad_files}", flush=True)
+    log(f"Valid files: {valid_files}, bad/empty: {bad_files}")
     if board_size is not None:
-        print(f"Filtered by board size ({board_size}x{board_size}): {filtered_by_board} files removed", flush=True)
-    print(f"Total rows: {total_rows}", flush=True)
+        log(f"Filtered by board size ({board_size}x{board_size}): {filtered_by_board} files removed")
+    log(f"Total rows: {total_rows}")
     if scan_cache_path is not None:
-        print(f"Scan cache stats: {cache_hits} hits, {cache_misses} misses", flush=True)
-    if file_rows:
+        log(f"Scan cache stats: {cache_hits} hits, {cache_misses} misses")
+    if sample_file is not None:
         log_memory_estimates(
-            sample_file=file_rows[0][0],
+            sample_file=sample_file,
             worker_group_size=worker_group_size,
             rows_per_file=rows_per_file,
             shard_processes=shard_processes,
             merge_processes=merge_processes,
         )
+    if fixed_val_selector is not None and total_rows < fixed_val_selector.target_rows:
+        log(f"WARNING: total rows ({total_rows}) < val target ({fixed_val_selector.target_rows}). "
+            f"Using all data for val.")
 
     if total_rows == 0:
-        print("No rows found, exiting.")
+        log("No rows found, exiting.")
         sys.exit(0)
 
     # --- Stage 3: Split files into val/train ---
     splits_by_name = {s.name: s for s in args.splits}
+    for split in args.splits:
+        split.file_rows = None
+        split.num_files = 0
+        split.total_rows = 0
+        split.manifest_path = os.path.join(scan_tmp_dir, f"{split.name}.manifest")
+
+    selected_val_paths = None
+    if args.val_num_files is not None:
+        selected_val_paths = fixed_val_selector.selected_paths() if fixed_val_selector is not None else set()
+
+    with Timer("Assigning files to splits"):
+        handles = {
+            split.name: open(split.manifest_path, "w", encoding="utf-8", newline="")
+            for split in args.splits
+        }
+        try:
+            progress = ProgressLogger(
+                desc="split manifests",
+                total=valid_files,
+                unit="files",
+                interval_sec=progress_interval_sec,
+            )
+            for processed_files, (filename, num_rows) in enumerate(iter_manifest_entries(master_manifest_path), start=1):
+                h = None
+
+                if selected_val_paths is not None:
+                    if filename in selected_val_paths:
+                        append_split_entry(splits_by_name["val"], handles["val"], filename, num_rows)
+                    else:
+                        append_split_entry(splits_by_name["train"], handles["train"], filename, num_rows)
+
+                    for split in args.splits:
+                        if split.name in ("train", "val"):
+                            continue
+                        if h is None:
+                            h = md5_hash_float(os.path.basename(filename))
+                        if split.md5_lbound <= h < split.md5_ubound:
+                            append_split_entry(split, handles[split.name], filename, num_rows)
+                else:
+                    for split in args.splits:
+                        if h is None:
+                            h = md5_hash_float(os.path.basename(filename))
+                        if split.md5_lbound <= h < split.md5_ubound:
+                            append_split_entry(split, handles[split.name], filename, num_rows)
+
+                progress.maybe_report(processed_files)
+        finally:
+            for handle in handles.values():
+                handle.close()
 
     if args.val_num_files is not None:
-        # Fixed val size mode: randomly select files for val
-        val_file_rows, train_file_rows = select_val_files_fixed(
-            file_rows, args.val_num_files, rows_per_file,
-        )
-        splits_by_name["val"].file_rows = val_file_rows
-        splits_by_name["train"].file_rows = train_file_rows
+        val_split = splits_by_name["val"]
+        train_split = splits_by_name["train"]
+        log(f"Split 'val': {val_split.num_files}/{valid_files} files, "
+            f"{val_split.total_rows}/{total_rows} rows "
+            f"(fixed {args.val_num_files} output files)")
+        log(f"Split 'train': {train_split.num_files}/{valid_files} files, "
+            f"{train_split.total_rows}/{total_rows} rows")
 
-        val_rows = sum(nr for _, nr in val_file_rows)
-        train_rows = sum(nr for _, nr in train_file_rows)
-        print(f"Split 'val': {len(val_file_rows)}/{len(file_rows)} files, "
-              f"{val_rows}/{total_rows} rows "
-              f"(fixed {args.val_num_files} output files)", flush=True)
-        print(f"Split 'train': {len(train_file_rows)}/{len(file_rows)} files, "
-              f"{train_rows}/{total_rows} rows", flush=True)
-
-        # Other splits still use MD5
         for split in args.splits:
             if split.name not in ("train", "val"):
-                split.file_rows = md5_filter(file_rows, split.md5_lbound, split.md5_ubound)
-                split_rows = sum(nr for _, nr in split.file_rows)
-                print(f"Split '{split.name}': {len(split.file_rows)}/{len(file_rows)} files, "
-                      f"{split_rows}/{total_rows} rows "
-                      f"(MD5 [{split.md5_lbound:.2f}, {split.md5_ubound:.2f}))", flush=True)
+                log(f"Split '{split.name}': {split.num_files}/{valid_files} files, "
+                    f"{split.total_rows}/{total_rows} rows "
+                    f"(MD5 [{split.md5_lbound:.2f}, {split.md5_ubound:.2f}))")
     else:
-        # Default: MD5 hash-based split
         for split in args.splits:
-            split.file_rows = md5_filter(file_rows, split.md5_lbound, split.md5_ubound)
-            split_rows = sum(nr for _, nr in split.file_rows)
-            print(f"Split '{split.name}': {len(split.file_rows)}/{len(file_rows)} files, "
-                  f"{split_rows}/{total_rows} rows "
-                  f"(MD5 [{split.md5_lbound:.2f}, {split.md5_ubound:.2f}))", flush=True)
+            log(f"Split '{split.name}': {split.num_files}/{valid_files} files, "
+                f"{split.total_rows}/{total_rows} rows "
+                f"(MD5 [{split.md5_lbound:.2f}, {split.md5_ubound:.2f}))")
 
     # --- Stage 4: Process splits (val first, then train) ---
     # Val is processed first so its remainder rows can be added to train.
@@ -1331,32 +1482,36 @@ def main():
 
     compress_shards = args.compress_shards
 
-    val_remainder = None
-    if val_split is not None:
-        val_remainder = process_split(
-            val_split, shard_processes, merge_processes, rows_per_file, worker_group_size,
-            num_buckets=num_buckets, shard_chunk_size=shard_chunk_size,
-            keep_remainder=True, compress_shards=compress_shards,
-            progress_interval_sec=progress_interval_sec,
-        )
+    try:
+        val_remainder = None
+        if val_split is not None:
+            val_remainder = process_split(
+                val_split, shard_processes, merge_processes, rows_per_file, worker_group_size,
+                num_buckets=num_buckets, shard_chunk_size=shard_chunk_size,
+                keep_remainder=True, compress_shards=compress_shards,
+                progress_interval_sec=progress_interval_sec,
+            )
 
-    if train_split is not None:
-        process_split(
-            train_split, shard_processes, merge_processes, rows_per_file, worker_group_size,
-            num_buckets=num_buckets, shard_chunk_size=shard_chunk_size,
-            extra_rows=val_remainder, compress_shards=compress_shards,
-            progress_interval_sec=progress_interval_sec,
-        )
+        if train_split is not None:
+            process_split(
+                train_split, shard_processes, merge_processes, rows_per_file, worker_group_size,
+                num_buckets=num_buckets, shard_chunk_size=shard_chunk_size,
+                extra_rows=val_remainder, compress_shards=compress_shards,
+                progress_interval_sec=progress_interval_sec,
+            )
 
-    # Process any other splits (neither train nor val)
-    for split in args.splits:
-        if split.name not in ("train", "val"):
-            process_split(split, shard_processes, merge_processes, rows_per_file, worker_group_size,
-                          num_buckets=num_buckets, shard_chunk_size=shard_chunk_size,
-                          compress_shards=compress_shards,
-                          progress_interval_sec=progress_interval_sec)
+        # Process any other splits (neither train nor val)
+        for split in args.splits:
+            if split.name not in ("train", "val"):
+                process_split(split, shard_processes, merge_processes, rows_per_file, worker_group_size,
+                              num_buckets=num_buckets, shard_chunk_size=shard_chunk_size,
+                              compress_shards=compress_shards,
+                              progress_interval_sec=progress_interval_sec)
 
-    print(f"\nAll splits done.", flush=True)
+        print("", flush=True)
+        log("All splits done.")
+    finally:
+        shutil.rmtree(scan_tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
