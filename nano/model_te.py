@@ -280,6 +280,12 @@ def convert_checkpoint_model_to_te(state_dict):
             continue
         elif ".ffn_w2.weight" in key:
             new_sd[key.replace(".ffn_w2.weight", ".layer.layernorm_mlp.fc2_weight")] = value
+        elif ".norm1.norm.weight" in key:
+            new_sd[key.replace(".norm1.norm.weight", ".layer.self_attention.layernorm_qkv.layer_norm_weight")] = value
+        elif ".norm2.norm.weight" in key:
+            new_sd[key.replace(".norm2.norm.weight", ".layer.layernorm_mlp.layer_norm_weight")] = value
+        elif ".norm_final.norm.weight" in key:
+            new_sd[key.replace(".norm_final.norm.weight", ".norm_final.weight")] = value
         elif ".norm1.weight" in key:
             new_sd[key.replace(".norm1.weight", ".layer.self_attention.layernorm_qkv.layer_norm_weight")] = value
         elif ".norm1.bias" in key:
@@ -318,13 +324,14 @@ def convert_checkpoint_te_to_model(state_dict):
         elif ".layer.layernorm_mlp.fc2_weight" in key:
             new_sd[key.replace(".layer.layernorm_mlp.fc2_weight", ".ffn_w2.weight")] = value
         elif ".layer.self_attention.layernorm_qkv.layer_norm_weight" in key:
-            new_sd[key.replace(".layer.self_attention.layernorm_qkv.layer_norm_weight", ".norm1.weight")] = value
+            new_sd[key.replace(".layer.self_attention.layernorm_qkv.layer_norm_weight", ".norm1.norm.weight")] = value
         elif ".layer.self_attention.layernorm_qkv.layer_norm_bias" in key:
-            new_sd[key.replace(".layer.self_attention.layernorm_qkv.layer_norm_bias", ".norm1.bias")] = value
+            # model.py uses nn.RMSNorm inside RMSNormFP32 and therefore has no bias parameter.
+            continue
         elif ".layer.layernorm_mlp.layer_norm_weight" in key:
-            new_sd[key.replace(".layer.layernorm_mlp.layer_norm_weight", ".norm2.weight")] = value
+            new_sd[key.replace(".layer.layernorm_mlp.layer_norm_weight", ".norm2.norm.weight")] = value
         elif ".layer.layernorm_mlp.layer_norm_bias" in key:
-            new_sd[key.replace(".layer.layernorm_mlp.layer_norm_bias", ".norm2.bias")] = value
+            continue
         elif ".layer.self_attention.layernorm_qkv.query_weight" in key:
             new_sd[key.replace(".layer.self_attention.layernorm_qkv.query_weight", ".q_proj.weight")] = value
         elif ".layer.self_attention.layernorm_qkv.key_weight" in key:
@@ -333,6 +340,8 @@ def convert_checkpoint_te_to_model(state_dict):
             new_sd[key.replace(".layer.self_attention.layernorm_qkv.value_weight", ".v_proj.weight")] = value
         elif ".layer.self_attention.proj.weight" in key:
             new_sd[key.replace(".layer.self_attention.proj.weight", ".out_proj.weight")] = value
+        elif key.endswith(".norm_final.weight"):
+            new_sd[key.replace(".norm_final.weight", ".norm_final.norm.weight")] = value
         else:
             new_sd[key] = value
     return new_sd
