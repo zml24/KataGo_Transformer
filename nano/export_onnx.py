@@ -98,6 +98,10 @@ def _resolve_model_state(state, use_ema):
     return model_state
 
 
+def _looks_like_te_checkpoint(model_state):
+    return any(".layer.self_attention." in key for key in model_state)
+
+
 def _make_dummy_inputs(config, pos_len, device):
     num_bin = get_num_bin_input_features(config)
     num_global = get_num_global_input_features(config)
@@ -196,11 +200,15 @@ def _make_te_decomposed_fallback_args(args):
 
 def _export_legacy(args, state, config):
     model_state = _resolve_model_state(state, args.use_ema)
-    if args.use_te:
+    should_try_te_conversion = args.use_te or _looks_like_te_checkpoint(model_state)
+    if should_try_te_conversion:
         try:
             from model_te import detect_checkpoint_format, convert_checkpoint_te_to_model
         except ImportError as exc:
-            print("ERROR: --use-te requires Transformer Engine and model_te.py dependencies to be installed")
+            if _looks_like_te_checkpoint(model_state):
+                print("ERROR: legacy export detected a TE checkpoint but could not import model_te for conversion")
+            else:
+                print("ERROR: --use-te requires Transformer Engine and model_te.py dependencies to be installed")
             raise SystemExit(1) from exc
         if detect_checkpoint_format(model_state) == "te":
             print("Converting TE checkpoint to model.py format for legacy ONNX export")
@@ -443,7 +451,7 @@ def main():
     parser.add_argument("--fallback-to-legacy-on-te-export-error", action="store_true",
                         help="If TE-based export fails, fall back to legacy export by converting the checkpoint to model.py format")
     parser.add_argument("--use-te", action="store_true",
-                        help="Legacy exporter only: checkpoint is from TE model and should be converted to model.py first")
+                        help="Legacy exporter only: force conversion of a TE checkpoint before export (normally auto-detected)")
     parser.add_argument("--use-ema", action="store_true",
                         help="Export EMA shadow weights instead of training weights")
     args = parser.parse_args()

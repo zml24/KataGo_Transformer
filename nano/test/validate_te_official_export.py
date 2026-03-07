@@ -60,7 +60,7 @@ def _make_export_args(args, checkpoint_path, onnx_path, method, enable_nested_fa
         fallback_to_legacy_on_te_export_error=(
             enable_nested_fallbacks and args.fallback_to_legacy_on_te_export_error
         ),
-        use_te=False,
+        use_te=(method == "legacy"),
         use_ema=False,
     )
 
