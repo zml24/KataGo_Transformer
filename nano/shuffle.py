@@ -47,6 +47,62 @@ POS_LEN = 19
 PACKED_BYTES = (POS_LEN * POS_LEN + 7) // 8  # 46
 
 
+def format_duration(seconds):
+    """Format seconds as a compact human-readable duration."""
+    seconds = max(0, int(round(seconds)))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:d}h{minutes:02d}m{secs:02d}s"
+    if minutes > 0:
+        return f"{minutes:d}m{secs:02d}s"
+    return f"{secs:d}s"
+
+
+class ProgressLogger:
+    """Periodic progress logger with throughput and ETA."""
+
+    def __init__(self, desc, total, unit, interval_sec=30.0):
+        self.desc = desc
+        self.total = max(0, int(total))
+        self.unit = unit
+        self.interval_sec = max(1.0, float(interval_sec))
+        self.t0 = time.time()
+        self.last_report_time = self.t0
+
+    def maybe_report(self, completed, extra=""):
+        now = time.time()
+        if completed < self.total and now - self.last_report_time < self.interval_sec:
+            return
+        self._report(completed, now, extra)
+
+    def final_report(self, completed, extra=""):
+        self._report(completed, time.time(), extra)
+
+    def _report(self, completed, now, extra):
+        elapsed = max(1e-9, now - self.t0)
+        rate = completed / elapsed
+        if self.total > 0:
+            pct = 100.0 * completed / self.total
+            if completed > 0 and completed < self.total:
+                eta = (self.total - completed) / rate
+                eta_text = f", ETA {format_duration(eta)}"
+            else:
+                eta_text = ""
+            total_text = f"/{self.total}"
+            pct_text = f" ({pct:.1f}%)"
+        else:
+            total_text = ""
+            pct_text = ""
+            eta_text = ""
+
+        rate_text = f", {rate:.2f} {self.unit}/s" if rate > 0 else ""
+        extra_text = f", {extra}" if extra else ""
+        print(f"  Progress [{self.desc}]: {completed}{total_text} {self.unit}{pct_text}"
+              f"{rate_text}{eta_text}{extra_text}", flush=True)
+        self.last_report_time = now
+
+
 @dataclass
 class SplitConfig:
     name: str
@@ -116,6 +172,118 @@ def get_numpy_npz_headers(filename):
             (shape, is_fortran, dtype) = np.lib.format._read_array_header(npyfile, version)
             npzheaders[subfilename] = (shape, is_fortran, dtype)
         return npzheaders
+
+
+def get_header_entry(npheaders, key):
+    """Get NPZ header entry, allowing for the '.npy' suffix inside zip files."""
+    if key in npheaders:
+        return npheaders[key]
+    key_npy = f"{key}.npy"
+    if key_npy in npheaders:
+        return npheaders[key_npy]
+    return None
+
+
+def estimate_required_bytes_per_row(filename):
+    """Estimate bytes/row for the arrays this script actually reads."""
+    try:
+        npheaders = get_numpy_npz_headers(filename)
+    except (PermissionError, zipfile.BadZipFile):
+        return None
+
+    if not npheaders:
+        return None
+
+    packed_header = get_header_entry(npheaders, "binaryInputNCHWPacked")
+    if packed_header is None:
+        return None
+
+    num_rows = packed_header[0][0]
+    if num_rows <= 0:
+        return None
+
+    total_bytes = 0
+    for key in REQUIRED_KEYS + OPTIONAL_KEYS:
+        entry = get_header_entry(npheaders, key)
+        if entry is None:
+            if key in REQUIRED_KEYS:
+                return None
+            continue
+        shape, _, dtype = entry
+        itemsize = np.dtype(dtype).itemsize
+        num_items = 1
+        for dim in shape:
+            num_items *= dim
+        total_bytes += itemsize * num_items
+
+    return total_bytes / num_rows
+
+
+def format_bytes(num_bytes):
+    """Format bytes as a human-readable binary size."""
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+
+
+def get_total_memory_bytes():
+    """Best-effort total system RAM detection."""
+    page_names = ("SC_PAGE_SIZE", "SC_PAGESIZE")
+    for page_name in page_names:
+        try:
+            page_size = os.sysconf(page_name)
+            phys_pages = os.sysconf("SC_PHYS_PAGES")
+            return int(page_size) * int(phys_pages)
+        except (AttributeError, OSError, ValueError):
+            continue
+    return None
+
+
+def log_memory_estimates(sample_file, worker_group_size, rows_per_file,
+                         shard_processes, merge_processes):
+    """Print rough memory estimates for current shuffle settings."""
+    bytes_per_row = estimate_required_bytes_per_row(sample_file)
+    if bytes_per_row is None:
+        print("Memory estimate: unavailable (could not read sample NPZ headers)", flush=True)
+        return
+
+    shard_raw = bytes_per_row * worker_group_size
+    merge_raw = bytes_per_row * rows_per_file
+
+    # Rough peak multipliers from the current algorithm:
+    # shardify ~= loaded file arrays + concatenated arrays + shuffled copy
+    # merge ~= buffered arrays + concatenated chunk + shuffled output chunk
+    shard_peak_per_worker = shard_raw * 3.25
+    merge_peak_per_worker = merge_raw * 4.0
+    shard_peak_total = shard_peak_per_worker * shard_processes
+    merge_peak_total = merge_peak_per_worker * merge_processes
+
+    print("Memory estimate (rough, for required arrays only):", flush=True)
+    print(f"  Sample file: {sample_file}", flush=True)
+    print(f"  Bytes per row: {bytes_per_row:.0f} ({format_bytes(bytes_per_row)})", flush=True)
+    print(f"  Shardify per worker: ~{format_bytes(shard_peak_per_worker)} "
+          f"(worker_group_size={worker_group_size})", flush=True)
+    print(f"  Shardify total: ~{format_bytes(shard_peak_total)} "
+          f"({shard_processes} workers)", flush=True)
+    print(f"  Merge per worker: ~{format_bytes(merge_peak_per_worker)} "
+          f"(rows_per_file={rows_per_file})", flush=True)
+    print(f"  Merge total: ~{format_bytes(merge_peak_total)} "
+          f"({merge_processes} workers)", flush=True)
+
+    total_mem = get_total_memory_bytes()
+    if total_mem is not None:
+        print(f"  Host RAM: {format_bytes(total_mem)}", flush=True)
+        if shard_peak_total > total_mem * 0.70:
+            print("WARNING: shardify memory estimate exceeds 70% of host RAM. "
+                  "Reduce --worker-group-size and/or --shard-processes.", flush=True)
+        if merge_peak_total > total_mem * 0.70:
+            print("WARNING: merge memory estimate exceeds 70% of host RAM. "
+                  "Reduce --merge-processes and/or --rows-per-file.", flush=True)
 
 
 def md5_hash_float(s):
@@ -202,6 +370,11 @@ def shardify(input_idx, file_group, num_out_files, out_tmp_dirs,
         offset += n
 
     return counts
+
+
+def shardify_star(args):
+    """Helper for imap_unordered with shardify."""
+    return shardify(*args)
 
 
 def sequential_merge_repack(num_shards, out_tmp_dirs, out_dir, rows_per_file,
@@ -301,7 +474,7 @@ def sequential_merge_repack(num_shards, out_tmp_dirs, out_dir, rows_per_file,
 
 def merge_one_bucket(bucket_idx, tmp_dir, num_shards, out_dir,
                      out_file_idx, rows_per_file, remainder_path,
-                     extra_rows_path=None):
+                     extra_rows_path=None, progress_interval_sec=30.0):
     """Merge all shard files in one bucket, write output files, save remainder.
 
     Uses streaming buffer: loads one shard at a time and flushes when the buffer
@@ -319,7 +492,7 @@ def merge_one_bucket(bucket_idx, tmp_dir, num_shards, out_dir,
         extra_rows_path: Optional path to NPZ file with extra rows to inject.
 
     Returns:
-        (written_files, remainder_rows)
+        (bucket_idx, written_files, remainder_rows)
         - written_files: list of (filepath, num_rows)
         - remainder_rows: int, number of leftover rows saved to remainder_path
     """
@@ -369,8 +542,10 @@ def merge_one_bucket(bucket_idx, tmp_dir, num_shards, out_dir,
         if os.path.exists(path):
             shard_files.append(path)
     np.random.shuffle(shard_files)
+    total_shard_files = len(shard_files)
+    last_progress_time = time.time()
 
-    for path in shard_files:
+    for processed_shards, path in enumerate(shard_files, start=1):
         try:
             with np.load(path) as npz:
                 for key in npz.keys():
@@ -386,18 +561,33 @@ def merge_one_bucket(bucket_idx, tmp_dir, num_shards, out_dir,
         while buffer_rows >= rows_per_file:
             flush_buffer(rows_per_file)
 
+        now = time.time()
+        if processed_shards < total_shard_files and now - last_progress_time >= progress_interval_sec:
+            pct = 100.0 * processed_shards / total_shard_files if total_shard_files > 0 else 100.0
+            print(f"  Bucket {bucket_idx}: read {processed_shards}/{total_shard_files} shard files "
+                  f"({pct:.1f}%), wrote {len(written_files)} files, buffered {buffer_rows} rows",
+                  flush=True)
+            last_progress_time = now
+
     # Save remainder to temp file (avoid pickling large arrays through IPC)
     if buffer_rows > 0:
         remainder = {key: np.concatenate(arrs) for key, arrs in buffer.items()}
         np.savez(remainder_path, **remainder)  # uncompressed, temp file
 
-    return written_files, buffer_rows
+    print(f"  Bucket {bucket_idx}: finished {total_shard_files}/{total_shard_files} shard files, "
+          f"wrote {len(written_files)} files, remainder {buffer_rows} rows", flush=True)
+    return bucket_idx, written_files, buffer_rows
+
+
+def merge_one_bucket_star(args):
+    """Helper for imap_unordered with merge_one_bucket."""
+    return merge_one_bucket(*args)
 
 
 def parallel_merge_repack(num_shards, out_tmp_dirs, out_dir, rows_per_file,
                           num_processes, keep_remainder=False,
                           extra_rows=None, tmp_base_dir=None,
-                          bucket_row_counts=None):
+                          bucket_row_counts=None, progress_interval_sec=30.0):
     """Parallel merge: each bucket processed independently by a worker.
 
     Args:
@@ -468,18 +658,35 @@ def parallel_merge_repack(num_shards, out_tmp_dirs, out_dir, rows_per_file,
         tasks.append((
             bucket_idx, tmp_dir, num_shards, out_dir,
             out_file_starts[bucket_idx], rows_per_file,
-            remainder_path, inject_path,
+            remainder_path, inject_path, progress_interval_sec,
         ))
 
     with multiprocessing.Pool(num_processes) as pool:
-        results = pool.starmap(merge_one_bucket, tasks)
+        results = []
+        progress = ProgressLogger(
+            desc="merge buckets",
+            total=len(tasks),
+            unit="buckets",
+            interval_sec=progress_interval_sec,
+        )
+        total_written_files = 0
+        for completed_buckets, result in enumerate(pool.imap_unordered(merge_one_bucket_star, tasks), start=1):
+            bucket_idx, written_files, rem_rows = result
+            results.append(result)
+            total_written_files += len(written_files)
+            bucket_rows = bucket_row_counts[bucket_idx] if bucket_idx < len(bucket_row_counts) else 0
+            progress.maybe_report(
+                completed_buckets,
+                extra=f"bucket {bucket_idx} done, files_written={total_written_files}, "
+                      f"bucket_rows={bucket_rows}",
+            )
 
     # --- Phase 4: Collect results and handle remainders ---
     all_written = []
     all_remainder_paths = []
     total_remainder_rows = 0
 
-    for bucket_idx, (written_files, rem_rows) in enumerate(results):
+    for bucket_idx, written_files, rem_rows in results:
         all_written.extend(written_files)
         if rem_rows > 0:
             rem_path = os.path.join(remainder_dir, f"rem_{bucket_idx}.npz")
@@ -604,18 +811,21 @@ def select_val_files_fixed(file_rows, val_num_files, rows_per_file):
     return val_file_rows, train_file_rows
 
 
-def process_split(split, num_processes, rows_per_file, worker_group_size,
+def process_split(split, shard_processes, merge_processes, rows_per_file, worker_group_size,
                   num_buckets=None, shard_chunk_size=16384,
-                  keep_remainder=False, extra_rows=None, compress_shards=False):
+                  keep_remainder=False, extra_rows=None, compress_shards=False,
+                  progress_interval_sec=30.0):
     """Process a single split: shardify + parallel merge-repack + index.json.
 
     Args:
         split: SplitConfig with file_rows populated.
-        num_processes: Number of parallel workers for shardify.
+        shard_processes: Number of parallel workers for shardify.
+        merge_processes: Number of parallel workers for merge/repack.
         rows_per_file: Exact rows per output file.
         worker_group_size: Target rows per sharding worker group.
         keep_remainder: If True, return leftover rows instead of writing them.
         extra_rows: Optional dict of arrays to inject (e.g. val remainder for train).
+        progress_interval_sec: Seconds between progress updates.
 
     Returns:
         remainder: dict of arrays (< rows_per_file) or None.
@@ -641,11 +851,13 @@ def process_split(split, num_processes, rows_per_file, worker_group_size,
     if num_buckets is not None:
         num_shards_buckets = min(num_output_files, max(1, num_buckets))
     else:
-        num_shards_buckets = min(num_output_files, max(1, num_processes))
+        num_shards_buckets = min(num_output_files, max(1, merge_processes))
     out_tmp_dirs = [os.path.join(split.tmp_dir, f"tmp.shuf{i}") for i in range(num_shards_buckets)]
 
     print(f"  Intermediate shard buckets: {num_shards_buckets}", flush=True)
     print(f"  Rows per file: {rows_per_file}", flush=True)
+    print(f"  Shard workers: {shard_processes}", flush=True)
+    print(f"  Merge workers: {merge_processes}", flush=True)
 
     # Clean and create tmp dirs
     for d in out_tmp_dirs:
@@ -677,17 +889,27 @@ def process_split(split, num_processes, rows_per_file, worker_group_size,
     # Stage 1: Shardify (parallel)
     bucket_row_counts = np.zeros(num_shards_buckets, dtype=np.int64)
     if groups:
-        with multiprocessing.Pool(num_processes) as pool:
+        with multiprocessing.Pool(shard_processes) as pool:
             with Timer(f"Sharding ({split.name})"):
-                shard_results = pool.starmap(
-                    shardify,
-                    [(idx, groups[idx], num_shards_buckets, out_tmp_dirs,
-                      compress_shards, shard_chunk_size)
-                     for idx in range(num_worker_groups)],
+                progress = ProgressLogger(
+                    desc=f"sharding {split.name}",
+                    total=num_worker_groups,
+                    unit="groups",
+                    interval_sec=progress_interval_sec,
                 )
-                for counts in shard_results:
+                total_sharded = 0
+                shard_tasks = [
+                    (idx, groups[idx], num_shards_buckets, out_tmp_dirs,
+                     compress_shards, shard_chunk_size)
+                    for idx in range(num_worker_groups)
+                ]
+                for completed_groups, counts in enumerate(pool.imap_unordered(shardify_star, shard_tasks), start=1):
                     bucket_row_counts += counts
-                total_sharded = int(bucket_row_counts.sum())
+                    total_sharded += int(counts.sum())
+                    progress.maybe_report(
+                        completed_groups,
+                        extra=f"rows={total_sharded}",
+                    )
                 print(f"  Sharded {total_sharded} rows", flush=True)
     else:
         num_worker_groups = 0
@@ -700,11 +922,12 @@ def process_split(split, num_processes, rows_per_file, worker_group_size,
             out_tmp_dirs=out_tmp_dirs,
             out_dir=split.out_dir,
             rows_per_file=rows_per_file,
-            num_processes=num_processes,
+            num_processes=merge_processes,
             keep_remainder=keep_remainder,
             extra_rows=extra_rows,
             tmp_base_dir=split.tmp_dir,
             bucket_row_counts=bucket_row_counts.tolist(),
+            progress_interval_sec=progress_interval_sec,
         )
 
     # Write index.json
@@ -778,6 +1001,10 @@ def main():
     parser = argparse.ArgumentParser(description="Shuffle NPZ training data for nano.")
     parser.add_argument("dirs", nargs="+", help="Input directories containing NPZ files")
     parser.add_argument("--num-processes", type=int, required=True, help="Number of parallel workers")
+    parser.add_argument("--shard-processes", type=int, default=None,
+                        help="Parallel workers for shardify only (default: --num-processes)")
+    parser.add_argument("--merge-processes", type=int, default=None,
+                        help="Parallel workers for merge/repack only (default: --num-processes)")
     parser.add_argument("--rows-per-file", type=int, default=131072,
                         help="Exact rows per output file (default: 131072). "
                              "Use a power of 2 so it divides evenly by batch_size * world_size.")
@@ -792,12 +1019,14 @@ def main():
                         help="Fixed number of val output files (val total = N * rows-per-file). "
                              "Overrides MD5 bounds for val split.")
     parser.add_argument("--num-buckets", type=int, default=None,
-                        help="Number of intermediate shard buckets (default: num-processes)")
+                        help="Number of intermediate shard buckets (default: merge-processes)")
     parser.add_argument("--shard-chunk-size", type=int, default=16384,
                         help="Rows per chunk when distributing to buckets (default: 16384). "
                              "Larger = fewer shard files, slightly less uniform bucket sizes.")
     parser.add_argument("--compress-shards", action="store_true", default=False,
                         help="Compress intermediate shard files (saves tmp disk space, slower)")
+    parser.add_argument("--progress-interval-sec", type=float, default=30.0,
+                        help="Seconds between progress updates during sharding/merge (default: 30)")
     args = parser.parse_args()
 
     if not args.splits:
@@ -820,10 +1049,13 @@ def main():
             sys.exit(1)
 
     num_processes = args.num_processes
+    shard_processes = args.shard_processes if args.shard_processes is not None else num_processes
+    merge_processes = args.merge_processes if args.merge_processes is not None else num_processes
     rows_per_file = args.rows_per_file
     worker_group_size = args.worker_group_size
-    num_buckets = args.num_buckets if args.num_buckets is not None else num_processes
+    num_buckets = args.num_buckets if args.num_buckets is not None else merge_processes
     shard_chunk_size = args.shard_chunk_size
+    progress_interval_sec = args.progress_interval_sec
 
     # --- Stage 1: Find all NPZ files ---
     all_files = []
@@ -863,6 +1095,14 @@ def main():
     if board_size is not None:
         print(f"Filtered by board size ({board_size}x{board_size}): {filtered_by_board} files removed", flush=True)
     print(f"Total rows: {total_rows}", flush=True)
+    if file_rows:
+        log_memory_estimates(
+            sample_file=file_rows[0][0],
+            worker_group_size=worker_group_size,
+            rows_per_file=rows_per_file,
+            shard_processes=shard_processes,
+            merge_processes=merge_processes,
+        )
 
     if total_rows == 0:
         print("No rows found, exiting.")
@@ -914,24 +1154,27 @@ def main():
     val_remainder = None
     if val_split is not None:
         val_remainder = process_split(
-            val_split, num_processes, rows_per_file, worker_group_size,
+            val_split, shard_processes, merge_processes, rows_per_file, worker_group_size,
             num_buckets=num_buckets, shard_chunk_size=shard_chunk_size,
             keep_remainder=True, compress_shards=compress_shards,
+            progress_interval_sec=progress_interval_sec,
         )
 
     if train_split is not None:
         process_split(
-            train_split, num_processes, rows_per_file, worker_group_size,
+            train_split, shard_processes, merge_processes, rows_per_file, worker_group_size,
             num_buckets=num_buckets, shard_chunk_size=shard_chunk_size,
             extra_rows=val_remainder, compress_shards=compress_shards,
+            progress_interval_sec=progress_interval_sec,
         )
 
     # Process any other splits (neither train nor val)
     for split in args.splits:
         if split.name not in ("train", "val"):
-            process_split(split, num_processes, rows_per_file, worker_group_size,
+            process_split(split, shard_processes, merge_processes, rows_per_file, worker_group_size,
                           num_buckets=num_buckets, shard_chunk_size=shard_chunk_size,
-                          compress_shards=compress_shards)
+                          compress_shards=compress_shards,
+                          progress_interval_sec=progress_interval_sec)
 
     print(f"\nAll splits done.", flush=True)
 

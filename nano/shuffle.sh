@@ -11,6 +11,9 @@ set -o pipefail
 #   # Fixed val size: val = 2 files (2 * 131072 rows)
 #   VAL_NUM_FILES=2 bash shuffle.sh /data/npz /out /tmp 8
 #
+#   # Limit memory-heavy sharding, keep merge moderately parallel
+#   bash shuffle.sh /data/npz /out /tmp 24 --shard-processes 4 --merge-processes 8
+#
 #   # Compress intermediate shards (saves tmp disk, slower)
 #   COMPRESS_SHARDS=1 bash shuffle.sh /data/npz /out /tmp 8
 
