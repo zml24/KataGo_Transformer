@@ -24,6 +24,13 @@ import configs
 from export_onnx import export, verify
 
 DEFAULT_MODES = ["te-official", "te-decomposed", "legacy"]
+DEFAULT_TRTEXEC_CANDIDATES = [
+    "trtexec",
+    "/usr/src/tensorrt/bin/trtexec",
+    "/usr/local/tensorrt/bin/trtexec",
+    "/usr/local/TensorRT/bin/trtexec",
+    "/opt/tensorrt/bin/trtexec",
+]
 
 
 def _mode_slug(mode):
@@ -111,6 +118,23 @@ def _shape_spec(args, model_config):
     )
 
 
+def _resolve_trtexec_path(trtexec_bin):
+    if os.path.isabs(trtexec_bin):
+        return trtexec_bin if os.path.isfile(trtexec_bin) and os.access(trtexec_bin, os.X_OK) else None
+
+    direct = shutil.which(trtexec_bin)
+    if direct is not None:
+        return direct
+
+    if trtexec_bin != "trtexec":
+        return None
+
+    for candidate in DEFAULT_TRTEXEC_CANDIDATES[1:]:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def _run_trtexec(cmd, description):
     print(description)
     print("  " + " ".join(shlex.quote(part) for part in cmd))
@@ -183,9 +207,12 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
         print(f"Skipping TensorRT build/benchmark for {mode} because --skip-trtexec was set")
         return None
 
-    trtexec_path = shutil.which(args.trtexec_bin)
+    trtexec_path = _resolve_trtexec_path(args.trtexec_bin)
     if trtexec_path is None:
-        print(f"Skipping TensorRT build/benchmark for {mode} because {args.trtexec_bin!r} was not found in PATH")
+        print(
+            f"Skipping TensorRT build/benchmark for {mode} because {args.trtexec_bin!r} was not found. "
+            "Add it to PATH or pass --trtexec-bin /abs/path/to/trtexec"
+        )
         return None
 
     shapes = _shape_spec(args, model_config)

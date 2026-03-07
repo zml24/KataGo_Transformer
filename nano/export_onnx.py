@@ -130,9 +130,30 @@ def _print_param_count(model):
     print(f"Parameters: {num_params:,}")
 
 
+def _collect_export_artifacts(output_path):
+    artifacts = []
+    for path in (output_path, output_path + ".data"):
+        if os.path.exists(path):
+            artifacts.append(path)
+    return artifacts
+
+
 def _save_summary(output_path):
-    size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"Saved: {output_path} ({size_mb:.1f} MB)")
+    artifacts = _collect_export_artifacts(output_path)
+    if not artifacts:
+        print(f"Saved: {output_path}")
+        return
+
+    output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    if len(artifacts) == 1:
+        print(f"Saved: {output_path} ({output_size_mb:.1f} MB)")
+        return
+
+    total_size_mb = sum(os.path.getsize(path) for path in artifacts) / (1024 * 1024)
+    print(f"Saved: {output_path} ({output_size_mb:.1f} MB, total with external data {total_size_mb:.1f} MB)")
+    for path in artifacts[1:]:
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        print(f"  External data: {path} ({size_mb:.1f} MB)")
 
 
 def _resolve_te_support():
