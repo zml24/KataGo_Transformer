@@ -14,6 +14,9 @@ set -o pipefail
 #   # Limit memory-heavy sharding, keep merge moderately parallel
 #   bash shuffle.sh /data/npz /out /tmp 24 --shard-processes 4 --merge-processes 8
 #
+#   # Reuse scan results across reruns
+#   bash shuffle.sh /data/npz /out /tmp 12 --scan-cache /tmp/katago_scan_cache.sqlite
+#
 #   # Compress intermediate shards (saves tmp disk, slower)
 #   COMPRESS_SHARDS=1 bash shuffle.sh /data/npz /out /tmp 8
 

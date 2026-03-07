@@ -27,6 +27,7 @@ import json
 import multiprocessing
 import os
 import shutil
+import sqlite3
 import sys
 import time
 import zipfile
@@ -46,6 +47,9 @@ OPTIONAL_KEYS = []
 
 POS_LEN = 19
 PACKED_BYTES = (POS_LEN * POS_LEN + 7) // 8  # 46
+SCAN_CACHE_KEY_NONE = -1
+SCAN_CACHE_PROCESS_CHUNK_SIZE = 8192
+SCAN_CACHE_QUERY_BATCH_SIZE = 512
 
 
 def format_duration(seconds):
@@ -102,6 +106,100 @@ class ProgressLogger:
         print(f"  Progress [{self.desc}]: {completed}{total_text} {self.unit}{pct_text}"
               f"{rate_text}{eta_text}{extra_text}", flush=True)
         self.last_report_time = now
+
+
+def board_size_cache_key(board_size):
+    """Encode board_size for cache storage."""
+    return SCAN_CACHE_KEY_NONE if board_size is None else int(board_size)
+
+
+def open_scan_cache(path):
+    """Open or create the SQLite scan cache."""
+    cache_dir = os.path.dirname(path)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scan_cache (
+            board_size INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            num_rows INTEGER NOT NULL,
+            ok INTEGER NOT NULL,
+            PRIMARY KEY (board_size, path)
+        )
+        """
+    )
+    # Older versions used 0 to represent board_size=None. Migrate in place so
+    # existing caches keep working after switching the sentinel to -1.
+    conn.execute(
+        "UPDATE scan_cache SET board_size = ? WHERE board_size = 0",
+        (SCAN_CACHE_KEY_NONE,),
+    )
+    conn.commit()
+    return conn
+
+
+def fetch_scan_cache_entries(conn, board_size, paths):
+    """Fetch cached scan results for a list of file paths."""
+    if not paths:
+        return {}
+
+    cache_key = board_size_cache_key(board_size)
+    cached = {}
+    for i in range(0, len(paths), SCAN_CACHE_QUERY_BATCH_SIZE):
+        batch = paths[i:i + SCAN_CACHE_QUERY_BATCH_SIZE]
+        placeholders = ",".join("?" for _ in batch)
+        query = (
+            f"SELECT path, num_rows, ok FROM scan_cache "
+            f"WHERE board_size = ? AND path IN ({placeholders})"
+        )
+        rows = conn.execute(query, [cache_key, *batch]).fetchall()
+        for path, num_rows, ok in rows:
+            num_rows = None if num_rows == -1 else num_rows
+            cached[path] = (num_rows, bool(ok))
+    return cached
+
+
+def store_scan_cache_entries(conn, board_size, scan_results):
+    """Store scan results into the cache."""
+    if not scan_results:
+        return
+
+    cache_key = board_size_cache_key(board_size)
+    rows = []
+    for filename, num_rows, ok in scan_results:
+        stored_rows = -1 if num_rows is None else int(num_rows)
+        rows.append((cache_key, filename, stored_rows, 1 if ok else 0))
+
+    conn.executemany(
+        """
+        INSERT INTO scan_cache (board_size, path, num_rows, ok)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(board_size, path) DO UPDATE SET
+            num_rows = excluded.num_rows,
+            ok = excluded.ok
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def apply_scan_result(filename, num_rows, ok, file_rows, total_rows, bad_files, filtered_by_board):
+    """Accumulate one scan result into summary counters."""
+    if num_rows is None or num_rows <= 0:
+        bad_files += 1
+    elif not ok:
+        filtered_by_board += 1
+    else:
+        file_rows.append((filename, num_rows))
+        total_rows += num_rows
+
+    return total_rows, bad_files, filtered_by_board
 
 
 @dataclass
@@ -1028,6 +1126,10 @@ def main():
                         help="Compress intermediate shard files (saves tmp disk space, slower)")
     parser.add_argument("--progress-interval-sec", type=float, default=30.0,
                         help="Seconds between progress updates during sharding/merge (default: 30)")
+    parser.add_argument("--scan-cache", type=str, default=None,
+                        help="Optional SQLite cache file for scan results. Reuses row counts "
+                             "and board-size checks across reruns of the same dataset. "
+                             "Cache entries are keyed by path and are not invalidated by mtime/size.")
     args = parser.parse_args()
 
     if not args.splits:
@@ -1043,6 +1145,10 @@ def main():
             print("ERROR: --val-num-files requires both 'val' and 'train' splits.", file=sys.stderr)
             sys.exit(1)
 
+    if args.filter_board_size is not None and args.filter_board_size <= 0:
+        print("ERROR: --filter-board-size must be > 0.", file=sys.stderr)
+        sys.exit(1)
+
     # Pre-check: fail fast if any output directory already exists
     for split in args.splits:
         if os.path.exists(split.out_dir):
@@ -1057,6 +1163,7 @@ def main():
     num_buckets = args.num_buckets if args.num_buckets is not None else merge_processes
     shard_chunk_size = args.shard_chunk_size
     progress_interval_sec = args.progress_interval_sec
+    scan_cache_path = args.scan_cache
 
     # --- Stage 1: Find all NPZ files ---
     all_files = []
@@ -1083,36 +1190,91 @@ def main():
     else:
         scan_desc = "Scanning files (row counts)"
     with Timer(scan_desc):
-        with multiprocessing.Pool(num_processes) as pool:
-            progress = ProgressLogger(
-                desc="scan files",
-                total=len(all_files),
-                unit="files",
-                interval_sec=progress_interval_sec,
-            )
-            scan_iter = zip(all_files, itertools.repeat(board_size))
-            for scanned_files, (filename, num_rows, ok) in enumerate(
-                pool.imap_unordered(scan_file, scan_iter, chunksize=64),
-                start=1,
-            ):
-                if num_rows is None or num_rows <= 0:
-                    bad_files += 1
-                elif not ok:
-                    filtered_by_board += 1
-                else:
-                    file_rows.append((filename, num_rows))
-                    total_rows += num_rows
+        cache_conn = None
+        cache_hits = 0
+        cache_misses = 0
+        if scan_cache_path is not None:
+            cache_conn = open_scan_cache(scan_cache_path)
+            print(f"  Scan cache: {scan_cache_path}", flush=True)
 
-                progress.maybe_report(
-                    scanned_files,
-                    extra=f"valid={len(file_rows)}, bad={bad_files}, "
-                          f"filtered={filtered_by_board}, rows={total_rows}",
+        try:
+            with multiprocessing.Pool(num_processes) as pool:
+                progress = ProgressLogger(
+                    desc="scan files",
+                    total=len(all_files),
+                    unit="files",
+                    interval_sec=progress_interval_sec,
                 )
+                scanned_files = 0
+
+                if cache_conn is None:
+                    scan_iter = zip(all_files, itertools.repeat(board_size))
+                    for filename, num_rows, ok in pool.imap_unordered(scan_file, scan_iter, chunksize=64):
+                        total_rows, bad_files, filtered_by_board = apply_scan_result(
+                            filename, num_rows, ok,
+                            file_rows, total_rows, bad_files, filtered_by_board,
+                        )
+                        scanned_files += 1
+                        progress.maybe_report(
+                            scanned_files,
+                            extra=f"valid={len(file_rows)}, bad={bad_files}, "
+                                  f"filtered={filtered_by_board}, rows={total_rows}",
+                        )
+                else:
+                    for chunk_start in range(0, len(all_files), SCAN_CACHE_PROCESS_CHUNK_SIZE):
+                        chunk_files = all_files[chunk_start:chunk_start + SCAN_CACHE_PROCESS_CHUNK_SIZE]
+                        cached_results = fetch_scan_cache_entries(cache_conn, board_size, chunk_files)
+
+                        for filename in chunk_files:
+                            entry = cached_results.get(filename)
+                            if entry is None:
+                                continue
+                            num_rows, ok = entry
+                            total_rows, bad_files, filtered_by_board = apply_scan_result(
+                                filename, num_rows, ok,
+                                file_rows, total_rows, bad_files, filtered_by_board,
+                            )
+                            scanned_files += 1
+                            cache_hits += 1
+                            progress.maybe_report(
+                                scanned_files,
+                                extra=f"valid={len(file_rows)}, bad={bad_files}, "
+                                      f"filtered={filtered_by_board}, rows={total_rows}, "
+                                      f"cache_hits={cache_hits}, cache_misses={cache_misses}",
+                            )
+
+                        missing = [filename for filename in chunk_files if filename not in cached_results]
+                        if not missing:
+                            continue
+
+                        to_store = []
+                        miss_iter = zip(missing, itertools.repeat(board_size))
+                        for filename, num_rows, ok in pool.imap_unordered(scan_file, miss_iter, chunksize=64):
+                            total_rows, bad_files, filtered_by_board = apply_scan_result(
+                                filename, num_rows, ok,
+                                file_rows, total_rows, bad_files, filtered_by_board,
+                            )
+                            scanned_files += 1
+                            cache_misses += 1
+                            to_store.append((filename, num_rows, ok))
+                            progress.maybe_report(
+                                scanned_files,
+                                extra=f"valid={len(file_rows)}, bad={bad_files}, "
+                                      f"filtered={filtered_by_board}, rows={total_rows}, "
+                                      f"cache_hits={cache_hits}, cache_misses={cache_misses}",
+                            )
+
+                        store_scan_cache_entries(cache_conn, board_size, to_store)
+        finally:
+            if cache_conn is not None:
+                cache_conn.close()
 
     print(f"Valid files: {len(file_rows)}, bad/empty: {bad_files}", flush=True)
     if board_size is not None:
         print(f"Filtered by board size ({board_size}x{board_size}): {filtered_by_board} files removed", flush=True)
     print(f"Total rows: {total_rows}", flush=True)
+    if scan_cache_path is not None:
+        print(f"Scan cache stats: {cache_hits} hits, {cache_misses} misses", flush=True)
     if file_rows:
         log_memory_estimates(
             sample_file=file_rows[0][0],
