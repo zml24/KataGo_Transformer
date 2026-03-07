@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import hashlib
+import itertools
 import json
 import multiprocessing
 import os
@@ -1073,23 +1074,40 @@ def main():
 
     # --- Stage 2: Scan files (row counts + optional board size filter) ---
     board_size = args.filter_board_size
-    with Timer("Scanning files (row counts" + (f" + {board_size}x{board_size} filter)" if board_size else ")")):
-        with multiprocessing.Pool(num_processes) as pool:
-            results = pool.map(scan_file, [(f, board_size) for f in all_files], chunksize=64)
-
     file_rows = []
     total_rows = 0
     bad_files = 0
     filtered_by_board = 0
-    for filename, num_rows, ok in results:
-        if num_rows is None or num_rows <= 0:
-            bad_files += 1
-            continue
-        if not ok:
-            filtered_by_board += 1
-            continue
-        file_rows.append((filename, num_rows))
-        total_rows += num_rows
+    if board_size is not None:
+        scan_desc = f"Scanning files (row counts + {board_size}x{board_size} filter)"
+    else:
+        scan_desc = "Scanning files (row counts)"
+    with Timer(scan_desc):
+        with multiprocessing.Pool(num_processes) as pool:
+            progress = ProgressLogger(
+                desc="scan files",
+                total=len(all_files),
+                unit="files",
+                interval_sec=progress_interval_sec,
+            )
+            scan_iter = zip(all_files, itertools.repeat(board_size))
+            for scanned_files, (filename, num_rows, ok) in enumerate(
+                pool.imap_unordered(scan_file, scan_iter, chunksize=64),
+                start=1,
+            ):
+                if num_rows is None or num_rows <= 0:
+                    bad_files += 1
+                elif not ok:
+                    filtered_by_board += 1
+                else:
+                    file_rows.append((filename, num_rows))
+                    total_rows += num_rows
+
+                progress.maybe_report(
+                    scanned_files,
+                    extra=f"valid={len(file_rows)}, bad={bad_files}, "
+                          f"filtered={filtered_by_board}, rows={total_rows}",
+                )
 
     print(f"Valid files: {len(file_rows)}, bad/empty: {bad_files}", flush=True)
     if board_size is not None:
