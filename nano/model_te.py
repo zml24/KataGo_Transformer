@@ -340,6 +340,8 @@ def convert_checkpoint_te_to_model(state_dict):
             new_sd[key.replace(".layer.self_attention.layernorm_qkv.value_weight", ".v_proj.weight")] = value
         elif ".layer.self_attention.proj.weight" in key:
             new_sd[key.replace(".layer.self_attention.proj.weight", ".out_proj.weight")] = value
+        elif key == "norm_final.weight":
+            new_sd["norm_final.norm.weight"] = value
         elif key.endswith(".norm_final.weight"):
             new_sd[key.replace(".norm_final.weight", ".norm_final.norm.weight")] = value
         else:
