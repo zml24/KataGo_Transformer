@@ -153,7 +153,7 @@ def _resolve_te_support():
         except ImportError as exc:
             raise RuntimeError("Unable to locate Transformer Engine ONNX export context manager.") from exc
 
-    return te_onnx_export, te_translation_table
+    return te, te_onnx_export, te_translation_table
 
 
 def _resolve_te_device(device_arg):
@@ -218,7 +218,7 @@ def _export_legacy(args, state, config):
 
 
 def _export_te_official(args, state, config):
-    te_onnx_export, te_translation_table = _resolve_te_support()
+    te, te_onnx_export, te_translation_table = _resolve_te_support()
     from model_te import Model as TEModel, convert_checkpoint_model_to_te, detect_checkpoint_format
 
     device = _resolve_te_device(args.device)
@@ -243,19 +243,20 @@ def _export_te_official(args, state, config):
         "output_names": OUTPUT_NAMES,
         "dynamo": True,
         "fallback": False,
-        "dynamic_shapes": _te_dynamic_shapes(),
         "custom_translation_table": te_translation_table,
     }
+    if args.dynamic_batch:
+        export_kwargs["dynamic_shapes"] = _te_dynamic_shapes()
     if args.opset is not None:
         export_kwargs["opset_version"] = args.opset
 
     print("Running one TE eager forward pass before export ...")
-    with torch.inference_mode():
+    with torch.no_grad(), te.autocast(enabled=False):
         wrapper(input_spatial, input_global)
 
     opset_desc = f"opset {args.opset}" if args.opset is not None else "PyTorch default opset"
     print(f"Exporting ONNX with Transformer Engine official exporter ({opset_desc}) ...")
-    with torch.inference_mode():
+    with torch.no_grad(), te.autocast(enabled=False):
         with te_onnx_export(enabled=True):
             torch.onnx.export(
                 wrapper,
@@ -327,6 +328,8 @@ def main():
                         choices=["mixop", "mix", "simple"], help="Score belief head mode")
     parser.add_argument("--opset", type=int, default=None,
                         help="ONNX opset version (default: legacy=17, te-official=PyTorch default)")
+    parser.add_argument("--dynamic-batch", action="store_true",
+                        help="Enable dynamic batch shapes for te-official export (disabled by default to match the official example)")
     parser.add_argument("--verify", action="store_true", help="Verify exported model with onnxruntime")
     parser.add_argument("--ort-provider", type=str, default="CPUExecutionProvider",
                         help="onnxruntime provider used by --verify (default: CPUExecutionProvider)")

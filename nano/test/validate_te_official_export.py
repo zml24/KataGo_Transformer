@@ -31,6 +31,7 @@ def _make_export_args(args, checkpoint_path, onnx_path):
         pos_len=args.pos_len,
         score_mode=args.score_mode,
         opset=args.opset,
+        dynamic_batch=args.dynamic_batch,
         verify=False,
         ort_provider=args.ort_provider,
         use_te=False,
@@ -126,6 +127,8 @@ def main():
                         choices=["mixop", "mix", "simple"], help="Score belief head mode")
     parser.add_argument("--opset", type=int, default=None,
                         help="ONNX opset version passed to export_onnx.py (default: PyTorch exporter default)")
+    parser.add_argument("--dynamic-batch", action="store_true",
+                        help="Enable dynamic batch shapes during te-official export")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed (default: 1234)")
     parser.add_argument("--init-std", type=float, default=0.02,
                         help="Initialization std passed to model.initialize() (default: 0.02)")
