@@ -34,6 +34,7 @@ def _make_export_args(args, checkpoint_path, onnx_path):
         dynamic_batch=args.dynamic_batch,
         verify=False,
         ort_provider=args.ort_provider,
+        fallback_to_legacy_on_te_export_error=args.fallback_to_legacy_on_te_export_error,
         use_te=False,
         use_ema=False,
     )
@@ -142,6 +143,8 @@ def main():
                         help="trtexec binary name or absolute path (default: trtexec)")
     parser.add_argument("--skip-trtexec", action="store_true",
                         help="Do not run TensorRT build validation")
+    parser.add_argument("--fallback-to-legacy-on-te-export-error", action="store_true",
+                        help="If the official TE export fails, fall back to legacy export so TensorRT validation can continue")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)

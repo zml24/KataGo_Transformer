@@ -178,6 +178,13 @@ def _validate_te_load_result(load_result):
         sys.exit(1)
 
 
+def _make_legacy_fallback_args(args):
+    fallback_args = argparse.Namespace(**vars(args))
+    fallback_args.method = "legacy"
+    fallback_args.use_te = True
+    return fallback_args
+
+
 def _export_legacy(args, state, config):
     model_state = _resolve_model_state(state, args.use_ema)
     if args.use_te:
@@ -274,7 +281,14 @@ def export(args):
     if args.method == "legacy":
         return _export_legacy(args, state, config)
     if args.method == "te-official":
-        return _export_te_official(args, state, config)
+        try:
+            return _export_te_official(args, state, config)
+        except RuntimeError as exc:
+            if getattr(args, "fallback_to_legacy_on_te_export_error", False):
+                print("\nWARNING: te-official export failed, falling back to legacy export.")
+                print(f"  original error: {exc}")
+                return _export_legacy(_make_legacy_fallback_args(args), state, config)
+            raise
     raise ValueError(f"Unsupported export method: {args.method}")
 
 
@@ -333,6 +347,8 @@ def main():
     parser.add_argument("--verify", action="store_true", help="Verify exported model with onnxruntime")
     parser.add_argument("--ort-provider", type=str, default="CPUExecutionProvider",
                         help="onnxruntime provider used by --verify (default: CPUExecutionProvider)")
+    parser.add_argument("--fallback-to-legacy-on-te-export-error", action="store_true",
+                        help="If te-official export fails, fall back to legacy export by converting the checkpoint to model.py format")
     parser.add_argument("--use-te", action="store_true",
                         help="Legacy exporter only: checkpoint is from TE model and should be converted to model.py first")
     parser.add_argument("--use-ema", action="store_true",
