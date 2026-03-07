@@ -4,6 +4,7 @@
 Usage:
     python export_onnx.py --checkpoint /path/to/checkpoint.ckpt
     python export_onnx.py --checkpoint /path/to/checkpoint.ckpt --output model.onnx --verify
+    python export_onnx.py --checkpoint /path/to/checkpoint.ckpt --method te-official --device cuda
 """
 
 import argparse
@@ -12,18 +13,19 @@ import sys
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from configs import get_num_bin_input_features, get_num_global_input_features, migrate_config
 from model import Model
 
 
 # ---------------------------------------------------------------------------
-# Patch nn.RMSNorm.forward so that ONNX export sees only basic math ops
-# instead of the unsupported aten::rms_norm operator.
+# Patch nn.RMSNorm.forward so that the legacy exporter sees only basic math ops
+# instead of aten::rms_norm, which is still problematic in some ONNX paths.
 # ---------------------------------------------------------------------------
 _original_rms_norm_forward = None
-if hasattr(torch.nn, "RMSNorm"):
-    _original_rms_norm_forward = torch.nn.RMSNorm.forward
+if hasattr(nn, "RMSNorm"):
+    _original_rms_norm_forward = nn.RMSNorm.forward
 
     def _manual_rms_norm_forward(self, x):
         x_f32 = x.float()
@@ -31,9 +33,10 @@ if hasattr(torch.nn, "RMSNorm"):
         inv_rms = torch.rsqrt(mean_sq + torch.tensor(self.eps, dtype=x_f32.dtype, device=x_f32.device))
         return (self.weight * (x_f32 * inv_rms)).type_as(x)
 
-    torch.nn.RMSNorm.forward = _manual_rms_norm_forward
+    nn.RMSNorm.forward = _manual_rms_norm_forward
 
 
+INPUT_NAMES = ["input_spatial", "input_global"]
 OUTPUT_NAMES = [
     "out_policy",       # (N, 6, L+1)
     "out_value",        # (N, 3)
@@ -47,99 +50,256 @@ OUTPUT_NAMES = [
 ]
 
 
-def export(args):
-    # Load checkpoint
+class TEOfficialExportWrapper(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_spatial, input_global):
+        return self.model.forward_for_onnx_export(input_spatial, input_global)
+
+
+def _load_checkpoint(args):
     print(f"Loading checkpoint: {args.checkpoint}")
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = migrate_config(state["config"])
     print(f"Model config: {config}")
-    print(f"pos_len={args.pos_len}, score_mode={args.score_mode}")
+    print(f"pos_len={args.pos_len}, score_mode={args.score_mode}, method={args.method}")
+    return state, config
 
-    # Build model — always export via model.py's Model for ONNX compatibility
-    model_state = state["model"]
-    if args.use_te:
-        from model_te import detect_checkpoint_format, convert_checkpoint_te_to_model
-        if detect_checkpoint_format(model_state) == "te":
-            print("Converting TE checkpoint to model.py format for ONNX export")
-            model_state = convert_checkpoint_te_to_model(model_state)
-    if args.use_ema:
-        ema_shadow = state.get("ema_shadow")
-        if ema_shadow is None:
-            print("ERROR: --use-ema specified but checkpoint has no ema_shadow state")
-            sys.exit(1)
-        for name, tensor in ema_shadow.items():
-            if name in model_state:
-                model_state[name] = tensor
-        print(f"Using EMA weights ({len(ema_shadow)} parameters)")
-    model = Model(config, args.pos_len, score_mode=args.score_mode)
-    model.load_state_dict(model_state)
-    model.eval()
 
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {num_params:,}")
-
-    # Dummy inputs
-    num_bin = get_num_bin_input_features(config)
-    num_global = get_num_global_input_features(config)
-    H = W = args.pos_len
-
-    input_spatial = torch.randn(1, num_bin, H, W)
-    input_global = torch.randn(1, num_global)
-
-    # Output path
+def _resolve_output_path(args):
     output_path = args.output
     if output_path is None:
         output_path = os.path.join(os.path.dirname(args.checkpoint), "model.onnx")
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    return output_path
 
-    # Dynamic axes: batch dimension only
+
+def _resolve_model_state(state, use_ema):
+    model_state = dict(state["model"])
+    if not use_ema:
+        return model_state
+
+    ema_shadow = state.get("ema_shadow")
+    if ema_shadow is None:
+        print("ERROR: --use-ema specified but checkpoint has no ema_shadow state")
+        sys.exit(1)
+
+    for name, tensor in ema_shadow.items():
+        if name in model_state:
+            model_state[name] = tensor
+    print(f"Using EMA weights ({len(ema_shadow)} parameters)")
+    return model_state
+
+
+def _make_dummy_inputs(config, pos_len, device):
+    num_bin = get_num_bin_input_features(config)
+    num_global = get_num_global_input_features(config)
+    input_spatial = torch.randn(1, num_bin, pos_len, pos_len, device=device)
+    input_global = torch.randn(1, num_global, device=device)
+    return input_spatial, input_global
+
+
+def _legacy_dynamic_axes():
     dynamic_axes = {"input_spatial": {0: "batch"}, "input_global": {0: "batch"}}
     for name in OUTPUT_NAMES:
         dynamic_axes[name] = {0: "batch"}
+    return dynamic_axes
 
-    # Export
-    print(f"Exporting ONNX (opset {args.opset}) ...")
-    with torch.no_grad():
+
+def _te_dynamic_shapes():
+    batch = torch.export.Dim("batch")
+    return (
+        {0: batch},
+        {0: batch},
+    )
+
+
+def _print_param_count(model):
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {num_params:,}")
+
+
+def _save_summary(output_path):
+    size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    print(f"Saved: {output_path} ({size_mb:.1f} MB)")
+
+
+def _resolve_te_support():
+    try:
+        import transformer_engine.pytorch as te
+    except ImportError as exc:
+        raise RuntimeError(
+            "Transformer Engine is required for --method te-official. "
+            "Install transformer-engine[pytorch] on a CUDA machine first."
+        ) from exc
+
+    try:
+        from transformer_engine.pytorch.export import te_translation_table
+    except ImportError as exc:
+        raise RuntimeError(
+            "This Transformer Engine build does not expose transformer_engine.pytorch.export.te_translation_table."
+        ) from exc
+
+    te_onnx_export = getattr(te, "onnx_export", None)
+    if te_onnx_export is None:
+        try:
+            from transformer_engine.pytorch import onnx_export as te_onnx_export
+        except ImportError as exc:
+            raise RuntimeError("Unable to locate Transformer Engine ONNX export context manager.") from exc
+
+    return te_onnx_export, te_translation_table
+
+
+def _resolve_te_device(device_arg):
+    if device_arg is not None:
+        device = torch.device(device_arg)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type != "cuda":
+        raise RuntimeError("--method te-official requires a CUDA device, for example --device cuda or --device cuda:0.")
+    return device
+
+
+def _validate_te_load_result(load_result):
+    missing = [key for key in load_result.missing_keys if "_extra_state" not in key]
+    unexpected = [key for key in load_result.unexpected_keys if "_extra_state" not in key]
+    if missing or unexpected:
+        print("ERROR: failed to load TE checkpoint cleanly for official ONNX export")
+        if missing:
+            print(f"  missing keys: {missing}")
+        if unexpected:
+            print(f"  unexpected keys: {unexpected}")
+        sys.exit(1)
+
+
+def _export_legacy(args, state, config):
+    model_state = _resolve_model_state(state, args.use_ema)
+    if args.use_te:
+        try:
+            from model_te import detect_checkpoint_format, convert_checkpoint_te_to_model
+        except ImportError as exc:
+            print("ERROR: --use-te requires Transformer Engine and model_te.py dependencies to be installed")
+            raise SystemExit(1) from exc
+        if detect_checkpoint_format(model_state) == "te":
+            print("Converting TE checkpoint to model.py format for legacy ONNX export")
+            model_state = convert_checkpoint_te_to_model(model_state)
+
+    model = Model(config, args.pos_len, score_mode=args.score_mode)
+    model.load_state_dict(model_state)
+    model.eval()
+    _print_param_count(model)
+
+    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device="cpu")
+    output_path = _resolve_output_path(args)
+    opset_version = 17 if args.opset is None else args.opset
+
+    print(f"Exporting ONNX with legacy exporter (opset {opset_version}) ...")
+    with torch.inference_mode():
         torch.onnx.export(
             model,
             (input_spatial, input_global),
             output_path,
-            input_names=["input_spatial", "input_global"],
+            input_names=INPUT_NAMES,
             output_names=OUTPUT_NAMES,
-            dynamic_axes=dynamic_axes,
-            opset_version=args.opset,
+            dynamic_axes=_legacy_dynamic_axes(),
+            opset_version=opset_version,
             do_constant_folding=True,
+            dynamo=False,
         )
 
-    size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"Saved: {output_path} ({size_mb:.1f} MB)")
+    _save_summary(output_path)
     return output_path, model, input_spatial, input_global
 
 
-def verify(onnx_path, model, input_spatial, input_global):
+def _export_te_official(args, state, config):
+    te_onnx_export, te_translation_table = _resolve_te_support()
+    from model_te import Model as TEModel, convert_checkpoint_model_to_te, detect_checkpoint_format
+
+    device = _resolve_te_device(args.device)
+    model_state = _resolve_model_state(state, args.use_ema)
+    if detect_checkpoint_format(model_state) == "pt":
+        print("Converting model.py checkpoint to TE format for official TE ONNX export")
+        model_state = convert_checkpoint_model_to_te(model_state)
+
+    model = TEModel(config, args.pos_len, score_mode=args.score_mode)
+    load_result = model.load_state_dict(model_state, strict=False)
+    _validate_te_load_result(load_result)
+    model.eval()
+    model.to(device)
+    _print_param_count(model)
+
+    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device=device)
+    wrapper = TEOfficialExportWrapper(model).eval()
+    output_path = _resolve_output_path(args)
+
+    export_kwargs = {
+        "input_names": INPUT_NAMES,
+        "output_names": OUTPUT_NAMES,
+        "dynamo": True,
+        "fallback": False,
+        "dynamic_shapes": _te_dynamic_shapes(),
+        "custom_translation_table": te_translation_table,
+    }
+    if args.opset is not None:
+        export_kwargs["opset_version"] = args.opset
+
+    print("Running one TE eager forward pass before export ...")
+    with torch.inference_mode():
+        wrapper(input_spatial, input_global)
+
+    opset_desc = f"opset {args.opset}" if args.opset is not None else "PyTorch default opset"
+    print(f"Exporting ONNX with Transformer Engine official exporter ({opset_desc}) ...")
+    with torch.inference_mode():
+        with te_onnx_export(enabled=True):
+            torch.onnx.export(
+                wrapper,
+                (input_spatial, input_global),
+                output_path,
+                **export_kwargs,
+            )
+
+    _save_summary(output_path)
+    return output_path, wrapper, input_spatial, input_global
+
+
+def export(args):
+    state, config = _load_checkpoint(args)
+    if args.method == "legacy":
+        return _export_legacy(args, state, config)
+    if args.method == "te-official":
+        return _export_te_official(args, state, config)
+    raise ValueError(f"Unsupported export method: {args.method}")
+
+
+def verify(onnx_path, model, input_spatial, input_global, provider="CPUExecutionProvider", atol=1e-5, rtol=1e-5):
     import onnxruntime as ort
 
-    # Restore original RMSNorm so PyTorch inference matches training behavior exactly
+    # Restore original RMSNorm so PyTorch inference matches training behavior exactly.
     if _original_rms_norm_forward is not None:
-        torch.nn.RMSNorm.forward = _original_rms_norm_forward
+        nn.RMSNorm.forward = _original_rms_norm_forward
 
-    print("\nVerifying with onnxruntime ...")
-    sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    print(f"\nVerifying with onnxruntime ({provider}) ...")
+    sess = ort.InferenceSession(onnx_path, providers=[provider])
 
-    with torch.no_grad():
+    with torch.inference_mode():
         pt_outputs = model(input_spatial, input_global)
 
     ort_inputs = {
-        "input_spatial": input_spatial.numpy(),
-        "input_global": input_global.numpy(),
+        "input_spatial": input_spatial.detach().cpu().numpy(),
+        "input_global": input_global.detach().cpu().numpy(),
     }
     ort_outputs = sess.run(None, ort_inputs)
 
     all_close = True
     for i, name in enumerate(OUTPUT_NAMES):
-        pt_arr = pt_outputs[i].numpy()
+        pt_arr = pt_outputs[i].detach().float().cpu().numpy()
         ort_arr = ort_outputs[i]
         max_diff = np.max(np.abs(pt_arr - ort_arr))
-        ok = np.allclose(pt_arr, ort_arr, atol=1e-5)
+        ok = np.allclose(pt_arr, ort_arr, atol=atol, rtol=rtol)
         status = "OK" if ok else "MISMATCH"
         print(f"  {name:20s} shape={str(pt_arr.shape):20s} max_diff={max_diff:.2e}  {status}")
         if not ok:
@@ -156,21 +316,35 @@ def main():
     parser = argparse.ArgumentParser(description="Export KataGo nano model to ONNX")
     parser.add_argument("--checkpoint", required=True, help="Path to checkpoint.ckpt")
     parser.add_argument("--output", default=None, help="Output .onnx path (default: <checkpoint_dir>/model.onnx)")
+    parser.add_argument("--method", type=str, default="legacy", choices=["legacy", "te-official"],
+                        help="Export method: legacy=model.py path, te-official=Transformer Engine official ONNX export")
+    parser.add_argument("--device", default=None,
+                        help="Torch device for te-official export (default: cuda if available)")
     parser.add_argument("--pos-len", type=int, default=19, help="Board size (default: 19)")
     parser.add_argument("--score-mode", type=str, default="simple",
                         choices=["mixop", "mix", "simple"], help="Score belief head mode")
-    parser.add_argument("--opset", type=int, default=17, help="ONNX opset version (default: 17)")
+    parser.add_argument("--opset", type=int, default=None,
+                        help="ONNX opset version (default: legacy=17, te-official=PyTorch default)")
     parser.add_argument("--verify", action="store_true", help="Verify exported model with onnxruntime")
+    parser.add_argument("--ort-provider", type=str, default="CPUExecutionProvider",
+                        help="onnxruntime provider used by --verify (default: CPUExecutionProvider)")
     parser.add_argument("--use-te", action="store_true",
-                        help="Checkpoint is from TE model — convert weights to model.py format before export")
+                        help="Legacy exporter only: checkpoint is from TE model and should be converted to model.py first")
     parser.add_argument("--use-ema", action="store_true",
                         help="Export EMA shadow weights instead of training weights")
     args = parser.parse_args()
 
-    onnx_path, model, input_spatial, input_global = export(args)
+    try:
+        onnx_path, model, input_spatial, input_global = export(args)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
 
     if args.verify:
-        verify(onnx_path, model, input_spatial, input_global)
+        if args.method == "legacy":
+            verify(onnx_path, model, input_spatial, input_global, provider=args.ort_provider, atol=1e-5, rtol=1e-5)
+        else:
+            verify(onnx_path, model, input_spatial, input_global, provider=args.ort_provider, atol=1e-4, rtol=1e-4)
 
 
 if __name__ == "__main__":

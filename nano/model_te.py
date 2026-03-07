@@ -171,7 +171,7 @@ class Model(nn.Module):
                 if p.dim() >= 2:
                     init_fn(p)
 
-    def forward(self, input_spatial, input_global):
+    def _forward_impl(self, input_spatial, input_global, for_onnx_export: bool):
         """
         input_spatial: (N, C_bin, H, W)
         input_global:  (N, C_global)
@@ -186,8 +186,12 @@ class Model(nn.Module):
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
         x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
 
-        # Trunk (isolated from torch.compile for TE compatibility)
-        x = self._run_trunk_no_compile(x)
+        # ONNX export needs the full TE graph visible to torch.export / torch.onnx.
+        if for_onnx_export:
+            x = self._run_trunk_impl(x)
+        else:
+            # Trunk is isolated from torch.compile for TE compatibility during training/inference.
+            x = self._run_trunk_no_compile(x)
 
         # Output heads
         out_policy = self.policy_head(x)
@@ -202,6 +206,12 @@ class Model(nn.Module):
             out_ownership.float(), out_scoring.float(), out_futurepos.float(), out_seki.float(),
             out_scorebelief.float(),
         )
+
+    def forward(self, input_spatial, input_global):
+        return self._forward_impl(input_spatial, input_global, for_onnx_export=False)
+
+    def forward_for_onnx_export(self, input_spatial, input_global):
+        return self._forward_impl(input_spatial, input_global, for_onnx_export=True)
 
     def postprocess(self, outputs):
         (
