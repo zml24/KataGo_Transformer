@@ -151,7 +151,8 @@ def joint_shuffle(arrs, n=None):
     return [arr[perm] for arr in arrs]
 
 
-def shardify(input_idx, file_group, num_out_files, out_tmp_dirs):
+def shardify(input_idx, file_group, num_out_files, out_tmp_dirs,
+             compress_shards=False, shard_chunk_size=16384):
     """Load a group of files, shuffle, and distribute rows to shard temp dirs."""
     np.random.seed([int.from_bytes(os.urandom(4), byteorder="little") for _ in range(4)])
 
@@ -167,7 +168,7 @@ def shardify(input_idx, file_group, num_out_files, out_tmp_dirs):
             all_data[key].append(arr)
 
     if not all_data or "binaryInputNCHWPacked" not in all_data:
-        return 0
+        return np.zeros(num_out_files, dtype=np.int64)
 
     merged = {key: np.concatenate(arrs) for key, arrs in all_data.items()}
     num_rows = merged["binaryInputNCHWPacked"].shape[0]
@@ -178,21 +179,29 @@ def shardify(input_idx, file_group, num_out_files, out_tmp_dirs):
     arrays = joint_shuffle(arrays)
     merged = dict(zip(keys, arrays))
 
-    # Distribute to shards
-    assignments = np.random.randint(num_out_files, size=num_rows)
+    # Distribute to shards by chunk: assign each chunk of rows to one bucket.
+    # With chunk_size=16K and ~80K rows/group, this produces ~5 shards instead of ~num_out_files.
+    num_chunks = (num_rows + shard_chunk_size - 1) // shard_chunk_size
+    chunk_assignments = np.random.randint(num_out_files, size=num_chunks)
+    # Expand chunk assignments to per-row assignments
+    assignments = np.repeat(chunk_assignments, shard_chunk_size)[:num_rows]
     counts = np.bincount(assignments, minlength=num_out_files)
-    cumsum = np.cumsum(counts)
 
+    # Group rows by bucket and write
+    order = np.argsort(assignments, kind="stable")
+    save_fn = np.savez_compressed if compress_shards else np.savez
+    offset = 0
     for out_idx in range(num_out_files):
-        start = cumsum[out_idx] - counts[out_idx]
-        stop = cumsum[out_idx]
-        if stop <= start:
+        n = counts[out_idx]
+        if n == 0:
             continue
-        shard = {key: merged[key][start:stop] for key in keys}
+        idx = order[offset:offset + n]
+        shard = {key: merged[key][idx] for key in keys}
         out_path = os.path.join(out_tmp_dirs[out_idx], f"{input_idx}.npz")
-        np.savez_compressed(out_path, **shard)
+        save_fn(out_path, **shard)
+        offset += n
 
-    return num_rows
+    return counts
 
 
 def sequential_merge_repack(num_shards, out_tmp_dirs, out_dir, rows_per_file,
@@ -387,7 +396,8 @@ def merge_one_bucket(bucket_idx, tmp_dir, num_shards, out_dir,
 
 def parallel_merge_repack(num_shards, out_tmp_dirs, out_dir, rows_per_file,
                           num_processes, keep_remainder=False,
-                          extra_rows=None, tmp_base_dir=None):
+                          extra_rows=None, tmp_base_dir=None,
+                          bucket_row_counts=None):
     """Parallel merge: each bucket processed independently by a worker.
 
     Args:
@@ -399,30 +409,32 @@ def parallel_merge_repack(num_shards, out_tmp_dirs, out_dir, rows_per_file,
         keep_remainder: If True, don't write the last partial chunk; return it.
         extra_rows: Optional dict of arrays to inject (e.g. val remainder for train).
         tmp_base_dir: Temp directory for remainder files and extra_rows file.
+        bucket_row_counts: Pre-computed list of row counts per bucket (from shardify).
 
     Returns:
         (written_files, remainder) -- same contract as sequential_merge_repack
     """
     num_buckets = len(out_tmp_dirs)
 
-    # --- Phase 1: Scan bucket row counts (header-only, no data loading) ---
-    bucket_row_counts = []
-    for tmp_dir in out_tmp_dirs:
-        total = 0
-        for shard_idx in range(num_shards):
-            path = os.path.join(tmp_dir, f"{shard_idx}.npz")
-            if os.path.exists(path):
-                try:
-                    headers = get_numpy_npz_headers(path)
-                    if headers:
-                        for key in headers:
-                            if key in ("binaryInputNCHWPacked",
-                                       "binaryInputNCHWPacked.npy"):
-                                total += headers[key][0][0]
-                                break
-                except Exception:
-                    pass
-        bucket_row_counts.append(total)
+    # Use pre-computed bucket row counts from shardify (skip header scanning)
+    if bucket_row_counts is None:
+        bucket_row_counts = []
+        for tmp_dir in out_tmp_dirs:
+            total = 0
+            for shard_idx in range(num_shards):
+                path = os.path.join(tmp_dir, f"{shard_idx}.npz")
+                if os.path.exists(path):
+                    try:
+                        headers = get_numpy_npz_headers(path)
+                        if headers:
+                            for key in headers:
+                                if key in ("binaryInputNCHWPacked",
+                                           "binaryInputNCHWPacked.npy"):
+                                    total += headers[key][0][0]
+                                    break
+                    except Exception:
+                        pass
+            bucket_row_counts.append(total)
 
     # Save extra_rows to temp file for IPC
     extra_rows_path = None
@@ -593,7 +605,8 @@ def select_val_files_fixed(file_rows, val_num_files, rows_per_file):
 
 
 def process_split(split, num_processes, rows_per_file, worker_group_size,
-                  keep_remainder=False, extra_rows=None):
+                  num_buckets=None, shard_chunk_size=16384,
+                  keep_remainder=False, extra_rows=None, compress_shards=False):
     """Process a single split: shardify + parallel merge-repack + index.json.
 
     Args:
@@ -624,10 +637,11 @@ def process_split(split, num_processes, rows_per_file, worker_group_size,
 
     os.makedirs(split.out_dir)
 
-    # Use fewer, larger buckets so each produces many full output files.
-    # This keeps the serial remainder phase small (≈ num_buckets × rows_per_file / 2).
     num_output_files = max(1, round(total_rows / rows_per_file)) if total_rows > 0 else 1
-    num_shards_buckets = min(num_output_files, max(1, num_processes * 2))
+    if num_buckets is not None:
+        num_shards_buckets = min(num_output_files, max(1, num_buckets))
+    else:
+        num_shards_buckets = min(num_output_files, max(1, num_processes))
     out_tmp_dirs = [os.path.join(split.tmp_dir, f"tmp.shuf{i}") for i in range(num_shards_buckets)]
 
     print(f"  Intermediate shard buckets: {num_shards_buckets}", flush=True)
@@ -661,15 +675,19 @@ def process_split(split, num_processes, rows_per_file, worker_group_size,
     print(f"  Grouped into {num_worker_groups} worker groups", flush=True)
 
     # Stage 1: Shardify (parallel)
+    bucket_row_counts = np.zeros(num_shards_buckets, dtype=np.int64)
     if groups:
         with multiprocessing.Pool(num_processes) as pool:
             with Timer(f"Sharding ({split.name})"):
                 shard_results = pool.starmap(
                     shardify,
-                    [(idx, groups[idx], num_shards_buckets, out_tmp_dirs)
+                    [(idx, groups[idx], num_shards_buckets, out_tmp_dirs,
+                      compress_shards, shard_chunk_size)
                      for idx in range(num_worker_groups)],
                 )
-                total_sharded = sum(shard_results)
+                for counts in shard_results:
+                    bucket_row_counts += counts
+                total_sharded = int(bucket_row_counts.sum())
                 print(f"  Sharded {total_sharded} rows", flush=True)
     else:
         num_worker_groups = 0
@@ -686,6 +704,7 @@ def process_split(split, num_processes, rows_per_file, worker_group_size,
             keep_remainder=keep_remainder,
             extra_rows=extra_rows,
             tmp_base_dir=split.tmp_dir,
+            bucket_row_counts=bucket_row_counts.tolist(),
         )
 
     # Write index.json
@@ -772,6 +791,13 @@ def main():
     parser.add_argument("--val-num-files", type=int, default=None,
                         help="Fixed number of val output files (val total = N * rows-per-file). "
                              "Overrides MD5 bounds for val split.")
+    parser.add_argument("--num-buckets", type=int, default=None,
+                        help="Number of intermediate shard buckets (default: num-processes)")
+    parser.add_argument("--shard-chunk-size", type=int, default=16384,
+                        help="Rows per chunk when distributing to buckets (default: 16384). "
+                             "Larger = fewer shard files, slightly less uniform bucket sizes.")
+    parser.add_argument("--compress-shards", action="store_true", default=False,
+                        help="Compress intermediate shard files (saves tmp disk space, slower)")
     args = parser.parse_args()
 
     if not args.splits:
@@ -796,6 +822,8 @@ def main():
     num_processes = args.num_processes
     rows_per_file = args.rows_per_file
     worker_group_size = args.worker_group_size
+    num_buckets = args.num_buckets if args.num_buckets is not None else num_processes
+    shard_chunk_size = args.shard_chunk_size
 
     # --- Stage 1: Find all NPZ files ---
     all_files = []
@@ -881,23 +909,29 @@ def main():
     val_split = splits_by_name.get("val")
     train_split = splits_by_name.get("train")
 
+    compress_shards = args.compress_shards
+
     val_remainder = None
     if val_split is not None:
         val_remainder = process_split(
             val_split, num_processes, rows_per_file, worker_group_size,
-            keep_remainder=True,
+            num_buckets=num_buckets, shard_chunk_size=shard_chunk_size,
+            keep_remainder=True, compress_shards=compress_shards,
         )
 
     if train_split is not None:
         process_split(
             train_split, num_processes, rows_per_file, worker_group_size,
-            extra_rows=val_remainder,
+            num_buckets=num_buckets, shard_chunk_size=shard_chunk_size,
+            extra_rows=val_remainder, compress_shards=compress_shards,
         )
 
     # Process any other splits (neither train nor val)
     for split in args.splits:
         if split.name not in ("train", "val"):
-            process_split(split, num_processes, rows_per_file, worker_group_size)
+            process_split(split, num_processes, rows_per_file, worker_group_size,
+                          num_buckets=num_buckets, shard_chunk_size=shard_chunk_size,
+                          compress_shards=compress_shards)
 
     print(f"\nAll splits done.", flush=True)
 

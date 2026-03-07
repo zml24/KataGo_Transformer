@@ -10,6 +10,9 @@ set -o pipefail
 #
 #   # Fixed val size: val = 2 files (2 * 131072 rows)
 #   VAL_NUM_FILES=2 bash shuffle.sh /data/npz /out /tmp 8
+#
+#   # Compress intermediate shards (saves tmp disk, slower)
+#   COMPRESS_SHARDS=1 bash shuffle.sh /data/npz /out /tmp 8
 
 if [[ $# -lt 4 ]]; then
     echo "Usage: $0 INPUTDIR OUTPUTDIR TMPDIR NTHREADS [extra args...]"
@@ -35,6 +38,11 @@ if [[ -n "${VAL_NUM_FILES:-}" ]]; then
     VAL_NUM_FILES_ARG="--val-num-files $VAL_NUM_FILES"
 fi
 
+COMPRESS_SHARDS_ARG=""
+if [[ -n "${COMPRESS_SHARDS:-}" ]]; then
+    COMPRESS_SHARDS_ARG="--compress-shards"
+fi
+
 #------------------------------------------------------------------------------
 
 mkdir -p "$OUTPUTDIR"
@@ -50,6 +58,7 @@ time python3 "$SCRIPTDIR"/shuffle.py \
      --split "train:0.00:0.95:$OUTPUTDIR/train:$TMPDIR/train" \
      --split "val:0.95:1.00:$OUTPUTDIR/val:$TMPDIR/val" \
      $VAL_NUM_FILES_ARG \
+     $COMPRESS_SHARDS_ARG \
      "$@" \
      2>&1 | tee "$OUTPUTDIR"/output.txt
 
