@@ -172,9 +172,10 @@ def _trtexec_precision_flags(precision, has_trt_fp8_qdq=False, has_standard_qdq=
             return ["--stronglyTyped"]
         if has_standard_qdq:
             # Standard ONNX QuantizeLinear/DequantizeLinear nodes.  Use
-            # --fp8 to enable FP8 precision and --fp16 for non-quantized
-            # layers and accumulation.  No --stronglyTyped needed.
-            return ["--fp8", "--fp16"]
+            # --fp8 only; adding --fp16 in weakly-typed mode lets TRT
+            # cast scales to fp16, which Myelin can't handle for FP8
+            # quantize ops (no rules for f32 input + f16 scale -> f8).
+            return ["--fp8"]
         # No Q/DQ nodes at all; just request FP8 and hope for the best.
         return ["--fp8"]
     return [f"--{precision}"]
