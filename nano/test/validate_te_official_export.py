@@ -202,6 +202,10 @@ def _format_trtexec_benchmark(metrics):
     return ", ".join(parts)
 
 
+def _is_trtexec_static_shape_error(error_text):
+    return "Static model does not take explicit shapes" in error_text
+
+
 def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
     if args.skip_trtexec:
         print(f"Skipping TensorRT build/benchmark for {mode} because --skip-trtexec was set")
@@ -226,7 +230,21 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
         "--skipInference",
     ]
 
-    _run_trtexec(build_cmd, f"Running TensorRT engine build for {mode}:")
+    build_uses_explicit_shapes = True
+    try:
+        _run_trtexec(build_cmd, f"Running TensorRT engine build for {mode}:")
+    except RuntimeError as exc:
+        if not _is_trtexec_static_shape_error(str(exc)):
+            raise
+        print(f"Retrying TensorRT engine build for {mode} without explicit shapes because the ONNX model is static.")
+        build_uses_explicit_shapes = False
+        static_build_cmd = [
+            trtexec_path,
+            f"--onnx={onnx_path}",
+            f"--saveEngine={engine_path}",
+            "--skipInference",
+        ]
+        _run_trtexec(static_build_cmd, f"Running TensorRT engine build for {mode} (static-shape retry):")
     print(f"TensorRT engine saved to: {engine_path}")
 
     if args.skip_trtexec_benchmark:
@@ -236,12 +254,27 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
     benchmark_cmd = [
         trtexec_path,
         f"--loadEngine={engine_path}",
-        f"--shapes={shapes}",
         f"--warmUp={args.trtexec_warmup_ms}",
         f"--duration={args.trtexec_duration_s}",
         f"--avgRuns={args.trtexec_avg_runs}",
     ]
-    benchmark_output = _run_trtexec(benchmark_cmd, f"Running TensorRT benchmark for {mode}:")
+    if build_uses_explicit_shapes:
+        benchmark_cmd.insert(2, f"--shapes={shapes}")
+
+    try:
+        benchmark_output = _run_trtexec(benchmark_cmd, f"Running TensorRT benchmark for {mode}:")
+    except RuntimeError as exc:
+        if not build_uses_explicit_shapes or not _is_trtexec_static_shape_error(str(exc)):
+            raise
+        print(f"Retrying TensorRT benchmark for {mode} without explicit shapes because the engine is static.")
+        benchmark_cmd = [
+            trtexec_path,
+            f"--loadEngine={engine_path}",
+            f"--warmUp={args.trtexec_warmup_ms}",
+            f"--duration={args.trtexec_duration_s}",
+            f"--avgRuns={args.trtexec_avg_runs}",
+        ]
+        benchmark_output = _run_trtexec(benchmark_cmd, f"Running TensorRT benchmark for {mode} (static-shape retry):")
     metrics = _parse_trtexec_benchmark(benchmark_output)
     summary = _format_trtexec_benchmark(metrics)
     print(f"TensorRT benchmark for {mode}: {summary}")
