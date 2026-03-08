@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import collections
 import os
 import random
 import re
@@ -24,6 +25,7 @@ import configs
 from export_onnx import export, verify
 
 DEFAULT_MODES = ["te-official", "te-decomposed", "legacy"]
+TRT_PRECISIONS = ["fp32", "fp16", "bf16", "fp8"]
 DEFAULT_TRTEXEC_CANDIDATES = [
     "trtexec",
     "/usr/src/tensorrt/bin/trtexec",
@@ -135,6 +137,20 @@ def _resolve_trtexec_path(trtexec_bin):
     return None
 
 
+def _mode_trt_precision(args, mode):
+    return {
+        "te-official": args.te_official_trt_precision,
+        "te-decomposed": args.te_decomposed_trt_precision,
+        "legacy": args.legacy_trt_precision,
+    }[mode]
+
+
+def _trtexec_precision_flags(precision):
+    if precision == "fp32":
+        return []
+    return [f"--{precision}"]
+
+
 def _run_trtexec(cmd, description):
     print(description)
     print("  " + " ".join(shlex.quote(part) for part in cmd))
@@ -186,6 +202,13 @@ def _parse_trtexec_benchmark(output_text):
     return metrics
 
 
+def _parse_trtexec_build_precision(output_text):
+    match = re.search(r"Precision:\s*([A-Za-z0-9+, ]+)", output_text)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
 def _format_trtexec_benchmark(metrics):
     if not metrics:
         return "benchmark completed (metrics not parsed)"
@@ -206,6 +229,39 @@ def _is_trtexec_static_shape_error(error_text):
     return "Static model does not take explicit shapes" in error_text
 
 
+def _inspect_onnx_quantization(onnx_path):
+    try:
+        import onnx
+    except ImportError:
+        return None
+
+    model = onnx.load(onnx_path, load_external_data=False)
+    op_counts = collections.Counter()
+    for node in model.graph.node:
+        key = f"{node.domain}::{node.op_type}" if node.domain else node.op_type
+        op_counts[key] += 1
+
+    standard_qdq = op_counts.get("QuantizeLinear", 0) + op_counts.get("DequantizeLinear", 0)
+    trt_fp8_qdq = sum(
+        count for key, count in op_counts.items()
+        if key.startswith("trt::TRT_FP8 ")
+    )
+    return {
+        "standard_qdq": standard_qdq,
+        "trt_fp8_qdq": trt_fp8_qdq,
+    }
+
+
+def _format_onnx_quantization_info(info):
+    if info is None:
+        return "onnx package not available; quantization nodes not inspected"
+    if info["trt_fp8_qdq"] > 0:
+        return f"detected {info['trt_fp8_qdq']} TRT FP8 Q/DQ nodes"
+    if info["standard_qdq"] > 0:
+        return f"detected {info['standard_qdq']} standard Q/DQ nodes"
+    return "no Q/DQ nodes detected"
+
+
 def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
     if args.skip_trtexec:
         print(f"Skipping TensorRT build/benchmark for {mode} because --skip-trtexec was set")
@@ -219,6 +275,16 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
         )
         return None
 
+    precision = _mode_trt_precision(args, mode)
+    quantization_info = _inspect_onnx_quantization(onnx_path)
+    print(f"Requested TensorRT precision for {mode}: {precision}")
+    print(f"ONNX quantization inspection for {mode}: {_format_onnx_quantization_info(quantization_info)}")
+    if precision == "fp8" and (quantization_info is None or quantization_info["trt_fp8_qdq"] == 0):
+        print(
+            "WARNING: FP8 was requested, but no TRT FP8 Q/DQ nodes were detected in the ONNX graph. "
+            "TensorRT documents FP8 as an explicit-quantization workflow, so this build may fail or fall back to higher precision."
+        )
+
     shapes = _shape_spec(args, model_config)
     build_cmd = [
         trtexec_path,
@@ -229,10 +295,11 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
         f"--maxShapes={shapes}",
         "--skipInference",
     ]
+    build_cmd.extend(_trtexec_precision_flags(precision))
 
     build_uses_explicit_shapes = True
     try:
-        _run_trtexec(build_cmd, f"Running TensorRT engine build for {mode}:")
+        build_output = _run_trtexec(build_cmd, f"Running TensorRT engine build for {mode}:")
     except RuntimeError as exc:
         if not _is_trtexec_static_shape_error(str(exc)):
             raise
@@ -244,7 +311,11 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
             f"--saveEngine={engine_path}",
             "--skipInference",
         ]
-        _run_trtexec(static_build_cmd, f"Running TensorRT engine build for {mode} (static-shape retry):")
+        static_build_cmd.extend(_trtexec_precision_flags(precision))
+        build_output = _run_trtexec(static_build_cmd, f"Running TensorRT engine build for {mode} (static-shape retry):")
+    actual_precision = _parse_trtexec_build_precision(build_output)
+    if actual_precision is not None:
+        print(f"TensorRT reported build precision for {mode}: {actual_precision}")
     print(f"TensorRT engine saved to: {engine_path}")
 
     if args.skip_trtexec_benchmark:
@@ -277,6 +348,8 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
         benchmark_output = _run_trtexec(benchmark_cmd, f"Running TensorRT benchmark for {mode} (static-shape retry):")
     metrics = _parse_trtexec_benchmark(benchmark_output)
     summary = _format_trtexec_benchmark(metrics)
+    if actual_precision is not None:
+        summary = f"{summary}, build_precision={actual_precision}"
     print(f"TensorRT benchmark for {mode}: {summary}")
     return summary
 
@@ -334,6 +407,12 @@ def main():
                         help="onnxruntime provider used by --verify-onnxruntime")
     parser.add_argument("--trtexec-bin", default="trtexec",
                         help="trtexec binary name or absolute path (default: trtexec)")
+    parser.add_argument("--te-official-trt-precision", choices=TRT_PRECISIONS, default="fp32",
+                        help="TensorRT precision requested for te-official mode (default: fp32)")
+    parser.add_argument("--te-decomposed-trt-precision", choices=TRT_PRECISIONS, default="fp8",
+                        help="TensorRT precision requested for te-decomposed mode (default: fp8)")
+    parser.add_argument("--legacy-trt-precision", choices=TRT_PRECISIONS, default="bf16",
+                        help="TensorRT precision requested for legacy mode (default: bf16)")
     parser.add_argument("--skip-trtexec", action="store_true",
                         help="Do not run TensorRT build or benchmark")
     parser.add_argument("--skip-trtexec-benchmark", action="store_true",
