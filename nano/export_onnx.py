@@ -39,7 +39,7 @@ if hasattr(nn, "RMSNorm"):
 
 INPUT_NAMES = ["input_spatial", "input_global"]
 BLOCKS_INPUT_NAMES = ["input_stem"]
-DEFAULT_ONNX_OPSET = 26
+DEFAULT_ONNX_OPSET = 25
 FULL_OUTPUT_NAMES = [
     "out_policy",       # (N, 6, L+1)
     "out_value",        # (N, 3)
