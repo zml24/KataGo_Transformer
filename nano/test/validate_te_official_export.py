@@ -199,8 +199,9 @@ def _trtexec_precision_flags(precision, has_trt_fp8_qdq=False, has_standard_qdq=
             return ["--stronglyTyped"]
         if has_standard_qdq:
             # Standard ONNX QuantizeLinear/DequantizeLinear with FP8 types.
-            # TRT recommends strongly-typed networks for Q/DQ nodes using
-            # precisions other than int8.
+            # Explicit quantization uses --stronglyTyped so TRT respects
+            # the Q/DQ type annotations and fuses DQL->MatMul<-DQL into
+            # FP8 GEMM kernels.
             return ["--stronglyTyped"]
         # No Q/DQ nodes at all; just request FP8 and hope for the best.
         return ["--fp8"]

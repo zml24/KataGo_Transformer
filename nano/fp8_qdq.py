@@ -5,11 +5,12 @@ so the legacy ONNX exporter emits standard ONNX Q/DQ ops that TensorRT can fuse
 into FP8 GEMM kernels.
 
 Usage:
-    from fp8_qdq import convert_model_to_fp8, fix_fp8_onnx_types
+    from fp8_qdq import convert_model_to_fp8, calibrate_activation_scales, fix_fp8_onnx_types
 
     model = Model(config, pos_len)
     model.load_state_dict(state_dict)
     convert_model_to_fp8(model)
+    calibrate_activation_scales(model, dummy_spatial, dummy_global)
 
     torch.onnx.export(model, ..., opset_version=25, dynamo=False)
     fix_fp8_onnx_types("model.onnx")
@@ -80,11 +81,15 @@ def compute_dynamic_scale_inv(x):
 class FP8Linear(nn.Module):
     """``nn.Linear`` wrapper that inserts FP8 Q/DQ on both activation and weight.
 
+    Both activation and weight scales are **static buffers** that become ONNX
+    constant initialisers.  Call :func:`calibrate_activation_scales` before
+    export to populate the activation scales from a representative forward pass.
+
     In the exported ONNX graph each ``FP8Linear`` produces::
 
-        activation ─→ [dynamic scale] ─→ QL ─→ DQL ─→ ┐
-                                                        MatMul ─→ output
-        weight ─────→ QL(static_scale) ─→ DQL ─→ ──────┘
+        activation ─→ QL(static_scale) ─→ DQL ─→ ┐
+                                                    MatMul ─→ output
+        weight ─────→ QL(static_scale) ─→ DQL ─→ ┘
 
     where QL = QuantizeLinear, DQL = DequantizeLinear.  TRT fuses the
     ``DQL → MatMul ← DQL`` pattern into an FP8 GEMM kernel.
@@ -108,6 +113,10 @@ class FP8Linear(nn.Module):
             self._compute_scale_inv(linear.weight),
         )
 
+        # Static activation scale (placeholder; call calibrate_activation_scales
+        # before export to populate from a representative forward pass).
+        self.register_buffer("act_scale_inv", torch.tensor(1.0))
+
     # -- helpers -------------------------------------------------------------
     @staticmethod
     def _compute_scale_inv(w):
@@ -120,9 +129,8 @@ class FP8Linear(nn.Module):
 
     # -- forward -------------------------------------------------------------
     def forward(self, x):
-        # Dynamic activation Q/DQ.
-        act_scale_inv = compute_dynamic_scale_inv(x)
-        x_qdq = FP8QuantDequant.apply(x, act_scale_inv)
+        # Static activation Q/DQ (scale is a buffer → ONNX constant).
+        x_qdq = FP8QuantDequant.apply(x, self.act_scale_inv)
 
         # Static weight Q/DQ.
         w_qdq = FP8QuantDequant.apply(self.weight, self.weight_scale_inv)
@@ -162,6 +170,32 @@ def refresh_all_weight_scales(model):
     for module in model.modules():
         if isinstance(module, FP8Linear):
             module.refresh_weight_scale()
+
+
+def calibrate_activation_scales(model, *sample_inputs):
+    """Run one forward pass to capture activation amax for each FP8Linear.
+
+    The captured values are written into each ``FP8Linear.act_scale_inv``
+    buffer so that the ONNX export embeds them as constant initialisers.
+    """
+    hooks = []
+    for module in model.modules():
+        if isinstance(module, FP8Linear):
+            def _make_hook(mod):
+                def _hook(_self, inputs, _output):
+                    x = inputs[0]
+                    amax = x.detach().abs().max()
+                    mod.act_scale_inv.copy_(
+                        torch.clamp(amax, min=1e-12) / FP8_E4M3_MAX
+                    )
+                return _hook
+            hooks.append(module.register_forward_hook(_make_hook(module)))
+
+    with torch.no_grad():
+        model(*sample_inputs)
+
+    for h in hooks:
+        h.remove()
 
 
 # ---------------------------------------------------------------------------

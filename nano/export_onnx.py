@@ -777,7 +777,7 @@ def _export_fp8_manual(args, state, config):
     FP8Linear wrappers that emit standard ONNX QuantizeLinear/DequantizeLinear
     nodes.  TensorRT fuses these into FP8 GEMM kernels.
     """
-    from fp8_qdq import convert_model_to_fp8, fix_fp8_onnx_types, refresh_all_weight_scales, verify_fp8_qdq_structure
+    from fp8_qdq import calibrate_activation_scales, convert_model_to_fp8, fix_fp8_onnx_types, refresh_all_weight_scales, verify_fp8_qdq_structure
 
     model_state = _resolve_model_state(state, args.use_ema)
     # Handle TE checkpoints by converting to model.py format.
@@ -804,6 +804,10 @@ def _export_fp8_manual(args, state, config):
     _print_param_count(model)
 
     input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device="cpu")
+
+    # Calibrate activation scales so they become ONNX constant initialisers.
+    print("Calibrating FP8 activation scales ...")
+    calibrate_activation_scales(model, input_spatial, input_global)
     output_path = _resolve_output_path(args)
     opset_version = DEFAULT_ONNX_OPSET if args.opset is None else args.opset
     if opset_version < 21:
