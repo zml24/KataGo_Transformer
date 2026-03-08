@@ -171,11 +171,13 @@ def _trtexec_precision_flags(precision, has_trt_fp8_qdq=False, has_standard_qdq=
             # warning), so we use --stronglyTyped alone.
             return ["--stronglyTyped"]
         if has_standard_qdq:
-            # Standard ONNX QuantizeLinear/DequantizeLinear nodes.  Use
-            # --fp8 only; adding --fp16 in weakly-typed mode lets TRT
-            # cast scales to fp16, which Myelin can't handle for FP8
-            # quantize ops (no rules for f32 input + f16 scale -> f8).
-            return ["--fp8"]
+            # Standard ONNX QuantizeLinear/DequantizeLinear with FP8
+            # types also need --stronglyTyped.  TRT >= 10.15 deprecates
+            # weakly-typed networks and warns that strongly typed mode
+            # is recommended for Q/DQ nodes using precisions other than
+            # int8.  In weakly-typed + --fp8 mode Myelin hits an
+            # internal SSA validation failure (gvn.cpp CHECK).
+            return ["--stronglyTyped"]
         # No Q/DQ nodes at all; just request FP8 and hope for the best.
         return ["--fp8"]
     return [f"--{precision}"]
