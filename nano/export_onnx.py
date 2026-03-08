@@ -770,8 +770,81 @@ def export_per_block(args):
     return block_paths
 
 
+def _export_fp8_manual(args, state, config):
+    """Export with manually inserted FP8 Q/DQ nodes (no Transformer Engine dependency).
+
+    Uses the pure PyTorch model (model.py) with nn.Linear layers replaced by
+    FP8Linear wrappers that emit standard ONNX QuantizeLinear/DequantizeLinear
+    nodes.  TensorRT fuses these into FP8 GEMM kernels.
+    """
+    from fp8_qdq import convert_model_to_fp8, fix_fp8_onnx_types, refresh_all_weight_scales, verify_fp8_qdq_structure
+
+    model_state = _resolve_model_state(state, args.use_ema)
+    # Handle TE checkpoints by converting to model.py format.
+    should_try_te_conversion = args.use_te or _looks_like_te_checkpoint(model_state)
+    if should_try_te_conversion:
+        try:
+            from model_te import detect_checkpoint_format, convert_checkpoint_te_to_model
+        except ImportError as exc:
+            if _looks_like_te_checkpoint(model_state):
+                print("ERROR: fp8-manual export detected a TE checkpoint but could not import model_te for conversion")
+            raise SystemExit(1) from exc
+        if detect_checkpoint_format(model_state) == "te":
+            print("Converting TE checkpoint to model.py format for FP8 manual export")
+            model_state = convert_checkpoint_te_to_model(model_state)
+
+    model = Model(config, args.pos_len, score_mode=args.score_mode)
+    model.load_state_dict(model_state)
+    model.eval()
+
+    # Replace transformer-block Linear layers with FP8Linear.
+    print("Converting transformer block Linear layers to FP8Linear ...")
+    convert_model_to_fp8(model)
+    refresh_all_weight_scales(model)
+    _print_param_count(model)
+
+    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device="cpu")
+    output_path = _resolve_output_path(args)
+    opset_version = DEFAULT_ONNX_OPSET if args.opset is None else args.opset
+    if opset_version < 21:
+        print(f"WARNING: FP8 Q/DQ requires opset >= 21, got {opset_version}. Forcing opset 21.")
+        opset_version = max(opset_version, 21)
+
+    output_names = _output_names(args.export_scope)
+    wrapper = ExportWrapper(model, args.export_scope).eval()
+    export_inputs, verify_input0, verify_input1 = _resolve_export_inputs(
+        model, args.export_scope, input_spatial, input_global
+    )
+
+    print(f"Exporting ONNX with manual FP8 Q/DQ (opset {opset_version}) ...")
+    with torch.inference_mode():
+        torch.onnx.export(
+            wrapper,
+            export_inputs,
+            output_path,
+            input_names=_input_names(args.export_scope),
+            output_names=output_names,
+            dynamic_axes=_dynamic_axes_for_scope(args.export_scope),
+            opset_version=opset_version,
+            do_constant_folding=True,
+            dynamo=False,
+        )
+
+    # Post-process: fix FP8 tensor types in value_info.
+    fix_fp8_onnx_types(output_path)
+
+    # Verify Q/DQ structure.
+    num_blocks = len(model.blocks)
+    verify_fp8_qdq_structure(output_path, num_blocks)
+
+    _save_summary(output_path)
+    return output_path, wrapper, verify_input0, verify_input1
+
+
 def export(args):
     state, config = _load_checkpoint(args)
+    if args.method == "fp8-manual":
+        return _export_fp8_manual(args, state, config)
     if args.method == "legacy":
         return _export_legacy(args, state, config)
     if args.method == "te-decomposed":
@@ -855,8 +928,10 @@ def main():
     parser = argparse.ArgumentParser(description="Export KataGo nano model to ONNX")
     parser.add_argument("--checkpoint", required=True, help="Path to checkpoint.ckpt")
     parser.add_argument("--output", default=None, help="Output .onnx path (default: <checkpoint_dir>/model.onnx)")
-    parser.add_argument("--method", type=str, default="legacy", choices=["legacy", "te-official", "te-decomposed"],
-                        help="Export method: legacy=model.py path, te-official=Transformer Engine official ONNX export, te-decomposed=TE modules with manual RoPE")
+    parser.add_argument("--method", type=str, default="legacy",
+                        choices=["legacy", "te-official", "te-decomposed", "fp8-manual"],
+                        help="Export method: legacy=model.py path, te-official=Transformer Engine official ONNX export, "
+                             "te-decomposed=TE modules with manual RoPE, fp8-manual=pure PyTorch with manual FP8 Q/DQ")
     parser.add_argument("--device", default=None,
                         help="Torch device for te-official export (default: cuda if available)")
     parser.add_argument("--pos-len", type=int, default=19, help="Board size (default: 19)")
@@ -893,7 +968,11 @@ def main():
         sys.exit(1)
 
     if args.verify:
-        if args.method == "legacy":
+        if args.method == "fp8-manual":
+            # FP8 Q/DQ introduces quantisation noise; ORT CPU may not support FP8.
+            print("NOTE: fp8-manual verification uses relaxed tolerances (FP8 quantisation noise).")
+            verify(onnx_path, model, input_spatial, input_global, provider=args.ort_provider, atol=0.5, rtol=0.1)
+        elif args.method == "legacy":
             verify(onnx_path, model, input_spatial, input_global, provider=args.ort_provider, atol=1e-5, rtol=1e-5)
         else:
             verify(onnx_path, model, input_spatial, input_global, provider=args.ort_provider, atol=1e-4, rtol=1e-4)
