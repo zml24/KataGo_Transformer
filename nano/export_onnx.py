@@ -214,25 +214,43 @@ def convert_trt_fp8_to_standard_qdq(onnx_path):
     TE's translation table emits custom ``trt::TRT_FP8*`` ops that trigger a
     Myelin compiler bug in TRT 10.15.  Standard ONNX Q/DQ ops with FP8 types
     are handled by TRT's native quantization path and avoid the crash.
+
+    Besides renaming the ops, this also fixes the quantized tensor element
+    types from UINT8 (TE's container type) to FLOAT8E4M3FN so that TRT
+    recognises them as FP8 rather than INT8.
     """
     import onnx
+    from onnx import TensorProto
 
     model = onnx.load(onnx_path)
+
+    # Pass 1: rename ops and collect quantized tensor names.
+    fp8_tensor_names = set()
     converted = 0
     for node in model.graph.node:
         if node.domain == "trt" and node.op_type == "TRT_FP8QuantizeLinear":
             node.domain = ""
             node.op_type = "QuantizeLinear"
+            fp8_tensor_names.update(node.output)
             converted += 1
         elif node.domain == "trt" and node.op_type == "TRT_FP8DequantizeLinear":
             node.domain = ""
             node.op_type = "DequantizeLinear"
             converted += 1
 
+    # Pass 2: fix element types from UINT8 -> FLOAT8E4M3FN in value_info.
+    type_fixed = 0
+    for vi in model.graph.value_info:
+        if vi.name in fp8_tensor_names and vi.type.tensor_type.elem_type == TensorProto.UINT8:
+            vi.type.tensor_type.elem_type = TensorProto.FLOAT8E4M3FN
+            type_fixed += 1
+
     if converted > 0:
         onnx.save(model, onnx_path, save_as_external_data=True, all_tensors_to_one_file=True,
                   location=os.path.basename(onnx_path) + ".data")
         print(f"Converted {converted} trt::TRT_FP8 ops to standard QuantizeLinear/DequantizeLinear")
+        if type_fixed > 0:
+            print(f"  Updated {type_fixed} tensor types from UINT8 to FLOAT8E4M3FN")
     return converted
 
 
