@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import sys
 
@@ -228,6 +229,36 @@ def _te_autocast_ctx(te, autocast_config):
     return te.autocast(**kwargs)
 
 
+def _te_fp8_exec_shape_is_valid(*shape_dims):
+    if not shape_dims:
+        return False
+    return math.prod(shape_dims[:-1]) % 8 == 0 and shape_dims[-1] % 16 == 0
+
+
+def _maybe_disable_te_fp8_for_export(autocast_config, *, batch_size, seq_len, hidden_size, export_label):
+    if not autocast_config["enabled"]:
+        return autocast_config
+
+    logical_shape = (int(batch_size), int(seq_len), int(hidden_size))
+    flattened_shape = (math.prod(logical_shape[:-1]), logical_shape[-1])
+    if _te_fp8_exec_shape_is_valid(*logical_shape):
+        return autocast_config
+
+    print(
+        f"WARNING: requested --use-fp8 for {export_label}, but the export trace uses TE activation shape "
+        f"{list(flattened_shape)} from logical shape {list(logical_shape)}. "
+        "Transformer Engine FP8 requires prod(shape[:-1]) % 8 == 0 and shape[-1] % 16 == 0. "
+        "Falling back to non-FP8 TE autocast for this export. "
+        "Use a trace shape where batch * pos_len^2 is divisible by 8 to keep FP8 enabled."
+    )
+
+    downgraded = dict(autocast_config)
+    downgraded["enabled"] = False
+    downgraded["recipe"] = None
+    downgraded["description"] = "disabled (export trace shape is not FP8-aligned)"
+    return downgraded
+
+
 def _validate_te_load_result(load_result):
     missing = [key for key in load_result.missing_keys if "_extra_state" not in key]
     unexpected = [key for key in load_result.unexpected_keys if "_extra_state" not in key]
@@ -315,6 +346,13 @@ def _export_te_official(args, state, config):
     _print_param_count(model)
 
     input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device=device)
+    autocast_config = _maybe_disable_te_fp8_for_export(
+        autocast_config,
+        batch_size=input_spatial.shape[0],
+        seq_len=args.pos_len * args.pos_len,
+        hidden_size=config["hidden_size"],
+        export_label="official TE export",
+    )
     wrapper = TEOfficialExportWrapper(model).eval()
     output_path = _resolve_output_path(args)
 
@@ -375,6 +413,13 @@ def _export_te_decomposed(args, state, config):
     _print_param_count(model)
 
     input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device=device)
+    autocast_config = _maybe_disable_te_fp8_for_export(
+        autocast_config,
+        batch_size=input_spatial.shape[0],
+        seq_len=args.pos_len * args.pos_len,
+        hidden_size=config["hidden_size"],
+        export_label="decomposed TE export",
+    )
     wrapper = TEOfficialExportWrapper(model).eval()
     output_path = _resolve_output_path(args)
 
