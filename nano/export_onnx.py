@@ -131,6 +131,34 @@ def _print_param_count(model):
     print(f"Parameters: {num_params:,}")
 
 
+def convert_trt_fp8_to_standard_qdq(onnx_path):
+    """Replace trt::TRT_FP8QuantizeLinear/DequantizeLinear with standard ONNX QuantizeLinear/DequantizeLinear.
+
+    TE's translation table emits custom ``trt::TRT_FP8*`` ops that trigger a
+    Myelin compiler bug in TRT 10.15.  Standard ONNX Q/DQ ops with FP8 types
+    are handled by TRT's native quantization path and avoid the crash.
+    """
+    import onnx
+
+    model = onnx.load(onnx_path)
+    converted = 0
+    for node in model.graph.node:
+        if node.domain == "trt" and node.op_type == "TRT_FP8QuantizeLinear":
+            node.domain = ""
+            node.op_type = "QuantizeLinear"
+            converted += 1
+        elif node.domain == "trt" and node.op_type == "TRT_FP8DequantizeLinear":
+            node.domain = ""
+            node.op_type = "DequantizeLinear"
+            converted += 1
+
+    if converted > 0:
+        onnx.save(model, onnx_path, save_as_external_data=True, all_tensors_to_one_file=True,
+                  location=os.path.basename(onnx_path) + ".data")
+        print(f"Converted {converted} trt::TRT_FP8 ops to standard QuantizeLinear/DequantizeLinear")
+    return converted
+
+
 def _collect_export_artifacts(output_path):
     artifacts = []
     for path in (output_path, output_path + ".data"):

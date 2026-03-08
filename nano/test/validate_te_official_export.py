@@ -22,7 +22,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
 import configs
-from export_onnx import export, verify
+from export_onnx import convert_trt_fp8_to_standard_qdq, export, verify
 
 DEFAULT_MODES = ["te-official", "te-decomposed", "legacy"]
 TRT_PRECISIONS = ["fp32", "fp16", "bf16", "fp8"]
@@ -455,6 +455,9 @@ def main():
                         help="Average runs passed to trtexec --avgRuns (default: 100)")
     parser.add_argument("--trt-plugins", nargs="*", default=[],
                         help="Extra TRT plugin shared libraries to load via trtexec --plugins (e.g. libtransformer_engine.so)")
+    parser.add_argument("--convert-fp8-qdq", action="store_true",
+                        help="Convert trt::TRT_FP8 custom ops to standard ONNX QuantizeLinear/DequantizeLinear before TRT build "
+                             "(workaround for TRT Myelin compiler bug with TE's custom FP8 ops)")
     parser.add_argument("--fallback-to-te-decomposed-on-te-export-error", action="store_true",
                         help="If the official TE export fails, retry with a decomposed TE export path before considering legacy export")
     parser.add_argument("--fallback-to-legacy-on-te-export-error", action="store_true",
@@ -480,6 +483,8 @@ def main():
         try:
             onnx_path, model, input_spatial, input_global = export(export_args)
             _verify_export(args, mode, onnx_path, model, input_spatial, input_global)
+            if args.convert_fp8_qdq:
+                convert_trt_fp8_to_standard_qdq(onnx_path)
             benchmark_summary = _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode)
             detail = onnx_path
             if benchmark_summary is not None:
