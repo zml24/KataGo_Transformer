@@ -17,6 +17,12 @@ set -o pipefail
 #   # Reuse scan results across reruns
 #   bash shuffle.sh /data/npz /out /tmp 12 --scan-cache /tmp/katago_scan_cache.sqlite
 #
+#   # Cap local scratch usage by merging every 32 worker groups
+#   bash shuffle.sh /data/npz /out /tmp 12 --max-active-worker-groups 32
+#
+#   # Persist wave progress and resume after crashes/restarts
+#   bash shuffle.sh /data/npz /out /tmp 12 --max-active-worker-groups 32 --shard-cache
+#
 #   # Compress intermediate shards (saves tmp disk, slower)
 #   COMPRESS_SHARDS=1 bash shuffle.sh /data/npz /out /tmp 8
 
