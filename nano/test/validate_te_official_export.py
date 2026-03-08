@@ -574,10 +574,11 @@ def main():
                 block_paths = export_per_block(export_args)
                 block_ok = 0
                 for i, block_path in enumerate(block_paths):
+                    print(f"\n--- Block {i}/{len(block_paths)} ---")
                     if args.convert_fp8_qdq:
                         convert_trt_fp8_to_standard_qdq(block_path)
                     block_engine = os.path.splitext(block_path)[0] + ".plan"
-                    _maybe_run_trtexec(args, block_path, block_engine, model_config, f"{mode}-block{i}")
+                    _maybe_run_trtexec(args, block_path, block_engine, model_config, mode)
                     block_ok += 1
                 detail = f"{block_ok}/{len(block_paths)} blocks built"
                 results.append((mode, "OK", detail))
