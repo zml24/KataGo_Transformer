@@ -299,11 +299,10 @@ class Model(nn.Module):
                     nn.init.normal_(p, mean=0.0, std=init_std)
 
     def _forward_trunk_impl(self, input_spatial, input_global):
-        N = input_spatial.shape[0]
-        H = W = self.pos_len
-        L = H * W
-
         x = self._forward_stem_impl(input_spatial, input_global)
+        return self._forward_blocks_impl(x)
+
+    def _forward_blocks_impl(self, x):
 
         # Trunk
         for block in self.blocks:
@@ -324,6 +323,9 @@ class Model(nn.Module):
 
     def forward_stem_for_onnx_export(self, input_spatial, input_global):
         return self._forward_stem_impl(input_spatial, input_global).float()
+
+    def forward_blocks_for_onnx_export(self, input_stem):
+        return self._forward_blocks_impl(input_stem).float()
 
     def forward_trunk_for_onnx_export(self, input_spatial, input_global):
         return self._forward_trunk_impl(input_spatial, input_global).float()

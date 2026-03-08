@@ -22,7 +22,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
 import configs
-from export_onnx import convert_trt_fp8_to_standard_qdq, export, verify
+from export_onnx import DEFAULT_ONNX_OPSET, convert_trt_fp8_to_standard_qdq, export, verify
 
 DEFAULT_MODES = ["te-official", "te-decomposed", "legacy"]
 TRT_PRECISIONS = ["fp32", "fp16", "bf16", "fp8"]
@@ -121,9 +121,14 @@ def _save_random_te_checkpoint(args, checkpoint_path):
 
 
 def _shape_spec(args, model_config):
+    batch = args.batch_size
+    if args.export_scope == "blocks":
+        seq_len = args.pos_len * args.pos_len
+        hidden_size = model_config["hidden_size"]
+        return f"input_stem:{batch}x{seq_len}x{hidden_size}"
+
     num_bin = configs.get_num_bin_input_features(model_config)
     num_global = configs.get_num_global_input_features(model_config)
-    batch = args.batch_size
     return (
         f"input_spatial:{batch}x{num_bin}x{args.pos_len}x{args.pos_len},"
         f"input_global:{batch}x{num_global}"
@@ -481,15 +486,15 @@ def main():
     parser.add_argument("--pos-len", type=int, default=19, help="Board size (default: 19)")
     parser.add_argument("--score-mode", type=str, default="simple",
                         choices=["mixop", "mix", "simple"], help="Score belief head mode")
-    parser.add_argument("--export-scope", type=str, default="full", choices=["full", "stem", "trunk"],
-                        help="Export the full model or only stem+trunk+norm (default: full)")
+    parser.add_argument("--export-scope", type=str, default="full", choices=["full", "stem", "blocks", "trunk"],
+                        help="Export the full model, stem-only, blocks-only, or stem+blocks (default: full)")
     parser.add_argument("--use-fp8", action="store_true",
                         help="Build the random TE checkpoint and TE-based exports with FP8-enabled module layout")
     parser.add_argument("--fp8-recipe", type=str, default="float8-current-scaling",
                         choices=["float8-current-scaling"],
                         help="FP8 recipe passed through to export_onnx.py when --use-fp8 is enabled")
-    parser.add_argument("--opset", type=int, default=None,
-                        help="ONNX opset version passed to export_onnx.py (default: PyTorch exporter default)")
+    parser.add_argument("--opset", type=int, default=DEFAULT_ONNX_OPSET,
+                        help=f"ONNX opset version passed to export_onnx.py (default: {DEFAULT_ONNX_OPSET})")
     parser.add_argument("--dynamic-batch", action="store_true",
                         help="Enable dynamic batch shapes during te-official export")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed (default: 1234)")

@@ -38,6 +38,8 @@ if hasattr(nn, "RMSNorm"):
 
 
 INPUT_NAMES = ["input_spatial", "input_global"]
+BLOCKS_INPUT_NAMES = ["input_stem"]
+DEFAULT_ONNX_OPSET = 26
 FULL_OUTPUT_NAMES = [
     "out_policy",       # (N, 6, L+1)
     "out_value",        # (N, 3)
@@ -52,9 +54,18 @@ FULL_OUTPUT_NAMES = [
 STEM_OUTPUT_NAMES = [
     "out_stem",         # (N, L, C)
 ]
+BLOCKS_OUTPUT_NAMES = [
+    "out_blocks",       # (N, L, C)
+]
 TRUNK_OUTPUT_NAMES = [
     "out_trunk",        # (N, L, C)
 ]
+
+
+def _input_names(export_scope):
+    if export_scope == "blocks":
+        return BLOCKS_INPUT_NAMES
+    return INPUT_NAMES
 
 
 def _output_names(export_scope):
@@ -62,6 +73,8 @@ def _output_names(export_scope):
         return FULL_OUTPUT_NAMES
     if export_scope == "stem":
         return STEM_OUTPUT_NAMES
+    if export_scope == "blocks":
+        return BLOCKS_OUTPUT_NAMES
     if export_scope == "trunk":
         return TRUNK_OUTPUT_NAMES
     raise ValueError(f"Unsupported export scope: {export_scope}")
@@ -72,27 +85,36 @@ class ExportWrapper(nn.Module):
         super().__init__()
         self.model = model
         self.export_scope = export_scope
+        self._export_scope = export_scope
+        self._export_input_names = _input_names(export_scope)
         self._export_output_names = _output_names(export_scope)
 
-    def forward(self, input_spatial, input_global):
+    def forward(self, input0, input1=None):
         if self.export_scope == "stem":
             export_stem = getattr(self.model, "forward_stem_for_onnx_export", None)
             if export_stem is None:
                 raise RuntimeError(
                     f"Model {type(self.model).__name__} does not implement forward_stem_for_onnx_export()"
                 )
-            return (export_stem(input_spatial, input_global),)
+            return (export_stem(input0, input1),)
+        if self.export_scope == "blocks":
+            export_blocks = getattr(self.model, "forward_blocks_for_onnx_export", None)
+            if export_blocks is None:
+                raise RuntimeError(
+                    f"Model {type(self.model).__name__} does not implement forward_blocks_for_onnx_export()"
+                )
+            return (export_blocks(input0),)
         if self.export_scope == "trunk":
             export_trunk = getattr(self.model, "forward_trunk_for_onnx_export", None)
             if export_trunk is None:
                 raise RuntimeError(
                     f"Model {type(self.model).__name__} does not implement forward_trunk_for_onnx_export()"
                 )
-            return (export_trunk(input_spatial, input_global),)
+            return (export_trunk(input0, input1),)
         export_forward = getattr(self.model, "forward_for_onnx_export", None)
         if export_forward is None:
-            return self.model(input_spatial, input_global)
-        return export_forward(input_spatial, input_global)
+            return self.model(input0, input1)
+        return export_forward(input0, input1)
 
 
 def _load_checkpoint(args):
@@ -143,6 +165,18 @@ def _make_dummy_inputs(config, pos_len, device, batch_size=1):
     return input_spatial, input_global
 
 
+def _make_blocks_input(model, input_spatial, input_global):
+    with torch.inference_mode():
+        return model.forward_stem_for_onnx_export(input_spatial, input_global)
+
+
+def _resolve_export_inputs(model, export_scope, input_spatial, input_global):
+    if export_scope == "blocks":
+        input_stem = _make_blocks_input(model, input_spatial, input_global)
+        return (input_stem,), input_stem, None
+    return (input_spatial, input_global), input_spatial, input_global
+
+
 def _legacy_dynamic_axes():
     dynamic_axes = {"input_spatial": {0: "batch"}, "input_global": {0: "batch"}}
     for name in FULL_OUTPUT_NAMES:
@@ -153,15 +187,16 @@ def _legacy_dynamic_axes():
 def _dynamic_axes_for_scope(export_scope):
     if export_scope == "full":
         return _legacy_dynamic_axes()
-    return {
-        "input_spatial": {0: "batch"},
-        "input_global": {0: "batch"},
-        _output_names(export_scope)[0]: {0: "batch"},
-    }
+    dynamic_axes = {_output_names(export_scope)[0]: {0: "batch"}}
+    for name in _input_names(export_scope):
+        dynamic_axes[name] = {0: "batch"}
+    return dynamic_axes
 
 
-def _te_dynamic_shapes():
+def _te_dynamic_shapes(export_scope):
     batch = torch.export.Dim("batch")
+    if export_scope == "blocks":
+        return ({0: batch},)
     return (
         {0: batch},
         {0: batch},
@@ -390,17 +425,20 @@ def _export_legacy(args, state, config):
 
     input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device="cpu")
     output_path = _resolve_output_path(args)
-    opset_version = 17 if args.opset is None else args.opset
+    opset_version = DEFAULT_ONNX_OPSET if args.opset is None else args.opset
     output_names = _output_names(args.export_scope)
     wrapper = ExportWrapper(model, args.export_scope).eval()
+    export_inputs, verify_input0, verify_input1 = _resolve_export_inputs(
+        model, args.export_scope, input_spatial, input_global
+    )
 
     print(f"Exporting ONNX with legacy exporter (opset {opset_version}) ...")
     with torch.inference_mode():
         torch.onnx.export(
             wrapper,
-            (input_spatial, input_global),
+            export_inputs,
             output_path,
-            input_names=INPUT_NAMES,
+            input_names=_input_names(args.export_scope),
             output_names=output_names,
             dynamic_axes=_dynamic_axes_for_scope(args.export_scope),
             opset_version=opset_version,
@@ -409,7 +447,7 @@ def _export_legacy(args, state, config):
         )
 
     _save_summary(output_path)
-    return output_path, wrapper, input_spatial, input_global
+    return output_path, wrapper, verify_input0, verify_input1
 
 
 def _export_te_official(args, state, config):
@@ -450,37 +488,40 @@ def _export_te_official(args, state, config):
     output_names = _output_names(args.export_scope)
     wrapper = ExportWrapper(model, args.export_scope).eval()
     output_path = _resolve_output_path(args)
+    export_inputs, verify_input0, verify_input1 = _resolve_export_inputs(
+        model, args.export_scope, input_spatial, input_global
+    )
 
     export_kwargs = {
-        "input_names": INPUT_NAMES,
+        "input_names": _input_names(args.export_scope),
         "output_names": output_names,
         "dynamo": True,
         "fallback": False,
         "custom_translation_table": te_translation_table,
     }
     if args.dynamic_batch:
-        export_kwargs["dynamic_shapes"] = _te_dynamic_shapes()
+        export_kwargs["dynamic_shapes"] = _te_dynamic_shapes(args.export_scope)
     if args.opset is not None:
         export_kwargs["opset_version"] = args.opset
 
     print("Running one TE eager forward pass before export ...")
     print(f"Using TE autocast for official export: {autocast_config['description']}")
     with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
-        wrapper(input_spatial, input_global)
+        wrapper(*export_inputs)
 
-    opset_desc = f"opset {args.opset}" if args.opset is not None else "PyTorch default opset"
+    opset_desc = f"opset {DEFAULT_ONNX_OPSET if args.opset is None else args.opset}"
     print(f"Exporting ONNX with Transformer Engine official exporter ({opset_desc}) ...")
     with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
         with te_onnx_export(enabled=True):
             torch.onnx.export(
                 wrapper,
-                (input_spatial, input_global),
+                export_inputs,
                 output_path,
                 **export_kwargs,
             )
 
     _save_summary(output_path)
-    return output_path, wrapper, input_spatial, input_global
+    return output_path, wrapper, verify_input0, verify_input1
 
 
 def _export_te_decomposed(args, state, config):
@@ -527,37 +568,40 @@ def _export_te_decomposed(args, state, config):
     output_names = _output_names(args.export_scope)
     wrapper = ExportWrapper(model, args.export_scope).eval()
     output_path = _resolve_output_path(args)
+    export_inputs, verify_input0, verify_input1 = _resolve_export_inputs(
+        model, args.export_scope, input_spatial, input_global
+    )
 
     export_kwargs = {
-        "input_names": INPUT_NAMES,
+        "input_names": _input_names(args.export_scope),
         "output_names": output_names,
         "dynamo": True,
         "fallback": False,
         "custom_translation_table": te_translation_table,
     }
     if args.dynamic_batch:
-        export_kwargs["dynamic_shapes"] = _te_dynamic_shapes()
+        export_kwargs["dynamic_shapes"] = _te_dynamic_shapes(args.export_scope)
     if args.opset is not None:
         export_kwargs["opset_version"] = args.opset
 
     print("Running one decomposed TE eager forward pass before export ...")
     print(f"Using TE autocast for decomposed export: {autocast_config['description']}")
     with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
-        wrapper(input_spatial, input_global)
+        wrapper(*export_inputs)
 
-    opset_desc = f"opset {args.opset}" if args.opset is not None else "PyTorch default opset"
+    opset_desc = f"opset {DEFAULT_ONNX_OPSET if args.opset is None else args.opset}"
     print(f"Exporting ONNX with decomposed Transformer Engine exporter ({opset_desc}) ...")
     with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
         with te_onnx_export(enabled=True):
             torch.onnx.export(
                 wrapper,
-                (input_spatial, input_global),
+                export_inputs,
                 output_path,
                 **export_kwargs,
             )
 
     _save_summary(output_path)
-    return output_path, wrapper, input_spatial, input_global
+    return output_path, wrapper, verify_input0, verify_input1
 
 
 def export(args):
@@ -609,14 +653,17 @@ def verify(onnx_path, model, input_spatial, input_global, provider="CPUExecution
 
     print(f"\nVerifying with onnxruntime ({provider}) ...")
     sess = ort.InferenceSession(onnx_path, providers=[provider])
+    input_names = getattr(model, "_export_input_names", INPUT_NAMES)
 
     with torch.inference_mode():
-        pt_outputs = model(input_spatial, input_global)
+        if input_global is None:
+            pt_outputs = model(input_spatial)
+        else:
+            pt_outputs = model(input_spatial, input_global)
 
-    ort_inputs = {
-        "input_spatial": input_spatial.detach().cpu().numpy(),
-        "input_global": input_global.detach().cpu().numpy(),
-    }
+    ort_inputs = {input_names[0]: input_spatial.detach().cpu().numpy()}
+    if input_global is not None:
+        ort_inputs[input_names[1]] = input_global.detach().cpu().numpy()
     ort_outputs = sess.run(None, ort_inputs)
 
     output_names = getattr(model, "_export_output_names", FULL_OUTPUT_NAMES)
@@ -649,10 +696,10 @@ def main():
     parser.add_argument("--pos-len", type=int, default=19, help="Board size (default: 19)")
     parser.add_argument("--score-mode", type=str, default="simple",
                         choices=["mixop", "mix", "simple"], help="Score belief head mode")
-    parser.add_argument("--export-scope", type=str, default="full", choices=["full", "stem", "trunk"],
-                        help="Export the full model or only stem+trunk+norm (default: full)")
-    parser.add_argument("--opset", type=int, default=None,
-                        help="ONNX opset version (default: legacy=17, te-official=PyTorch default)")
+    parser.add_argument("--export-scope", type=str, default="full", choices=["full", "stem", "blocks", "trunk"],
+                        help="Export the full model, stem-only, blocks-only, or stem+blocks (default: full)")
+    parser.add_argument("--opset", type=int, default=DEFAULT_ONNX_OPSET,
+                        help=f"ONNX opset version (default: {DEFAULT_ONNX_OPSET})")
     parser.add_argument("--dynamic-batch", action="store_true",
                         help="Enable dynamic batch shapes for te-official export (disabled by default to match the official example)")
     parser.add_argument("--verify", action="store_true", help="Verify exported model with onnxruntime")

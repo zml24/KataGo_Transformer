@@ -215,7 +215,7 @@ class Model(nn.Module):
 
     def forward_trunk_for_onnx_export(self, input_spatial, input_global):
         x = self._forward_stem_impl(input_spatial, input_global)
-        return self._run_trunk_impl(x).float()
+        return self._forward_blocks_impl(x).float()
 
     def _forward_stem_impl(self, input_spatial, input_global):
         N = input_spatial.shape[0]
@@ -227,6 +227,12 @@ class Model(nn.Module):
 
     def forward_stem_for_onnx_export(self, input_spatial, input_global):
         return self._forward_stem_impl(input_spatial, input_global).float()
+
+    def _forward_blocks_impl(self, x):
+        return self._run_trunk_impl(x)
+
+    def forward_blocks_for_onnx_export(self, input_stem):
+        return self._forward_blocks_impl(input_stem).float()
 
     def _forward_impl(self, input_spatial, input_global, for_onnx_export: bool):
         """
@@ -242,7 +248,7 @@ class Model(nn.Module):
 
         # ONNX export needs the full TE graph visible to torch.export / torch.onnx.
         if for_onnx_export:
-            x = self._run_trunk_impl(x)
+            x = self._forward_blocks_impl(x)
         else:
             # Trunk is isolated from torch.compile for TE compatibility during training/inference.
             x = self._run_trunk_no_compile(x)
@@ -372,13 +378,19 @@ class ModelDecomposedExport(nn.Module):
     def forward_stem_for_onnx_export(self, input_spatial, input_global):
         return self._forward_stem_impl(input_spatial, input_global).float()
 
+    def _forward_blocks_impl(self, x):
+        return self._run_trunk_impl(x)
+
+    def forward_blocks_for_onnx_export(self, input_stem):
+        return self._forward_blocks_impl(input_stem).float()
+
     def forward_trunk_for_onnx_export(self, input_spatial, input_global):
         x = self._forward_stem_impl(input_spatial, input_global)
-        return self._run_trunk_impl(x).float()
+        return self._forward_blocks_impl(x).float()
 
     def forward(self, input_spatial, input_global):
         x = self._forward_stem_impl(input_spatial, input_global)
-        x = self._run_trunk_impl(x)
+        x = self._forward_blocks_impl(x)
 
         out_policy = self.policy_head(x)
         (
