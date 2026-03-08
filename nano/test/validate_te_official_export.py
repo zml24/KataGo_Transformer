@@ -71,6 +71,8 @@ def _make_export_args(args, checkpoint_path, onnx_path, method, enable_nested_fa
         fallback_to_legacy_on_te_export_error=(
             enable_nested_fallbacks and args.fallback_to_legacy_on_te_export_error
         ),
+        use_fp8=args.use_fp8,
+        fp8_recipe=args.fp8_recipe,
         use_te=(method == "legacy"),
         use_ema=False,
     )
@@ -97,7 +99,7 @@ def _save_random_te_checkpoint(args, checkpoint_path):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    model = TEModel(model_config, args.pos_len, score_mode=args.score_mode)
+    model = TEModel(model_config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8)
     model.initialize(init_std=args.init_std)
     model.eval()
 
@@ -244,7 +246,7 @@ def _inspect_onnx_quantization(onnx_path):
     standard_qdq = op_counts.get("QuantizeLinear", 0) + op_counts.get("DequantizeLinear", 0)
     trt_fp8_qdq = sum(
         count for key, count in op_counts.items()
-        if key.startswith("trt::TRT_FP8 ")
+        if key.startswith("trt::TRT_FP8")
     )
     return {
         "standard_qdq": standard_qdq,
@@ -392,6 +394,11 @@ def main():
     parser.add_argument("--pos-len", type=int, default=19, help="Board size (default: 19)")
     parser.add_argument("--score-mode", type=str, default="simple",
                         choices=["mixop", "mix", "simple"], help="Score belief head mode")
+    parser.add_argument("--use-fp8", action="store_true",
+                        help="Build the random TE checkpoint and TE-based exports with FP8-enabled module layout")
+    parser.add_argument("--fp8-recipe", type=str, default="float8-current-scaling",
+                        choices=["float8-current-scaling"],
+                        help="FP8 recipe passed through to export_onnx.py when --use-fp8 is enabled")
     parser.add_argument("--opset", type=int, default=None,
                         help="ONNX opset version passed to export_onnx.py (default: PyTorch exporter default)")
     parser.add_argument("--dynamic-batch", action="store_true",

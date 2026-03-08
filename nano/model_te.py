@@ -302,7 +302,8 @@ class Model(nn.Module):
 class ModelDecomposedExport(nn.Module):
     """Export-only TE model that keeps TE modules but applies RoPE via plain PyTorch ops."""
 
-    def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop"):
+    def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
+                 use_fp8: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
@@ -314,8 +315,9 @@ class ModelDecomposedExport(nn.Module):
         ffn_dim = config["ffn_dim"]
         head_dim = self.c_trunk // num_heads
 
+        Linear = nn.Linear if use_fp8 else te.Linear
         self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
-        self.linear_global = te.Linear(num_global_features, self.c_trunk, bias=False)
+        self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
 
         emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)
         emb_expanded = torch.cat([emb, emb], dim=-1)
@@ -335,8 +337,9 @@ class ModelDecomposedExport(nn.Module):
         num_scorebeliefs = config["num_scorebeliefs"]
         self.policy_head = PolicyHead(self.c_trunk, pos_len)
         self.value_head = ValueHead(self.c_trunk, num_scorebeliefs, pos_len, score_mode=score_mode)
-        _replace_nn_linear_with_te(self.policy_head)
-        _replace_nn_linear_with_te(self.value_head)
+        if not use_fp8:
+            _replace_nn_linear_with_te(self.policy_head)
+            _replace_nn_linear_with_te(self.value_head)
 
         self.moving_unowned_proportion_sum = 0.0
         self.moving_unowned_proportion_weight = 0.0

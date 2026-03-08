@@ -161,7 +161,7 @@ def _resolve_te_support():
         import transformer_engine.pytorch as te
     except ImportError as exc:
         raise RuntimeError(
-            "Transformer Engine is required for --method te-official. "
+            "Transformer Engine is required for TE-based export. "
             "Install transformer-engine[pytorch] on a CUDA machine first. "
             f"Original import error: {exc}"
         ) from exc
@@ -190,8 +190,42 @@ def _resolve_te_device(device_arg):
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
-        raise RuntimeError("--method te-official requires a CUDA device, for example --device cuda or --device cuda:0.")
+        raise RuntimeError("TE-based export requires a CUDA device, for example --device cuda or --device cuda:0.")
     return device
+
+
+def _resolve_te_autocast_config(args):
+    config = {
+        "enabled": False,
+        "recipe": None,
+        "description": "disabled",
+    }
+    if not getattr(args, "use_fp8", False):
+        return config
+
+    recipe_name = getattr(args, "fp8_recipe", "float8-current-scaling")
+    if recipe_name != "float8-current-scaling":
+        raise RuntimeError(f"Unsupported --fp8-recipe value: {recipe_name}")
+
+    try:
+        from transformer_engine.common.recipe import Float8CurrentScaling, Format
+    except ImportError as exc:
+        raise RuntimeError(
+            "Failed to import Transformer Engine FP8 recipe support for TE-based export. "
+            f"Original import error: {exc}"
+        ) from exc
+
+    config["enabled"] = True
+    config["recipe"] = Float8CurrentScaling(fp8_format=Format.HYBRID)
+    config["description"] = "Float8CurrentScaling(HYBRID)"
+    return config
+
+
+def _te_autocast_ctx(te, autocast_config):
+    kwargs = {"enabled": autocast_config["enabled"]}
+    if autocast_config["recipe"] is not None:
+        kwargs["recipe"] = autocast_config["recipe"]
+    return te.autocast(**kwargs)
 
 
 def _validate_te_load_result(load_result):
@@ -267,12 +301,13 @@ def _export_te_official(args, state, config):
     from model_te import Model as TEModel, convert_checkpoint_model_to_te, detect_checkpoint_format
 
     device = _resolve_te_device(args.device)
+    autocast_config = _resolve_te_autocast_config(args)
     model_state = _resolve_model_state(state, args.use_ema)
     if detect_checkpoint_format(model_state) == "pt":
         print("Converting model.py checkpoint to TE format for official TE ONNX export")
         model_state = convert_checkpoint_model_to_te(model_state)
 
-    model = TEModel(config, args.pos_len, score_mode=args.score_mode)
+    model = TEModel(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8)
     load_result = model.load_state_dict(model_state, strict=False)
     _validate_te_load_result(load_result)
     model.eval()
@@ -296,12 +331,13 @@ def _export_te_official(args, state, config):
         export_kwargs["opset_version"] = args.opset
 
     print("Running one TE eager forward pass before export ...")
-    with torch.no_grad(), te.autocast(enabled=False):
+    print(f"Using TE autocast for official export: {autocast_config['description']}")
+    with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
         wrapper(input_spatial, input_global)
 
     opset_desc = f"opset {args.opset}" if args.opset is not None else "PyTorch default opset"
     print(f"Exporting ONNX with Transformer Engine official exporter ({opset_desc}) ...")
-    with torch.no_grad(), te.autocast(enabled=False):
+    with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
         with te_onnx_export(enabled=True):
             torch.onnx.export(
                 wrapper,
@@ -324,13 +360,14 @@ def _export_te_decomposed(args, state, config):
     )
 
     device = _resolve_te_device(args.device)
+    autocast_config = _resolve_te_autocast_config(args)
     model_state = _resolve_model_state(state, args.use_ema)
     if detect_checkpoint_format(model_state) == "te":
         print("Converting TE checkpoint to model.py format for decomposed TE ONNX export")
         model_state = convert_checkpoint_te_to_model(model_state)
 
     model_state = convert_checkpoint_model_to_te_decomposed(model_state)
-    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode)
+    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8)
     load_result = model.load_state_dict(model_state, strict=False)
     _validate_te_load_result(load_result)
     model.eval()
@@ -354,12 +391,13 @@ def _export_te_decomposed(args, state, config):
         export_kwargs["opset_version"] = args.opset
 
     print("Running one decomposed TE eager forward pass before export ...")
-    with torch.no_grad(), te.autocast(enabled=False):
+    print(f"Using TE autocast for decomposed export: {autocast_config['description']}")
+    with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
         wrapper(input_spatial, input_global)
 
     opset_desc = f"opset {args.opset}" if args.opset is not None else "PyTorch default opset"
     print(f"Exporting ONNX with decomposed Transformer Engine exporter ({opset_desc}) ...")
-    with torch.no_grad(), te.autocast(enabled=False):
+    with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
         with te_onnx_export(enabled=True):
             torch.onnx.export(
                 wrapper,
@@ -471,6 +509,11 @@ def main():
                         help="If te-official export fails, retry with a decomposed TE export path that applies RoPE via plain PyTorch ops")
     parser.add_argument("--fallback-to-legacy-on-te-export-error", action="store_true",
                         help="If TE-based export fails, fall back to legacy export by converting the checkpoint to model.py format")
+    parser.add_argument("--use-fp8", action="store_true",
+                        help="TE-based exporters only: enable TE FP8 autocast during eager warmup and ONNX export")
+    parser.add_argument("--fp8-recipe", type=str, default="float8-current-scaling",
+                        choices=["float8-current-scaling"],
+                        help="FP8 recipe used with --use-fp8 (default: float8-current-scaling)")
     parser.add_argument("--use-te", action="store_true",
                         help="Legacy exporter only: force conversion of a TE checkpoint before export (normally auto-detected)")
     parser.add_argument("--use-ema", action="store_true",
