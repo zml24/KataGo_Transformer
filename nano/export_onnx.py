@@ -103,11 +103,11 @@ def _looks_like_te_checkpoint(model_state):
     return any(".layer.self_attention." in key for key in model_state)
 
 
-def _make_dummy_inputs(config, pos_len, device):
+def _make_dummy_inputs(config, pos_len, device, batch_size=1):
     num_bin = get_num_bin_input_features(config)
     num_global = get_num_global_input_features(config)
-    input_spatial = torch.randn(1, num_bin, pos_len, pos_len, device=device)
-    input_global = torch.randn(1, num_global, device=device)
+    input_spatial = torch.randn(batch_size, num_bin, pos_len, pos_len, device=device)
+    input_global = torch.randn(batch_size, num_global, device=device)
     return input_spatial, input_global
 
 
@@ -235,6 +235,19 @@ def _te_fp8_exec_shape_is_valid(*shape_dims):
     return math.prod(shape_dims[:-1]) % 8 == 0 and shape_dims[-1] % 16 == 0
 
 
+def _fp8_aligned_batch_size(pos_len, hidden_size):
+    """Return the minimum batch size that satisfies TE FP8 alignment requirements.
+
+    TE FP8 requires prod(shape[:-1]) % 8 == 0 and shape[-1] % 16 == 0.
+    For activations shaped (batch, seq_len, hidden_size) where seq_len = pos_len^2,
+    we need batch * pos_len^2 to be divisible by 8.
+    """
+    if hidden_size % 16 != 0:
+        return None
+    seq_len = pos_len * pos_len
+    return 8 // math.gcd(seq_len, 8)
+
+
 def _maybe_disable_te_fp8_for_export(autocast_config, *, batch_size, seq_len, hidden_size, export_label):
     if not autocast_config["enabled"]:
         return autocast_config
@@ -345,7 +358,16 @@ def _export_te_official(args, state, config):
     model.to(device)
     _print_param_count(model)
 
-    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device=device)
+    batch_size = 1
+    if autocast_config["enabled"]:
+        aligned = _fp8_aligned_batch_size(args.pos_len, config["hidden_size"])
+        if aligned is not None and aligned > 1:
+            batch_size = aligned
+            print(
+                f"Using batch_size={batch_size} for FP8-aligned export trace "
+                f"(batch * pos_len^2 = {batch_size * args.pos_len * args.pos_len}, divisible by 8)"
+            )
+    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device=device, batch_size=batch_size)
     autocast_config = _maybe_disable_te_fp8_for_export(
         autocast_config,
         batch_size=input_spatial.shape[0],
@@ -412,7 +434,16 @@ def _export_te_decomposed(args, state, config):
     model.to(device)
     _print_param_count(model)
 
-    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device=device)
+    batch_size = 1
+    if autocast_config["enabled"]:
+        aligned = _fp8_aligned_batch_size(args.pos_len, config["hidden_size"])
+        if aligned is not None and aligned > 1:
+            batch_size = aligned
+            print(
+                f"Using batch_size={batch_size} for FP8-aligned export trace "
+                f"(batch * pos_len^2 = {batch_size * args.pos_len * args.pos_len}, divisible by 8)"
+            )
+    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device=device, batch_size=batch_size)
     autocast_config = _maybe_disable_te_fp8_for_export(
         autocast_config,
         batch_size=input_spatial.shape[0],
