@@ -298,11 +298,7 @@ class Model(nn.Module):
                 else:
                     nn.init.normal_(p, mean=0.0, std=init_std)
 
-    def forward(self, input_spatial, input_global):
-        """
-        input_spatial: (N, C_bin, H, W)
-        input_global:  (N, C_global)
-        """
+    def _forward_trunk_impl(self, input_spatial, input_global):
         N = input_spatial.shape[0]
         H = W = self.pos_len
         L = H * W
@@ -317,7 +313,17 @@ class Model(nn.Module):
         for block in self.blocks:
             x = block(x, self.rope_cos, self.rope_sin)
 
-        x = self.norm_final(x)
+        return self.norm_final(x)
+
+    def forward_trunk_for_onnx_export(self, input_spatial, input_global):
+        return self._forward_trunk_impl(input_spatial, input_global).float()
+
+    def forward(self, input_spatial, input_global):
+        """
+        input_spatial: (N, C_bin, H, W)
+        input_global:  (N, C_global)
+        """
+        x = self._forward_trunk_impl(input_spatial, input_global)
 
         # Output heads
         out_policy = self.policy_head(x)

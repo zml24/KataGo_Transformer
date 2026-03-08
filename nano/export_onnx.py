@@ -38,7 +38,7 @@ if hasattr(nn, "RMSNorm"):
 
 
 INPUT_NAMES = ["input_spatial", "input_global"]
-OUTPUT_NAMES = [
+FULL_OUTPUT_NAMES = [
     "out_policy",       # (N, 6, L+1)
     "out_value",        # (N, 3)
     "out_misc",         # (N, 10)
@@ -49,14 +49,34 @@ OUTPUT_NAMES = [
     "out_seki",         # (N, 4, H, W)
     "out_scorebelief",  # (N, scorebelief_len)
 ]
+TRUNK_OUTPUT_NAMES = [
+    "out_trunk",        # (N, L, C)
+]
 
 
-class TEOfficialExportWrapper(nn.Module):
-    def __init__(self, model):
+def _output_names(export_scope):
+    if export_scope == "full":
+        return FULL_OUTPUT_NAMES
+    if export_scope == "trunk":
+        return TRUNK_OUTPUT_NAMES
+    raise ValueError(f"Unsupported export scope: {export_scope}")
+
+
+class ExportWrapper(nn.Module):
+    def __init__(self, model, export_scope="full"):
         super().__init__()
         self.model = model
+        self.export_scope = export_scope
+        self._export_output_names = _output_names(export_scope)
 
     def forward(self, input_spatial, input_global):
+        if self.export_scope == "trunk":
+            export_trunk = getattr(self.model, "forward_trunk_for_onnx_export", None)
+            if export_trunk is None:
+                raise RuntimeError(
+                    f"Model {type(self.model).__name__} does not implement forward_trunk_for_onnx_export()"
+                )
+            return (export_trunk(input_spatial, input_global),)
         export_forward = getattr(self.model, "forward_for_onnx_export", None)
         if export_forward is None:
             return self.model(input_spatial, input_global)
@@ -113,9 +133,19 @@ def _make_dummy_inputs(config, pos_len, device, batch_size=1):
 
 def _legacy_dynamic_axes():
     dynamic_axes = {"input_spatial": {0: "batch"}, "input_global": {0: "batch"}}
-    for name in OUTPUT_NAMES:
+    for name in FULL_OUTPUT_NAMES:
         dynamic_axes[name] = {0: "batch"}
     return dynamic_axes
+
+
+def _dynamic_axes_for_scope(export_scope):
+    if export_scope == "full":
+        return _legacy_dynamic_axes()
+    return {
+        "input_spatial": {0: "batch"},
+        "input_global": {0: "batch"},
+        "out_trunk": {0: "batch"},
+    }
 
 
 def _te_dynamic_shapes():
@@ -349,23 +379,25 @@ def _export_legacy(args, state, config):
     input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device="cpu")
     output_path = _resolve_output_path(args)
     opset_version = 17 if args.opset is None else args.opset
+    output_names = _output_names(args.export_scope)
+    wrapper = ExportWrapper(model, args.export_scope).eval()
 
     print(f"Exporting ONNX with legacy exporter (opset {opset_version}) ...")
     with torch.inference_mode():
         torch.onnx.export(
-            model,
+            wrapper,
             (input_spatial, input_global),
             output_path,
             input_names=INPUT_NAMES,
-            output_names=OUTPUT_NAMES,
-            dynamic_axes=_legacy_dynamic_axes(),
+            output_names=output_names,
+            dynamic_axes=_dynamic_axes_for_scope(args.export_scope),
             opset_version=opset_version,
             do_constant_folding=True,
             dynamo=False,
         )
 
     _save_summary(output_path)
-    return output_path, model, input_spatial, input_global
+    return output_path, wrapper, input_spatial, input_global
 
 
 def _export_te_official(args, state, config):
@@ -403,12 +435,13 @@ def _export_te_official(args, state, config):
         hidden_size=config["hidden_size"],
         export_label="official TE export",
     )
-    wrapper = TEOfficialExportWrapper(model).eval()
+    output_names = _output_names(args.export_scope)
+    wrapper = ExportWrapper(model, args.export_scope).eval()
     output_path = _resolve_output_path(args)
 
     export_kwargs = {
         "input_names": INPUT_NAMES,
-        "output_names": OUTPUT_NAMES,
+        "output_names": output_names,
         "dynamo": True,
         "fallback": False,
         "custom_translation_table": te_translation_table,
@@ -479,12 +512,13 @@ def _export_te_decomposed(args, state, config):
         hidden_size=config["hidden_size"],
         export_label="decomposed TE export",
     )
-    wrapper = TEOfficialExportWrapper(model).eval()
+    output_names = _output_names(args.export_scope)
+    wrapper = ExportWrapper(model, args.export_scope).eval()
     output_path = _resolve_output_path(args)
 
     export_kwargs = {
         "input_names": INPUT_NAMES,
-        "output_names": OUTPUT_NAMES,
+        "output_names": output_names,
         "dynamo": True,
         "fallback": False,
         "custom_translation_table": te_translation_table,
@@ -573,8 +607,9 @@ def verify(onnx_path, model, input_spatial, input_global, provider="CPUExecution
     }
     ort_outputs = sess.run(None, ort_inputs)
 
+    output_names = getattr(model, "_export_output_names", FULL_OUTPUT_NAMES)
     all_close = True
-    for i, name in enumerate(OUTPUT_NAMES):
+    for i, name in enumerate(output_names):
         pt_arr = pt_outputs[i].detach().float().cpu().numpy()
         ort_arr = ort_outputs[i]
         max_diff = np.max(np.abs(pt_arr - ort_arr))
@@ -602,6 +637,8 @@ def main():
     parser.add_argument("--pos-len", type=int, default=19, help="Board size (default: 19)")
     parser.add_argument("--score-mode", type=str, default="simple",
                         choices=["mixop", "mix", "simple"], help="Score belief head mode")
+    parser.add_argument("--export-scope", type=str, default="full", choices=["full", "trunk"],
+                        help="Export the full model or only stem+trunk+norm (default: full)")
     parser.add_argument("--opset", type=int, default=None,
                         help="ONNX opset version (default: legacy=17, te-official=PyTorch default)")
     parser.add_argument("--dynamic-batch", action="store_true",

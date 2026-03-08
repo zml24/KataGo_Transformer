@@ -53,6 +53,13 @@ def _resolve_mode_artifact_path(base_path, output_dir, config_name, mode, ext, s
     return f"{root}_{mode_suffix}{current_ext}"
 
 
+def _append_artifact_suffix(path, suffix):
+    root, ext = os.path.splitext(path)
+    if not ext:
+        return path + suffix
+    return f"{root}{suffix}{ext}"
+
+
 def _make_export_args(args, checkpoint_path, onnx_path, method, enable_nested_fallbacks):
     return argparse.Namespace(
         checkpoint=checkpoint_path,
@@ -61,6 +68,7 @@ def _make_export_args(args, checkpoint_path, onnx_path, method, enable_nested_fa
         device=args.device,
         pos_len=args.pos_len,
         score_mode=args.score_mode,
+        export_scope=args.export_scope,
         opset=args.opset,
         dynamic_batch=args.dynamic_batch,
         verify=False,
@@ -236,6 +244,10 @@ def _is_trtexec_static_shape_error(error_text):
     return "Static model does not take explicit shapes" in error_text
 
 
+def _is_trtexec_myelin_ssa_error(error_text):
+    return "MyelinCheckException" in error_text and "ssa_validation()" in error_text
+
+
 def _inspect_onnx_quantization(onnx_path):
     try:
         import onnx
@@ -297,9 +309,12 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
     quantization_info = _inspect_onnx_quantization(onnx_path)
     print(f"Requested TensorRT precision for {mode}: {precision}")
     print(f"ONNX quantization inspection for {mode}: {_format_onnx_quantization_info(quantization_info)}")
-    if precision == "fp8" and (quantization_info is None or quantization_info["trt_fp8_qdq"] == 0):
+    if precision == "fp8" and (
+        quantization_info is None
+        or (quantization_info["trt_fp8_qdq"] == 0 and quantization_info["standard_qdq"] == 0)
+    ):
         print(
-            "WARNING: FP8 was requested, but no TRT FP8 Q/DQ nodes were detected in the ONNX graph. "
+            "WARNING: FP8 was requested, but no FP8 Q/DQ nodes were detected in the ONNX graph. "
             "TensorRT documents FP8 as an explicit-quantization workflow, so this build may fail or fall back to higher precision."
         )
 
@@ -379,6 +394,55 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
     return summary
 
 
+def _maybe_retry_trtexec_with_non_fp8_export(
+    args,
+    mode,
+    checkpoint_path,
+    onnx_path,
+    engine_path,
+    model_config,
+    enable_nested_fallbacks,
+    exc,
+):
+    error_text = str(exc)
+    if not getattr(args, "fallback_disable_fp8_on_trt_internal_error", False):
+        return None
+    if mode != "te-decomposed" or not args.use_fp8:
+        return None
+    if not _is_trtexec_myelin_ssa_error(error_text):
+        return None
+
+    fallback_onnx_path = _append_artifact_suffix(onnx_path, "_trt_nofp8")
+    fallback_engine_path = _append_artifact_suffix(engine_path, "_trt_nofp8")
+    print(
+        "Detected a TensorRT Myelin SSA internal error while building the FP8 te-decomposed graph. "
+        "Keeping the original FP8 ONNX artifact and retrying TensorRT validation with a non-FP8 re-export."
+    )
+    print(f"  Original FP8 ONNX: {onnx_path}")
+    print(f"  Fallback TRT ONNX: {fallback_onnx_path}")
+
+    fallback_export_args = _make_export_args(
+        args,
+        checkpoint_path,
+        fallback_onnx_path,
+        mode,
+        enable_nested_fallbacks,
+    )
+    fallback_export_args.use_fp8 = False
+
+    fallback_onnx_path, model, input_spatial, input_global = export(fallback_export_args)
+    _verify_export(args, mode, fallback_onnx_path, model, input_spatial, input_global)
+    benchmark_summary = _maybe_run_trtexec(args, fallback_onnx_path, fallback_engine_path, model_config, mode)
+
+    detail = (
+        f"{onnx_path} | FP8 TRT unsupported in current TRT/Myelin path; "
+        f"fallback_non_fp8={fallback_onnx_path}"
+    )
+    if benchmark_summary is not None:
+        detail = f"{detail} | TRT {benchmark_summary}"
+    return detail
+
+
 def _verify_export(args, mode, onnx_path, model, input_spatial, input_global):
     if not args.verify_onnxruntime:
         return
@@ -417,6 +481,8 @@ def main():
     parser.add_argument("--pos-len", type=int, default=19, help="Board size (default: 19)")
     parser.add_argument("--score-mode", type=str, default="simple",
                         choices=["mixop", "mix", "simple"], help="Score belief head mode")
+    parser.add_argument("--export-scope", type=str, default="full", choices=["full", "trunk"],
+                        help="Export the full model or only stem+trunk+norm (default: full)")
     parser.add_argument("--use-fp8", action="store_true",
                         help="Build the random TE checkpoint and TE-based exports with FP8-enabled module layout")
     parser.add_argument("--fp8-recipe", type=str, default="float8-current-scaling",
@@ -458,6 +524,9 @@ def main():
     parser.add_argument("--convert-fp8-qdq", action="store_true",
                         help="Convert trt::TRT_FP8 custom ops to standard ONNX QuantizeLinear/DequantizeLinear before TRT build "
                              "(workaround for TRT Myelin compiler bug with TE's custom FP8 ops)")
+    parser.add_argument("--fallback-disable-fp8-on-trt-internal-error", action="store_true",
+                        help="If TensorRT hits a Myelin internal error on te-decomposed FP8 export, keep the FP8 ONNX artifact "
+                             "but re-export that mode without FP8 for TensorRT validation")
     parser.add_argument("--fallback-to-te-decomposed-on-te-export-error", action="store_true",
                         help="If the official TE export fails, retry with a decomposed TE export path before considering legacy export")
     parser.add_argument("--fallback-to-legacy-on-te-export-error", action="store_true",
@@ -491,9 +560,30 @@ def main():
                 detail = f"{onnx_path} | TRT {benchmark_summary}"
             results.append((mode, "OK", detail))
         except RuntimeError as exc:
+            fallback_detail = _maybe_retry_trtexec_with_non_fp8_export(
+                args,
+                mode,
+                checkpoint_path,
+                onnx_path,
+                engine_path,
+                model_config,
+                enable_nested_fallbacks,
+                exc,
+            )
+            if fallback_detail is not None:
+                results.append((mode, "OK", fallback_detail))
+                continue
             print(f"ERROR: mode {mode} failed")
-            print(exc)
-            results.append((mode, "FAILED", str(exc)))
+            error_text = str(exc)
+            if mode == "te-decomposed" and args.use_fp8 and _is_trtexec_myelin_ssa_error(error_text):
+                error_text = (
+                    f"{error_text}\n"
+                    "Hint: this looks like a TensorRT/Myelin internal FP8 build bug on the te-decomposed path. "
+                    "Try rerunning without --use-fp8, or pass --fallback-disable-fp8-on-trt-internal-error "
+                    "to keep the FP8 ONNX artifact but validate TensorRT with a non-FP8 re-export."
+                )
+            print(error_text)
+            results.append((mode, "FAILED", error_text))
 
     print("\nExport summary:")
     any_success = False
