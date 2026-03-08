@@ -1279,12 +1279,29 @@ def commit_wave_stage(stage_parts_dir, out_dir, active_bucket_indices,
 
 
 def finalize_incremental_bucket_outputs(num_buckets, bucket_remainder_paths,
-                                        out_dir, rows_per_file, keep_remainder):
+                                        out_dir, rows_per_file, keep_remainder,
+                                        progress_interval_sec=30.0,
+                                        split_name=None):
     """Finalize bucket-local temp outputs into data*.npz files and merge remainders."""
     written_files = []
     next_file_idx = 0
+    finalize_label = split_name if split_name is not None else "split"
 
-    for bucket_files in collect_bucket_part_files(out_dir, num_buckets):
+    bucket_part_files = collect_bucket_part_files(out_dir, num_buckets)
+    total_part_files = sum(len(bucket_files) for bucket_files in bucket_part_files)
+    if total_part_files > 0:
+        log(f"  Finalize: renaming {total_part_files} bucket part files for '{finalize_label}'")
+        rename_progress = ProgressLogger(
+            desc=f"finalize rename {finalize_label}",
+            total=total_part_files,
+            unit="files",
+            interval_sec=progress_interval_sec,
+        )
+    else:
+        rename_progress = None
+
+    renamed_files = 0
+    for bucket_files in bucket_part_files:
         for temp_path in bucket_files:
             with np.load(temp_path) as npz:
                 num_rows = npz["binaryInputNCHWPacked"].shape[0]
@@ -1292,12 +1309,28 @@ def finalize_incremental_bucket_outputs(num_buckets, bucket_remainder_paths,
             os.replace(temp_path, final_path)
             written_files.append((final_path, num_rows))
             next_file_idx += 1
+            renamed_files += 1
+            if rename_progress is not None:
+                rename_progress.maybe_report(
+                    renamed_files,
+                    extra=f"last=data{next_file_idx - 1}.npz",
+                )
+
+    if rename_progress is not None:
+        rename_progress.final_report(renamed_files, extra=f"renamed={renamed_files}")
 
     remainder = None
     all_remainder_paths = [path for path in bucket_remainder_paths if os.path.exists(path)]
     if all_remainder_paths:
+        log(f"  Finalize: reading {len(all_remainder_paths)} bucket remainders for '{finalize_label}'")
+        remainder_read_progress = ProgressLogger(
+            desc=f"finalize read remainders {finalize_label}",
+            total=len(all_remainder_paths),
+            unit="files",
+            interval_sec=progress_interval_sec,
+        )
         combined = {}
-        for rem_path in all_remainder_paths:
+        for completed_remainders, rem_path in enumerate(all_remainder_paths, start=1):
             try:
                 with np.load(rem_path) as npz:
                     for key in npz.keys():
@@ -1306,11 +1339,33 @@ def finalize_incremental_bucket_outputs(num_buckets, bucket_remainder_paths,
                         combined[key].append(npz[key])
             except Exception as e:
                 log(f"WARNING: error reading remainder {rem_path}: {e}")
+            remainder_read_progress.maybe_report(completed_remainders)
+
+        remainder_read_progress.final_report(len(all_remainder_paths))
 
         if combined:
             merged_rem = {key: np.concatenate(arrs) for key, arrs in combined.items()}
             keys = list(merged_rem.keys())
             total_rem = merged_rem[keys[0]].shape[0]
+            full_remainder_files = total_rem // rows_per_file
+            tail_rows = total_rem % rows_per_file
+            remainder_outputs = full_remainder_files
+            if tail_rows > 0 and not keep_remainder:
+                remainder_outputs += 1
+            log(
+                f"  Finalize: {total_rem} remainder rows across {len(all_remainder_paths)} buckets, "
+                f"writing {remainder_outputs} output files"
+            )
+            if remainder_outputs > 0:
+                remainder_write_progress = ProgressLogger(
+                    desc=f"finalize write remainders {finalize_label}",
+                    total=remainder_outputs,
+                    unit="files",
+                    interval_sec=progress_interval_sec,
+                )
+            else:
+                remainder_write_progress = None
+            written_remainder_files = 0
 
             offset = 0
             while offset + rows_per_file <= total_rem:
@@ -1322,6 +1377,12 @@ def finalize_incremental_bucket_outputs(num_buckets, bucket_remainder_paths,
                 written_files.append((out_path, rows_per_file))
                 next_file_idx += 1
                 offset += rows_per_file
+                written_remainder_files += 1
+                if remainder_write_progress is not None:
+                    remainder_write_progress.maybe_report(
+                        written_remainder_files,
+                        extra=f"rows={offset}/{total_rem}",
+                    )
 
             final_rem_rows = total_rem - offset
             if final_rem_rows > 0:
@@ -1335,6 +1396,18 @@ def finalize_incremental_bucket_outputs(num_buckets, bucket_remainder_paths,
                     out_path = os.path.join(out_dir, f"data{next_file_idx}.npz")
                     np.savez_compressed(out_path, **chunk)
                     written_files.append((out_path, final_rem_rows))
+                    written_remainder_files += 1
+                    if remainder_write_progress is not None:
+                        remainder_write_progress.maybe_report(
+                            written_remainder_files,
+                            extra=f"rows={total_rem}/{total_rem}",
+                        )
+
+            if remainder_write_progress is not None:
+                remainder_write_progress.final_report(
+                    written_remainder_files,
+                    extra=f"rows={total_rem}",
+                )
 
     return written_files, remainder
 
@@ -1657,6 +1730,8 @@ def process_split(split, shard_processes, merge_processes, rows_per_file, worker
                 out_dir=split.out_dir,
                 rows_per_file=rows_per_file,
                 keep_remainder=keep_remainder,
+                progress_interval_sec=progress_interval_sec,
+                split_name=split.name,
             )
         shutil.rmtree(remainder_dir, ignore_errors=True)
     else:
