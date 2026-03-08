@@ -25,6 +25,8 @@ import configs
 from export_onnx import DEFAULT_ONNX_OPSET, convert_trt_fp8_to_standard_qdq, export, export_per_block, verify
 
 DEFAULT_MODES = ["te-official", "te-decomposed", "legacy"]
+ALL_MODES = DEFAULT_MODES + ["fp8-manual"]
+_TE_MODES = {"te-official", "te-decomposed"}
 TRT_PRECISIONS = ["fp32", "fp16", "bf16", "fp8"]
 DEFAULT_TRTEXEC_CANDIDATES = [
     "trtexec",
@@ -79,9 +81,9 @@ def _make_export_args(args, checkpoint_path, onnx_path, method, enable_nested_fa
         fallback_to_legacy_on_te_export_error=(
             enable_nested_fallbacks and args.fallback_to_legacy_on_te_export_error
         ),
-        use_fp8=args.use_fp8,
+        use_fp8=args.use_fp8 if method != "fp8-manual" else False,
         fp8_recipe=args.fp8_recipe,
-        use_te=(method == "legacy"),
+        use_te=(method in ("legacy", "fp8-manual")),
         use_ema=False,
     )
 
@@ -116,6 +118,30 @@ def _save_random_te_checkpoint(args, checkpoint_path):
 
     torch.save({"model": model.state_dict(), "config": model_config}, checkpoint_path)
     print(f"Saved random TE checkpoint: {checkpoint_path}")
+
+    return model_config
+
+
+def _save_random_checkpoint(args, checkpoint_path):
+    """Generate a random model.py checkpoint (no Transformer Engine dependency)."""
+    from model import Model
+
+    model_config = configs.config_of_name[args.config]
+    print(f"Config: {args.config} -> {model_config}")
+    print(f"Seed: {args.seed}")
+
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    model = Model(model_config, args.pos_len, score_mode=args.score_mode)
+    model.initialize(init_std=args.init_std)
+    model.eval()
+
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {num_params:,}")
+
+    torch.save({"model": model.state_dict(), "config": model_config}, checkpoint_path)
+    print(f"Saved random checkpoint: {checkpoint_path}")
 
     return model_config
 
@@ -157,6 +183,7 @@ def _mode_trt_precision(args, mode):
         "te-official": args.te_official_trt_precision,
         "te-decomposed": args.te_decomposed_trt_precision,
         "legacy": args.legacy_trt_precision,
+        "fp8-manual": args.fp8_manual_trt_precision,
     }[mode]
 
 
@@ -460,8 +487,12 @@ def _verify_export(args, mode, onnx_path, model, input_spatial, input_global):
     if not args.verify_onnxruntime:
         return
 
-    atol = 1e-5 if mode == "legacy" else 1e-4
-    rtol = 1e-5 if mode == "legacy" else 1e-4
+    if mode == "fp8-manual":
+        atol, rtol = 0.5, 0.1
+    elif mode == "legacy":
+        atol, rtol = 1e-5, 1e-5
+    else:
+        atol, rtol = 1e-4, 1e-4
     verify(
         onnx_path,
         model,
@@ -487,8 +518,9 @@ def main():
                         help="Output ONNX path. With multiple modes, mode suffixes are appended automatically")
     parser.add_argument("--engine", default=None,
                         help="TensorRT engine path. With multiple modes, mode suffixes are appended automatically")
-    parser.add_argument("--modes", nargs="+", choices=DEFAULT_MODES, default=DEFAULT_MODES,
-                        help="Export modes to run in order (default: te-official te-decomposed legacy)")
+    parser.add_argument("--modes", nargs="+", choices=ALL_MODES, default=DEFAULT_MODES,
+                        help="Export modes to run in order (default: te-official te-decomposed legacy). "
+                             "fp8-manual uses pure PyTorch with manual FP8 Q/DQ (no TE dependency)")
     parser.add_argument("--device", default="cuda",
                         help="Torch device for official TE export (default: cuda)")
     parser.add_argument("--pos-len", type=int, default=19, help="Board size (default: 19)")
@@ -522,6 +554,8 @@ def main():
                         help="TensorRT precision requested for te-decomposed mode (default: fp8)")
     parser.add_argument("--legacy-trt-precision", choices=TRT_PRECISIONS, default="bf16",
                         help="TensorRT precision requested for legacy mode (default: bf16)")
+    parser.add_argument("--fp8-manual-trt-precision", choices=TRT_PRECISIONS, default="fp8",
+                        help="TensorRT precision requested for fp8-manual mode (default: fp8)")
     parser.add_argument("--skip-trtexec", action="store_true",
                         help="Do not run TensorRT build or benchmark")
     parser.add_argument("--skip-trtexec-benchmark", action="store_true",
@@ -550,8 +584,13 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    checkpoint_path = args.checkpoint or os.path.join(args.output_dir, f"{args.config}_te_random.ckpt")
-    model_config = _save_random_te_checkpoint(args, checkpoint_path)
+    needs_te = any(m in _TE_MODES for m in args.modes)
+    if needs_te:
+        checkpoint_path = args.checkpoint or os.path.join(args.output_dir, f"{args.config}_te_random.ckpt")
+        model_config = _save_random_te_checkpoint(args, checkpoint_path)
+    else:
+        checkpoint_path = args.checkpoint or os.path.join(args.output_dir, f"{args.config}_random.ckpt")
+        model_config = _save_random_checkpoint(args, checkpoint_path)
     enable_nested_fallbacks = len(args.modes) == 1
 
     results = []
