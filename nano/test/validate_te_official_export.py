@@ -22,7 +22,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
 import configs
-from export_onnx import DEFAULT_ONNX_OPSET, convert_trt_fp8_to_standard_qdq, export, verify
+from export_onnx import DEFAULT_ONNX_OPSET, convert_trt_fp8_to_standard_qdq, export, export_per_block, verify
 
 DEFAULT_MODES = ["te-official", "te-decomposed", "legacy"]
 TRT_PRECISIONS = ["fp32", "fp16", "bf16", "fp8"]
@@ -538,6 +538,9 @@ def main():
     parser.add_argument("--convert-fp8-qdq", action="store_true",
                         help="Convert trt::TRT_FP8 custom ops to standard ONNX QuantizeLinear/DequantizeLinear before TRT build "
                              "(workaround for TRT Myelin compiler bug with TE's custom FP8 ops)")
+    parser.add_argument("--split-blocks", action="store_true",
+                        help="Export each transformer block as a separate ONNX model and build individual TRT engines "
+                             "(workaround for TRT Myelin compiler bug with large FP8 graphs)")
     parser.add_argument("--fallback-disable-fp8-on-trt-internal-error", action="store_true",
                         help="If TensorRT hits a Myelin internal error on te-decomposed FP8 export, keep the FP8 ONNX artifact "
                              "but re-export that mode without FP8 for TensorRT validation")
@@ -563,6 +566,27 @@ def main():
 
         print(f"\n=== Export mode: {mode} ===")
         export_args = _make_export_args(args, checkpoint_path, onnx_path, mode, enable_nested_fallbacks)
+
+        # Per-block export path: export each transformer block as a separate
+        # ONNX model and build individual TRT engines.
+        if args.split_blocks and mode == "te-decomposed":
+            try:
+                block_paths = export_per_block(export_args)
+                block_ok = 0
+                for i, block_path in enumerate(block_paths):
+                    if args.convert_fp8_qdq:
+                        convert_trt_fp8_to_standard_qdq(block_path)
+                    block_engine = os.path.splitext(block_path)[0] + ".plan"
+                    _maybe_run_trtexec(args, block_path, block_engine, model_config, f"{mode}-block{i}")
+                    block_ok += 1
+                detail = f"{block_ok}/{len(block_paths)} blocks built"
+                results.append((mode, "OK", detail))
+            except RuntimeError as exc:
+                print(f"ERROR: mode {mode} (split-blocks) failed")
+                print(str(exc))
+                results.append((mode, "FAILED", str(exc)))
+            continue
+
         try:
             onnx_path, model, input_spatial, input_global = export(export_args)
             _verify_export(args, mode, onnx_path, model, input_spatial, input_global)

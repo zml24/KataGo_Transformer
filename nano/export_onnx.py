@@ -80,6 +80,30 @@ def _output_names(export_scope):
     raise ValueError(f"Unsupported export scope: {export_scope}")
 
 
+class SingleBlockExportWrapper(nn.Module):
+    """Wrap a single TransformerBlockTEDecomposed for per-block ONNX export.
+
+    Each block is exported as an independent ONNX model with RoPE embeddings
+    baked in as constants.  The last block in the stack also includes the
+    final RMSNorm so the full ``blocks`` computation is covered.
+    """
+
+    def __init__(self, block, rope_cos, rope_sin, norm_final=None):
+        super().__init__()
+        self.block = block
+        self.register_buffer("rope_cos", rope_cos)
+        self.register_buffer("rope_sin", rope_sin)
+        self.norm_final = norm_final
+        self._export_input_names = BLOCKS_INPUT_NAMES
+        self._export_output_names = BLOCKS_OUTPUT_NAMES
+
+    def forward(self, x):
+        x = self.block(x, self.rope_cos, self.rope_sin)
+        if self.norm_final is not None:
+            x = self.norm_final(x)
+        return (x.float(),)
+
+
 class ExportWrapper(nn.Module):
     def __init__(self, model, export_scope="full"):
         super().__init__()
@@ -637,6 +661,117 @@ def _export_te_decomposed(args, state, config):
 
     _save_summary(output_path)
     return output_path, wrapper, verify_input0, verify_input1
+
+
+def export_per_block(args):
+    """Export each transformer block as a separate ONNX model.
+
+    This is a workaround for the TRT 10.15.1 Myelin GVN bug that crashes on
+    large FP8 graphs.  Each block is exported independently so TRT never sees
+    the full fused graph.
+
+    Returns a list of per-block ONNX file paths.
+    """
+    te, te_onnx_export, te_translation_table = _resolve_te_support()
+    from model_te import (
+        ModelDecomposedExport,
+        convert_checkpoint_model_to_te_decomposed,
+        convert_checkpoint_te_to_model,
+        detect_checkpoint_format,
+    )
+
+    state, config = _load_checkpoint(args)
+    device = _resolve_te_device(args.device)
+    autocast_config = _resolve_te_autocast_config(args)
+    model_state = _resolve_model_state(state, args.use_ema)
+    if detect_checkpoint_format(model_state) == "te":
+        print("Converting TE checkpoint to model.py format for per-block decomposed export")
+        model_state = convert_checkpoint_te_to_model(model_state)
+
+    model_state = convert_checkpoint_model_to_te_decomposed(model_state)
+    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8)
+    load_result = model.load_state_dict(model_state, strict=False)
+    _validate_te_load_result(load_result)
+    model.eval()
+    model.to(device)
+    _print_param_count(model)
+
+    batch_size = 1
+    if autocast_config["enabled"]:
+        aligned = _fp8_aligned_batch_size(args.pos_len, config["hidden_size"])
+        if aligned is not None and aligned > 1:
+            batch_size = aligned
+            print(
+                f"Using batch_size={batch_size} for FP8-aligned per-block export trace "
+                f"(batch * pos_len^2 = {batch_size * args.pos_len * args.pos_len}, divisible by 8)"
+            )
+    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device=device, batch_size=batch_size)
+    autocast_config = _maybe_disable_te_fp8_for_export(
+        autocast_config,
+        batch_size=input_spatial.shape[0],
+        seq_len=args.pos_len * args.pos_len,
+        hidden_size=config["hidden_size"],
+        export_label="per-block decomposed TE export",
+    )
+
+    input_stem = _make_blocks_input(model, input_spatial, input_global)
+    output_path = _resolve_output_path(args)
+    base_name, ext = os.path.splitext(output_path)
+    num_blocks = len(model.blocks)
+
+    export_kwargs_base = {
+        "input_names": BLOCKS_INPUT_NAMES,
+        "output_names": BLOCKS_OUTPUT_NAMES,
+        "dynamo": True,
+        "fallback": False,
+        "custom_translation_table": te_translation_table,
+    }
+    if args.dynamic_batch:
+        export_kwargs_base["dynamic_shapes"] = _te_dynamic_shapes("blocks")
+    if args.opset is not None:
+        export_kwargs_base["opset_version"] = args.opset
+
+    opset_desc = f"opset {DEFAULT_ONNX_OPSET if args.opset is None else args.opset}"
+    print(f"Using TE autocast for per-block export: {autocast_config['description']}")
+    print(f"Exporting {num_blocks} blocks individually ({opset_desc}) ...")
+
+    x = input_stem
+    block_paths = []
+    for i in range(num_blocks):
+        is_last = (i == num_blocks - 1)
+        wrapper = SingleBlockExportWrapper(
+            model.blocks[i],
+            model.rope_cos,
+            model.rope_sin,
+            norm_final=model.norm_final if is_last else None,
+        )
+        wrapper.eval()
+
+        block_path = f"{base_name}_block{i}{ext}"
+
+        with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
+            wrapper(x)  # warmup
+
+        with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
+            with te_onnx_export(enabled=True):
+                torch.onnx.export(
+                    wrapper,
+                    (x,),
+                    block_path,
+                    **export_kwargs_base,
+                )
+
+        _save_summary(block_path)
+
+        # Compute this block's output (raw, without norm_final / .float())
+        # to use as the next block's input.
+        with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
+            x = model.blocks[i](x, model.rope_cos, model.rope_sin)
+
+        block_paths.append(block_path)
+
+    print(f"Exported {num_blocks} per-block ONNX models")
+    return block_paths
 
 
 def export(args):
