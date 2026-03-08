@@ -147,10 +147,13 @@ def _mode_trt_precision(args, mode):
     }[mode]
 
 
-def _trtexec_precision_flags(precision):
+def _trtexec_precision_flags(precision, has_qdq_nodes=False):
     if precision == "fp32":
         return []
-    return [f"--{precision}"]
+    flags = [f"--{precision}"]
+    if precision == "fp8" and has_qdq_nodes:
+        flags.append("--stronglyTyped")
+    return flags
 
 
 def _run_trtexec(cmd, description):
@@ -287,6 +290,9 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
             "TensorRT documents FP8 as an explicit-quantization workflow, so this build may fail or fall back to higher precision."
         )
 
+    has_qdq_nodes = quantization_info is not None and (
+        quantization_info["trt_fp8_qdq"] > 0 or quantization_info["standard_qdq"] > 0
+    )
     shapes = _shape_spec(args, model_config)
     build_cmd = [
         trtexec_path,
@@ -297,7 +303,7 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
         f"--maxShapes={shapes}",
         "--skipInference",
     ]
-    build_cmd.extend(_trtexec_precision_flags(precision))
+    build_cmd.extend(_trtexec_precision_flags(precision, has_qdq_nodes=has_qdq_nodes))
 
     build_uses_explicit_shapes = True
     try:
@@ -313,7 +319,7 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
             f"--saveEngine={engine_path}",
             "--skipInference",
         ]
-        static_build_cmd.extend(_trtexec_precision_flags(precision))
+        static_build_cmd.extend(_trtexec_precision_flags(precision, has_qdq_nodes=has_qdq_nodes))
         build_output = _run_trtexec(static_build_cmd, f"Running TensorRT engine build for {mode} (static-shape retry):")
     actual_precision = _parse_trtexec_build_precision(build_output)
     if actual_precision is not None:
