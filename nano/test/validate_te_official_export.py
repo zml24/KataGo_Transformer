@@ -150,10 +150,12 @@ def _mode_trt_precision(args, mode):
 def _trtexec_precision_flags(precision, has_qdq_nodes=False):
     if precision == "fp32":
         return []
-    flags = [f"--{precision}"]
     if precision == "fp8" and has_qdq_nodes:
-        flags.append("--stronglyTyped")
-    return flags
+        # Q/DQ nodes encode precision explicitly; --stronglyTyped tells TRT
+        # to respect them.  --fp8 conflicts with --stronglyTyped (TRT ignores
+        # it with a warning), so we use --stronglyTyped alone.
+        return ["--stronglyTyped"]
+    return [f"--{precision}"]
 
 
 def _run_trtexec(cmd, description):
@@ -251,20 +253,31 @@ def _inspect_onnx_quantization(onnx_path):
         count for key, count in op_counts.items()
         if key.startswith("trt::TRT_FP8")
     )
+    custom_domain_ops = {
+        key: count for key, count in op_counts.items()
+        if "::" in key
+    }
     return {
         "standard_qdq": standard_qdq,
         "trt_fp8_qdq": trt_fp8_qdq,
+        "custom_domain_ops": custom_domain_ops,
     }
 
 
 def _format_onnx_quantization_info(info):
     if info is None:
         return "onnx package not available; quantization nodes not inspected"
+    parts = []
     if info["trt_fp8_qdq"] > 0:
-        return f"detected {info['trt_fp8_qdq']} TRT FP8 Q/DQ nodes"
+        parts.append(f"{info['trt_fp8_qdq']} TRT FP8 Q/DQ nodes")
     if info["standard_qdq"] > 0:
-        return f"detected {info['standard_qdq']} standard Q/DQ nodes"
-    return "no Q/DQ nodes detected"
+        parts.append(f"{info['standard_qdq']} standard Q/DQ nodes")
+    if info["custom_domain_ops"]:
+        op_summary = ", ".join(f"{k}({v})" for k, v in sorted(info["custom_domain_ops"].items()))
+        parts.append(f"custom ops: [{op_summary}]")
+    if not parts:
+        return "no Q/DQ nodes detected"
+    return "; ".join(parts)
 
 
 def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
@@ -304,6 +317,8 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
         "--skipInference",
     ]
     build_cmd.extend(_trtexec_precision_flags(precision, has_qdq_nodes=has_qdq_nodes))
+    for plugin_path in getattr(args, "trt_plugins", []):
+        build_cmd.append(f"--plugins={plugin_path}")
 
     build_uses_explicit_shapes = True
     try:
@@ -320,6 +335,8 @@ def _maybe_run_trtexec(args, onnx_path, engine_path, model_config, mode):
             "--skipInference",
         ]
         static_build_cmd.extend(_trtexec_precision_flags(precision, has_qdq_nodes=has_qdq_nodes))
+        for plugin_path in getattr(args, "trt_plugins", []):
+            static_build_cmd.append(f"--plugins={plugin_path}")
         build_output = _run_trtexec(static_build_cmd, f"Running TensorRT engine build for {mode} (static-shape retry):")
     actual_precision = _parse_trtexec_build_precision(build_output)
     if actual_precision is not None:
@@ -436,6 +453,8 @@ def main():
                         help="Benchmark duration passed to trtexec --duration (default: 10)")
     parser.add_argument("--trtexec-avg-runs", type=int, default=100,
                         help="Average runs passed to trtexec --avgRuns (default: 100)")
+    parser.add_argument("--trt-plugins", nargs="*", default=[],
+                        help="Extra TRT plugin shared libraries to load via trtexec --plugins (e.g. libtransformer_engine.so)")
     parser.add_argument("--fallback-to-te-decomposed-on-te-export-error", action="store_true",
                         help="If the official TE export fails, retry with a decomposed TE export path before considering legacy export")
     parser.add_argument("--fallback-to-legacy-on-te-export-error", action="store_true",
