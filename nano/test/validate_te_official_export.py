@@ -171,11 +171,10 @@ def _trtexec_precision_flags(precision, has_trt_fp8_qdq=False, has_standard_qdq=
             # warning), so we use --stronglyTyped alone.
             return ["--stronglyTyped"]
         if has_standard_qdq:
-            # Standard ONNX QuantizeLinear/DequantizeLinear nodes.  Use
-            # --fp8 only; adding --fp16 in weakly-typed mode lets TRT
-            # cast scales to fp16, which Myelin can't handle for FP8
-            # quantize ops (no rules for f32 input + f16 scale -> f8).
-            return ["--fp8"]
+            # Standard ONNX QuantizeLinear/DequantizeLinear with FP8 types.
+            # TRT recommends strongly-typed networks for Q/DQ nodes using
+            # precisions other than int8.
+            return ["--stronglyTyped"]
         # No Q/DQ nodes at all; just request FP8 and hope for the best.
         return ["--fp8"]
     return [f"--{precision}"]
@@ -583,10 +582,20 @@ def main():
                 detail = f"{block_ok}/{len(block_paths)} blocks built"
                 results.append((mode, "OK", detail))
             except RuntimeError as exc:
-                print(f"ERROR: mode {mode} (split-blocks) failed")
-                print(str(exc))
-                results.append((mode, "FAILED", str(exc)))
-            continue
+                error_text = str(exc)
+                if args.use_fp8 and _is_trtexec_myelin_ssa_error(error_text):
+                    # FP8 Q/DQ triggers a Myelin GVN bug in TRT 10.15.1
+                    # even on single blocks.  Fall through to the normal
+                    # export path which supports --fallback-disable-fp8-on-trt-internal-error.
+                    print(
+                        "Split-blocks FP8 build hit Myelin SSA error. "
+                        "Falling through to standard export path for fallback handling."
+                    )
+                else:
+                    print(f"ERROR: mode {mode} (split-blocks) failed")
+                    print(error_text)
+                    results.append((mode, "FAILED", error_text))
+                    continue
 
         try:
             onnx_path, model, input_spatial, input_global = export(export_args)

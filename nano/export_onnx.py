@@ -235,48 +235,44 @@ def _print_param_count(model):
 def convert_trt_fp8_to_standard_qdq(onnx_path):
     """Replace trt::TRT_FP8QuantizeLinear/DequantizeLinear with standard ONNX QuantizeLinear/DequantizeLinear.
 
-    TE's translation table emits custom ``trt::TRT_FP8*`` ops that trigger a
-    Myelin compiler bug in TRT 10.15.  Standard ONNX Q/DQ ops with FP8 types
-    are handled by TRT's native quantization path and avoid the crash.
+    TE's translation table emits custom ``trt::TRT_FP8*`` ops.  This converts
+    them to standard ONNX Q/DQ ops using the ``output_dtype`` attribute
+    (opset 21+) to specify the FP8 quantized type.
 
-    Besides renaming the ops, this adds a FLOAT8E4M3FN zero-point constant
-    as the third input to each Q/DQ node.  Without this zero-point, standard
-    QuantizeLinear defaults to uint8 output which TRT interprets as INT8.
-    The zero-point's data type tells TRT the quantized precision is FP8.
-    The value_info element types are also updated for consistency.
+    TRT documents FP8 as symmetric quantization (no zero-point).  The ONNX
+    spec also says "zero-point is usually not used in the case of
+    float8e4m3fn quantization."  Using the ``output_dtype`` attribute instead
+    of a zero-point input avoids adding unnecessary computation nodes in
+    TRT's internal graph.
+
+    The value_info element types are also updated from UINT8 to FLOAT8E4M3FN
+    so that TRT and other tools can infer the correct quantized tensor type.
     """
     import onnx
-    from onnx import TensorProto
+    from onnx import TensorProto, helper
 
     model = onnx.load(onnx_path)
 
-    # Create a shared scalar FLOAT8E4M3FN zero-point constant (value=0).
-    # Standard ONNX QuantizeLinear/DequantizeLinear infer the quantized
-    # data type from the zero_point input type.
-    zp_name = "__fp8e4m3fn_zero_point__"
-    zp_initializer = onnx.TensorProto()
-    zp_initializer.name = zp_name
-    zp_initializer.data_type = TensorProto.FLOAT8E4M3FN
-    zp_initializer.raw_data = b"\x00"  # scalar 0 in FP8 E4M3FN
-
-    # Pass 1: rename ops, attach zero-point, and collect quantized tensor names.
+    # Pass 1: rename ops, set output_dtype, collect quantized tensor names.
     fp8_tensor_names = set()
     converted = 0
     for node in model.graph.node:
         if node.domain == "trt" and node.op_type == "TRT_FP8QuantizeLinear":
             node.domain = ""
             node.op_type = "QuantizeLinear"
-            node.input.append(zp_name)
+            # Use output_dtype attribute (opset 21+) to specify FP8 output
+            # type instead of adding a zero_point input.
+            node.attribute.append(
+                helper.make_attribute("output_dtype", TensorProto.FLOAT8E4M3FN)
+            )
             fp8_tensor_names.update(node.output)
             converted += 1
         elif node.domain == "trt" and node.op_type == "TRT_FP8DequantizeLinear":
             node.domain = ""
             node.op_type = "DequantizeLinear"
-            node.input.append(zp_name)
+            # DequantizeLinear infers the quantized input type from the
+            # tensor's value_info annotation; no zero_point needed.
             converted += 1
-
-    if converted > 0:
-        model.graph.initializer.append(zp_initializer)
 
     # Pass 2: fix element types from UINT8 -> FLOAT8E4M3FN in value_info.
     type_fixed = 0
@@ -289,7 +285,7 @@ def convert_trt_fp8_to_standard_qdq(onnx_path):
         onnx.save(model, onnx_path, save_as_external_data=True, all_tensors_to_one_file=True,
                   location=os.path.basename(onnx_path) + ".data")
         print(f"Converted {converted} trt::TRT_FP8 ops to standard QuantizeLinear/DequantizeLinear")
-        print(f"  Added FLOAT8E4M3FN zero-point to {converted} Q/DQ nodes")
+        print(f"  Set output_dtype=FLOAT8E4M3FN on QuantizeLinear nodes")
         if type_fixed > 0:
             print(f"  Updated {type_fixed} value_info tensor types from UINT8 to FLOAT8E4M3FN")
     return converted
