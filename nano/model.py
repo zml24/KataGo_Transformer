@@ -303,17 +303,27 @@ class Model(nn.Module):
         H = W = self.pos_len
         L = H * W
 
-        # Stem: NCHW -> NLC
-        x_spatial = self.conv_spatial(input_spatial)
-        x_global = self.linear_global(input_global)
-        x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-        x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
+        x = self._forward_stem_impl(input_spatial, input_global)
 
         # Trunk
         for block in self.blocks:
             x = block(x, self.rope_cos, self.rope_sin)
 
         return self.norm_final(x)
+
+    def _forward_stem_impl(self, input_spatial, input_global):
+        N = input_spatial.shape[0]
+        H = W = self.pos_len
+        L = H * W
+
+        # Stem: NCHW -> NLC
+        x_spatial = self.conv_spatial(input_spatial)
+        x_global = self.linear_global(input_global)
+        x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
+        return x.view(N, self.c_trunk, L).permute(0, 2, 1)
+
+    def forward_stem_for_onnx_export(self, input_spatial, input_global):
+        return self._forward_stem_impl(input_spatial, input_global).float()
 
     def forward_trunk_for_onnx_export(self, input_spatial, input_global):
         return self._forward_trunk_impl(input_spatial, input_global).float()

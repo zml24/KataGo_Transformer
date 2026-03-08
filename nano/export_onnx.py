@@ -49,6 +49,9 @@ FULL_OUTPUT_NAMES = [
     "out_seki",         # (N, 4, H, W)
     "out_scorebelief",  # (N, scorebelief_len)
 ]
+STEM_OUTPUT_NAMES = [
+    "out_stem",         # (N, L, C)
+]
 TRUNK_OUTPUT_NAMES = [
     "out_trunk",        # (N, L, C)
 ]
@@ -57,6 +60,8 @@ TRUNK_OUTPUT_NAMES = [
 def _output_names(export_scope):
     if export_scope == "full":
         return FULL_OUTPUT_NAMES
+    if export_scope == "stem":
+        return STEM_OUTPUT_NAMES
     if export_scope == "trunk":
         return TRUNK_OUTPUT_NAMES
     raise ValueError(f"Unsupported export scope: {export_scope}")
@@ -70,6 +75,13 @@ class ExportWrapper(nn.Module):
         self._export_output_names = _output_names(export_scope)
 
     def forward(self, input_spatial, input_global):
+        if self.export_scope == "stem":
+            export_stem = getattr(self.model, "forward_stem_for_onnx_export", None)
+            if export_stem is None:
+                raise RuntimeError(
+                    f"Model {type(self.model).__name__} does not implement forward_stem_for_onnx_export()"
+                )
+            return (export_stem(input_spatial, input_global),)
         if self.export_scope == "trunk":
             export_trunk = getattr(self.model, "forward_trunk_for_onnx_export", None)
             if export_trunk is None:
@@ -144,7 +156,7 @@ def _dynamic_axes_for_scope(export_scope):
     return {
         "input_spatial": {0: "batch"},
         "input_global": {0: "batch"},
-        "out_trunk": {0: "batch"},
+        _output_names(export_scope)[0]: {0: "batch"},
     }
 
 
@@ -637,7 +649,7 @@ def main():
     parser.add_argument("--pos-len", type=int, default=19, help="Board size (default: 19)")
     parser.add_argument("--score-mode", type=str, default="simple",
                         choices=["mixop", "mix", "simple"], help="Score belief head mode")
-    parser.add_argument("--export-scope", type=str, default="full", choices=["full", "trunk"],
+    parser.add_argument("--export-scope", type=str, default="full", choices=["full", "stem", "trunk"],
                         help="Export the full model or only stem+trunk+norm (default: full)")
     parser.add_argument("--opset", type=int, default=None,
                         help="ONNX opset version (default: legacy=17, te-official=PyTorch default)")

@@ -214,13 +214,19 @@ class Model(nn.Module):
                     init_fn(p)
 
     def forward_trunk_for_onnx_export(self, input_spatial, input_global):
+        x = self._forward_stem_impl(input_spatial, input_global)
+        return self._run_trunk_impl(x).float()
+
+    def _forward_stem_impl(self, input_spatial, input_global):
         N = input_spatial.shape[0]
         L = self.pos_len * self.pos_len
         x_spatial = self.conv_spatial(input_spatial)
         x_global = self.linear_global(input_global)
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-        x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
-        return self._run_trunk_impl(x).float()
+        return x.view(N, self.c_trunk, L).permute(0, 2, 1)
+
+    def forward_stem_for_onnx_export(self, input_spatial, input_global):
+        return self._forward_stem_impl(input_spatial, input_global).float()
 
     def _forward_impl(self, input_spatial, input_global, for_onnx_export: bool):
         """
@@ -232,10 +238,7 @@ class Model(nn.Module):
         L = H * W
 
         # Stem: NCHW -> NLC
-        x_spatial = self.conv_spatial(input_spatial)
-        x_global = self.linear_global(input_global)
-        x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-        x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
+        x = self._forward_stem_impl(input_spatial, input_global)
 
         # ONNX export needs the full TE graph visible to torch.export / torch.onnx.
         if for_onnx_export:
@@ -358,23 +361,23 @@ class ModelDecomposedExport(nn.Module):
             x = block(x, self.rope_cos, self.rope_sin)
         return self.norm_final(x)
 
-    def forward_trunk_for_onnx_export(self, input_spatial, input_global):
+    def _forward_stem_impl(self, input_spatial, input_global):
         batch_size = input_spatial.shape[0]
         seq_len = self.pos_len * self.pos_len
         x_spatial = self.conv_spatial(input_spatial)
         x_global = self.linear_global(input_global)
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-        x = x.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
+        return x.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
+
+    def forward_stem_for_onnx_export(self, input_spatial, input_global):
+        return self._forward_stem_impl(input_spatial, input_global).float()
+
+    def forward_trunk_for_onnx_export(self, input_spatial, input_global):
+        x = self._forward_stem_impl(input_spatial, input_global)
         return self._run_trunk_impl(x).float()
 
     def forward(self, input_spatial, input_global):
-        batch_size = input_spatial.shape[0]
-        seq_len = self.pos_len * self.pos_len
-
-        x_spatial = self.conv_spatial(input_spatial)
-        x_global = self.linear_global(input_global)
-        x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-        x = x.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
+        x = self._forward_stem_impl(input_spatial, input_global)
         x = self._run_trunk_impl(x)
 
         out_policy = self.policy_head(x)

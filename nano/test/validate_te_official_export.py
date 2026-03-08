@@ -481,7 +481,7 @@ def main():
     parser.add_argument("--pos-len", type=int, default=19, help="Board size (default: 19)")
     parser.add_argument("--score-mode", type=str, default="simple",
                         choices=["mixop", "mix", "simple"], help="Score belief head mode")
-    parser.add_argument("--export-scope", type=str, default="full", choices=["full", "trunk"],
+    parser.add_argument("--export-scope", type=str, default="full", choices=["full", "stem", "trunk"],
                         help="Export the full model or only stem+trunk+norm (default: full)")
     parser.add_argument("--use-fp8", action="store_true",
                         help="Build the random TE checkpoint and TE-based exports with FP8-enabled module layout")
