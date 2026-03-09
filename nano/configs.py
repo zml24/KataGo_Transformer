@@ -29,7 +29,7 @@ def get_num_global_input_features(config: ModelConfig):
         assert False
 
 
-def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebeliefs=8, version=15):
+def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebeliefs=8, version=15, pos_enc="rope"):
     """Create a model config from minimal parameters.
 
     Args:
@@ -39,6 +39,8 @@ def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebelie
         ffn_dim: SwiGLU FFN intermediate dimension. Default: hidden_size * 8 // 3.
         num_scorebeliefs: Number of score belief mixtures. Default: 8.
         version: Data format version. Default: 15.
+        pos_enc: Position encoding mode. "rope" (3x3 conv, RoPE only),
+            "ape-stem" (1x1 conv, APE on stem), "ape-all" (1x1 conv, APE on every layer).
     """
     if ffn_dim is None:
         ffn_dim = hidden_size * 8 // 3
@@ -49,12 +51,16 @@ def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebelie
         "num_heads": num_heads,
         "ffn_dim": ffn_dim,
         "num_scorebeliefs": num_scorebeliefs,
+        "pos_enc": pos_enc,
     }
 
 
 def migrate_config(old: ModelConfig) -> ModelConfig:
     """Convert old-format config (with trunk_num_channels etc.) to new minimal format."""
     if "hidden_size" in old:
+        if "pos_enc" not in old:
+            old = dict(old)
+            old["pos_enc"] = "rope"
         return old
     return make_config(
         num_layers=len(old["block_kind"]),
@@ -63,6 +69,7 @@ def migrate_config(old: ModelConfig) -> ModelConfig:
         ffn_dim=old.get("transformer_ffn_channels", old["trunk_num_channels"] * 8 // 3),
         num_scorebeliefs=old.get("num_scorebeliefs", 8),
         version=old.get("version", 15),
+        pos_enc=old.get("pos_enc", "rope"),
     )
 
 

@@ -41,6 +41,21 @@ def cross_entropy(pred_logits, target_probs, dim):
 # ---------------------------------------------------------------------------
 # 2D RoPE
 # ---------------------------------------------------------------------------
+def build_edge_index_map(pos_len: int) -> torch.Tensor:
+    """Precompute edge-distance index map for absolute position encoding.
+
+    For each position (r, c), compute: min(r+1, pos_len-r, c+1, pos_len-c) - 1
+    This gives embedding index 0 for edges, up to (pos_len+1)//2 - 1 for center.
+    For 19x19: indices 0-9 (10 unique values).
+
+    Returns: LongTensor of shape (pos_len * pos_len,)
+    """
+    coords = torch.arange(pos_len)
+    edge_dist = torch.min(coords, pos_len - 1 - coords)  # 0 to (pos_len-1)//2
+    grid_r, grid_c = torch.meshgrid(edge_dist, edge_dist, indexing="ij")
+    return torch.min(grid_r, grid_c).flatten().long()
+
+
 def precompute_freqs_cos_sin_2d(dim: int, pos_len: int, theta: float = 100.0):
     assert dim % 4 == 0
     dim_half = dim // 2
@@ -252,7 +267,14 @@ class Model(nn.Module):
         head_dim = self.c_trunk // num_heads
 
         # Stem
-        self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
+        self.pos_enc = config.get("pos_enc", "rope")
+        if self.pos_enc in ("ape-stem", "ape-all"):
+            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=1, bias=False)
+            num_edge_positions = (pos_len + 1) // 2
+            self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
+            self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
+        else:
+            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
         self.linear_global = nn.Linear(num_global_features, self.c_trunk, bias=False)
 
         # Precompute RoPE embeddings once for the whole model (rotate_half style)
@@ -298,6 +320,9 @@ class Model(nn.Module):
                 else:
                     nn.init.normal_(p, mean=0.0, std=init_std)
 
+        if self.pos_enc in ("ape-stem", "ape-all"):
+            nn.init.normal_(self.pos_embed.weight, mean=0.0, std=init_std)
+
     def _forward_trunk_impl(self, input_spatial, input_global):
         x = self._forward_stem_impl(input_spatial, input_global)
         return self._forward_blocks_impl(x)
@@ -306,6 +331,8 @@ class Model(nn.Module):
 
         # Trunk
         for block in self.blocks:
+            if self.pos_enc == "ape-all":
+                x = x + self.pos_embed(self.edge_index_map)
             x = block(x, self.rope_cos, self.rope_sin)
 
         return self.norm_final(x)
@@ -319,7 +346,10 @@ class Model(nn.Module):
         x_spatial = self.conv_spatial(input_spatial)
         x_global = self.linear_global(input_global)
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-        return x.view(N, self.c_trunk, L).permute(0, 2, 1)
+        x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
+        if self.pos_enc == "ape-stem":
+            x = x + self.pos_embed(self.edge_index_map)
+        return x
 
     def forward_stem_for_onnx_export(self, input_spatial, input_global):
         return self._forward_stem_impl(input_spatial, input_global).float()

@@ -29,6 +29,7 @@ from model import (
     EXTRA_SCORE_DISTR_RADIUS,
     SoftPlusWithGradientFloor,
     apply_rotary_emb,
+    build_edge_index_map,
     cross_entropy,
     precompute_freqs_cos_sin_2d,
     PolicyHead,
@@ -141,8 +142,15 @@ class Model(nn.Module):
 
         # Stem: Conv2d stays as nn (TE has no Conv2d)
         # Non-FP8: use te.Linear for fused kernels; FP8: nn.Linear (dims not FP8-aligned)
+        self.pos_enc = config.get("pos_enc", "rope")
         Linear = nn.Linear if use_fp8 else te.Linear
-        self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
+        if self.pos_enc in ("ape-stem", "ape-all"):
+            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=1, bias=False)
+            num_edge_positions = (pos_len + 1) // 2
+            self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
+            self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
+        else:
+            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
         self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
 
         # Precompute RoPE embeddings (rotate_half)
@@ -177,6 +185,8 @@ class Model(nn.Module):
 
     def _run_trunk_impl(self, x):
         for block in self.blocks:
+            if self.pos_enc == "ape-all":
+                x = x + self.pos_embed(self.edge_index_map)
             x = block(x, self.rope)
         return self.norm_final(x)
 
@@ -213,6 +223,10 @@ class Model(nn.Module):
                 if p.dim() >= 2:
                     init_fn(p)
 
+        # APE embedding
+        if self.pos_enc in ("ape-stem", "ape-all"):
+            init_fn(self.pos_embed.weight)
+
     def forward_trunk_for_onnx_export(self, input_spatial, input_global):
         x = self._forward_stem_impl(input_spatial, input_global)
         return self._forward_blocks_impl(x).float()
@@ -223,7 +237,10 @@ class Model(nn.Module):
         x_spatial = self.conv_spatial(input_spatial)
         x_global = self.linear_global(input_global)
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-        return x.view(N, self.c_trunk, L).permute(0, 2, 1)
+        x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
+        if self.pos_enc == "ape-stem":
+            x = x + self.pos_embed(self.edge_index_map)
+        return x
 
     def forward_stem_for_onnx_export(self, input_spatial, input_global):
         return self._forward_stem_impl(input_spatial, input_global).float()
@@ -333,8 +350,15 @@ class ModelDecomposedExport(nn.Module):
         ffn_dim = config["ffn_dim"]
         head_dim = self.c_trunk // num_heads
 
+        self.pos_enc = config.get("pos_enc", "rope")
         Linear = nn.Linear if use_fp8 else te.Linear
-        self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
+        if self.pos_enc in ("ape-stem", "ape-all"):
+            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=1, bias=False)
+            num_edge_positions = (pos_len + 1) // 2
+            self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
+            self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
+        else:
+            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
         self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
 
         emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)
@@ -364,6 +388,8 @@ class ModelDecomposedExport(nn.Module):
 
     def _run_trunk_impl(self, x):
         for block in self.blocks:
+            if self.pos_enc == "ape-all":
+                x = x + self.pos_embed(self.edge_index_map)
             x = block(x, self.rope_cos, self.rope_sin)
         return self.norm_final(x)
 
@@ -373,7 +399,10 @@ class ModelDecomposedExport(nn.Module):
         x_spatial = self.conv_spatial(input_spatial)
         x_global = self.linear_global(input_global)
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-        return x.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
+        x = x.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
+        if self.pos_enc == "ape-stem":
+            x = x + self.pos_embed(self.edge_index_map)
+        return x
 
     def forward_stem_for_onnx_export(self, input_spatial, input_global):
         return self._forward_stem_impl(input_spatial, input_global).float()

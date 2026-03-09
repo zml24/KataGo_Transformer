@@ -88,16 +88,22 @@ class SingleBlockExportWrapper(nn.Module):
     final RMSNorm so the full ``blocks`` computation is covered.
     """
 
-    def __init__(self, block, rope_cos, rope_sin, norm_final=None):
+    def __init__(self, block, rope_cos, rope_sin, norm_final=None,
+                 pos_embed=None, edge_index_map=None):
         super().__init__()
         self.block = block
         self.register_buffer("rope_cos", rope_cos)
         self.register_buffer("rope_sin", rope_sin)
         self.norm_final = norm_final
+        self.pos_embed = pos_embed
+        if edge_index_map is not None:
+            self.register_buffer("edge_index_map", edge_index_map)
         self._export_input_names = BLOCKS_INPUT_NAMES
         self._export_output_names = BLOCKS_OUTPUT_NAMES
 
     def forward(self, x):
+        if self.pos_embed is not None:
+            x = x + self.pos_embed(self.edge_index_map)
         x = self.block(x, self.rope_cos, self.rope_sin)
         if self.norm_final is not None:
             x = self.norm_final(x)
@@ -735,11 +741,14 @@ def export_per_block(args):
     block_paths = []
     for i in range(num_blocks):
         is_last = (i == num_blocks - 1)
+        use_ape_all = getattr(model, "pos_enc", "rope") == "ape-all"
         wrapper = SingleBlockExportWrapper(
             model.blocks[i],
             model.rope_cos,
             model.rope_sin,
             norm_final=model.norm_final if is_last else None,
+            pos_embed=model.pos_embed if use_ape_all else None,
+            edge_index_map=model.edge_index_map if use_ape_all else None,
         )
         wrapper.eval()
 

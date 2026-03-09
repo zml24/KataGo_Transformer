@@ -217,9 +217,12 @@ def main(rank, world_size, args, gpu_id):
             num_layers=args.num_layers,
             hidden_size=args.hidden_size,
             num_heads=args.num_heads,
+            pos_enc=args.pos_enc,
         )
     else:
         model_config = configs.config_of_name[args.model_kind].copy()
+        if args.pos_enc != "rope":
+            model_config["pos_enc"] = args.pos_enc
     logging.info(f"Model config: {json.dumps(model_config, indent=2, default=str)}")
 
     pos_len = args.pos_len
@@ -993,6 +996,9 @@ if __name__ == "__main__":
                         help="Enable per-stage CUDA-synced profiling (adds sync overhead)")
     parser.add_argument("--ema-decay", type=float, default=0.0,
                         help="EMA decay rate for model params (0=disabled, typical: 0.999 or 0.9999)")
+    parser.add_argument("--pos-enc", type=str, default="rope", choices=["rope", "ape-stem", "ape-all"],
+                        help="Position encoding mode: rope=3x3 conv + RoPE only, "
+                             "ape-stem=1x1 conv + APE on stem + RoPE, ape-all=1x1 conv + APE on every layer + RoPE")
     args = parser.parse_args()
 
     # Validation
