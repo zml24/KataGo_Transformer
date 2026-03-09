@@ -145,7 +145,8 @@ class Model(nn.Module):
         Linear = nn.Linear if use_fp8 else te.Linear
         if self.pos_enc in ("ape-stem", "ape-all"):
             self.linear_spatial = Linear(num_bin_features, self.c_trunk, bias=False)
-            num_edge_positions = (pos_len + 1) // 2
+            half = (pos_len - 1) // 2
+            num_edge_positions = (half + 1) * (half + 2) // 2
             self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
             if self.pos_enc == "ape-stem":
                 self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
@@ -371,7 +372,8 @@ class ModelDecomposedExport(nn.Module):
         Linear = nn.Linear if use_fp8 else te.Linear
         if self.pos_enc in ("ape-stem", "ape-all"):
             self.linear_spatial = Linear(num_bin_features, self.c_trunk, bias=False)
-            num_edge_positions = (pos_len + 1) // 2
+            half = (pos_len - 1) // 2
+            num_edge_positions = (half + 1) * (half + 2) // 2
             self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
             if self.pos_enc == "ape-stem":
                 self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)

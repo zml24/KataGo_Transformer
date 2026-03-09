@@ -44,16 +44,19 @@ def cross_entropy(pred_logits, target_probs, dim):
 def build_edge_index_map(pos_len: int) -> torch.Tensor:
     """Precompute edge-distance index map for absolute position encoding.
 
-    For each position (r, c), compute: min(r+1, pos_len-r, c+1, pos_len-c) - 1
-    This gives embedding index 0 for edges, up to (pos_len+1)//2 - 1 for center.
-    For 19x19: indices 0-9 (10 unique values).
+    For each position (r, c), compute sorted edge-distance pair (a, b) where
+    a = min(dist_r, dist_c), b = max(dist_r, dist_c), then map to a unique
+    index via b*(b+1)/2 + a. This gives 55 equivalence classes for 19x19
+    (0 <= a <= b <= 9) with full D_4 invariance.
 
     Returns: LongTensor of shape (pos_len * pos_len,)
     """
     coords = torch.arange(pos_len)
     edge_dist = torch.min(coords, pos_len - 1 - coords)  # 0 to (pos_len-1)//2
     grid_r, grid_c = torch.meshgrid(edge_dist, edge_dist, indexing="ij")
-    return torch.min(grid_r, grid_c).flatten().long()
+    a = torch.min(grid_r, grid_c)
+    b = torch.max(grid_r, grid_c)
+    return (b * (b + 1) // 2 + a).flatten().long()
 
 
 def precompute_freqs_cos_sin_2d(dim: int, pos_len: int, theta: float = 100.0):
@@ -270,7 +273,8 @@ class Model(nn.Module):
         self.pos_enc = config.get("pos_enc", "rope")
         if self.pos_enc in ("ape-stem", "ape-all"):
             self.linear_spatial = nn.Linear(num_bin_features, self.c_trunk, bias=False)
-            num_edge_positions = (pos_len + 1) // 2
+            half = (pos_len - 1) // 2
+            num_edge_positions = (half + 1) * (half + 2) // 2
             self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
             if self.pos_enc == "ape-stem":
                 self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
