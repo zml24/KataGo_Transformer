@@ -140,17 +140,24 @@ class Model(nn.Module):
         ffn_dim = config["ffn_dim"]
         head_dim = self.c_trunk // num_heads
 
-        # Stem: Conv2d stays as nn (TE has no Conv2d)
-        # Non-FP8: use te.Linear for fused kernels; FP8: nn.Linear (dims not FP8-aligned)
+        # Stem
         self.pos_enc = config.get("pos_enc", "rope")
         Linear = nn.Linear if use_fp8 else te.Linear
         if self.pos_enc in ("ape-stem", "ape-all"):
-            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=1, bias=False)
+            self.linear_spatial = Linear(num_bin_features, self.c_trunk, bias=False)
             num_edge_positions = (pos_len + 1) // 2
-            self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
             self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
+            if self.pos_enc == "ape-stem":
+                self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
+            else:  # ape-all: per-layer independent embeddings
+                self.pos_embeds = nn.ModuleList([
+                    nn.Embedding(num_edge_positions, self.c_trunk)
+                    for _ in range(config["num_layers"])
+                ])
         else:
+            # Conv2d stays as nn (TE has no Conv2d)
             self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
+        # Non-FP8: use te.Linear for fused kernels; FP8: nn.Linear (dims not FP8-aligned)
         self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
 
         # Precompute RoPE embeddings (rotate_half)
@@ -184,9 +191,9 @@ class Model(nn.Module):
         self.moving_unowned_proportion_weight = 0.0
 
     def _run_trunk_impl(self, x):
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             if self.pos_enc == "ape-all":
-                x = x + self.pos_embed(self.edge_index_map)
+                x = x + self.pos_embeds[i](self.edge_index_map)
             x = block(x, self.rope)
         return self.norm_final(x)
 
@@ -214,7 +221,10 @@ class Model(nn.Module):
         ])
 
         # Stem
-        init_fn(self.conv_spatial.weight)
+        if self.pos_enc in ("ape-stem", "ape-all"):
+            init_fn(self.linear_spatial.weight)
+        else:
+            init_fn(self.conv_spatial.weight)
         init_fn(self.linear_global.weight)
 
         # Heads (nn.Linear from model.py, all bias=False)
@@ -224,8 +234,11 @@ class Model(nn.Module):
                     init_fn(p)
 
         # APE embedding
-        if self.pos_enc in ("ape-stem", "ape-all"):
+        if self.pos_enc == "ape-stem":
             init_fn(self.pos_embed.weight)
+        elif self.pos_enc == "ape-all":
+            for emb in self.pos_embeds:
+                init_fn(emb.weight)
 
     def forward_trunk_for_onnx_export(self, input_spatial, input_global):
         x = self._forward_stem_impl(input_spatial, input_global)
@@ -234,10 +247,14 @@ class Model(nn.Module):
     def _forward_stem_impl(self, input_spatial, input_global):
         N = input_spatial.shape[0]
         L = self.pos_len * self.pos_len
-        x_spatial = self.conv_spatial(input_spatial)
         x_global = self.linear_global(input_global)
-        x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-        x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
+        if self.pos_enc in ("ape-stem", "ape-all"):
+            x_spatial = self.linear_spatial(input_spatial.view(N, -1, L).permute(0, 2, 1))
+            x = x_spatial + x_global.unsqueeze(1)
+        else:
+            x_spatial = self.conv_spatial(input_spatial)
+            x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
+            x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
         if self.pos_enc == "ape-stem":
             x = x + self.pos_embed(self.edge_index_map)
         return x
@@ -353,10 +370,16 @@ class ModelDecomposedExport(nn.Module):
         self.pos_enc = config.get("pos_enc", "rope")
         Linear = nn.Linear if use_fp8 else te.Linear
         if self.pos_enc in ("ape-stem", "ape-all"):
-            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=1, bias=False)
+            self.linear_spatial = Linear(num_bin_features, self.c_trunk, bias=False)
             num_edge_positions = (pos_len + 1) // 2
-            self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
             self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
+            if self.pos_enc == "ape-stem":
+                self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
+            else:  # ape-all: per-layer independent embeddings
+                self.pos_embeds = nn.ModuleList([
+                    nn.Embedding(num_edge_positions, self.c_trunk)
+                    for _ in range(config["num_layers"])
+                ])
         else:
             self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
         self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
@@ -387,19 +410,23 @@ class ModelDecomposedExport(nn.Module):
         self.moving_unowned_proportion_weight = 0.0
 
     def _run_trunk_impl(self, x):
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             if self.pos_enc == "ape-all":
-                x = x + self.pos_embed(self.edge_index_map)
+                x = x + self.pos_embeds[i](self.edge_index_map)
             x = block(x, self.rope_cos, self.rope_sin)
         return self.norm_final(x)
 
     def _forward_stem_impl(self, input_spatial, input_global):
         batch_size = input_spatial.shape[0]
         seq_len = self.pos_len * self.pos_len
-        x_spatial = self.conv_spatial(input_spatial)
         x_global = self.linear_global(input_global)
-        x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-        x = x.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
+        if self.pos_enc in ("ape-stem", "ape-all"):
+            x_spatial = self.linear_spatial(input_spatial.view(batch_size, -1, seq_len).permute(0, 2, 1))
+            x = x_spatial + x_global.unsqueeze(1)
+        else:
+            x_spatial = self.conv_spatial(input_spatial)
+            x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
+            x = x.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
         if self.pos_enc == "ape-stem":
             x = x + self.pos_embed(self.edge_index_map)
         return x

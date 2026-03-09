@@ -269,10 +269,16 @@ class Model(nn.Module):
         # Stem
         self.pos_enc = config.get("pos_enc", "rope")
         if self.pos_enc in ("ape-stem", "ape-all"):
-            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=1, bias=False)
+            self.linear_spatial = nn.Linear(num_bin_features, self.c_trunk, bias=False)
             num_edge_positions = (pos_len + 1) // 2
-            self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
             self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
+            if self.pos_enc == "ape-stem":
+                self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
+            else:  # ape-all: per-layer independent embeddings
+                self.pos_embeds = nn.ModuleList([
+                    nn.Embedding(num_edge_positions, self.c_trunk)
+                    for _ in range(config["num_layers"])
+                ])
         else:
             self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
         self.linear_global = nn.Linear(num_global_features, self.c_trunk, bias=False)
@@ -320,8 +326,11 @@ class Model(nn.Module):
                 else:
                     nn.init.normal_(p, mean=0.0, std=init_std)
 
-        if self.pos_enc in ("ape-stem", "ape-all"):
+        if self.pos_enc == "ape-stem":
             nn.init.normal_(self.pos_embed.weight, mean=0.0, std=init_std)
+        elif self.pos_enc == "ape-all":
+            for emb in self.pos_embeds:
+                nn.init.normal_(emb.weight, mean=0.0, std=init_std)
 
     def _forward_trunk_impl(self, input_spatial, input_global):
         x = self._forward_stem_impl(input_spatial, input_global)
@@ -330,9 +339,9 @@ class Model(nn.Module):
     def _forward_blocks_impl(self, x):
 
         # Trunk
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             if self.pos_enc == "ape-all":
-                x = x + self.pos_embed(self.edge_index_map)
+                x = x + self.pos_embeds[i](self.edge_index_map)
             x = block(x, self.rope_cos, self.rope_sin)
 
         return self.norm_final(x)
@@ -343,10 +352,14 @@ class Model(nn.Module):
         L = H * W
 
         # Stem: NCHW -> NLC
-        x_spatial = self.conv_spatial(input_spatial)
         x_global = self.linear_global(input_global)
-        x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-        x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
+        if self.pos_enc in ("ape-stem", "ape-all"):
+            x_spatial = self.linear_spatial(input_spatial.view(N, -1, L).permute(0, 2, 1))  # (N, L, C)
+            x = x_spatial + x_global.unsqueeze(1)
+        else:
+            x_spatial = self.conv_spatial(input_spatial)
+            x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
+            x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
         if self.pos_enc == "ape-stem":
             x = x + self.pos_embed(self.edge_index_map)
         return x

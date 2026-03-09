@@ -747,7 +747,7 @@ def export_per_block(args):
             model.rope_cos,
             model.rope_sin,
             norm_final=model.norm_final if is_last else None,
-            pos_embed=model.pos_embed if use_ape_all else None,
+            pos_embed=model.pos_embeds[i] if use_ape_all else None,
             edge_index_map=model.edge_index_map if use_ape_all else None,
         )
         wrapper.eval()
@@ -771,6 +771,8 @@ def export_per_block(args):
         # Compute this block's output (raw, without norm_final / .float())
         # to use as the next block's input.
         with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
+            if use_ape_all:
+                x = x + model.pos_embeds[i](model.edge_index_map)
             x = model.blocks[i](x, model.rope_cos, model.rope_sin)
 
         block_paths.append(block_path)
