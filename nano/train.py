@@ -33,6 +33,45 @@ from losses import compute_loss, postprocess_and_loss_core, _METRIC_KEYS, estima
 
 
 # ---------------------------------------------------------------------------
+# Lightweight loss scaler for FP16 mixed-precision training.
+# PyTorch's GradScaler couples unscale/step per-optimizer, which doesn't
+# work cleanly with custom optimizers (Muon, Shampoo).  This class just
+# manages a scalar scale factor with grow/backoff logic.
+# ---------------------------------------------------------------------------
+class SimpleGradScaler:
+    def __init__(self, init_scale=2.**16, growth_factor=2.0, backoff_factor=0.5,
+                 growth_interval=2000):
+        self._scale = init_scale
+        self._growth_factor = growth_factor
+        self._backoff_factor = backoff_factor
+        self._growth_interval = growth_interval
+        self._growth_tracker = 0
+
+    def get_scale(self):
+        return self._scale
+
+    def scale(self, loss):
+        return loss * self._scale
+
+    def update(self, found_inf):
+        if found_inf:
+            self._scale *= self._backoff_factor
+            self._growth_tracker = 0
+        else:
+            self._growth_tracker += 1
+            if self._growth_tracker >= self._growth_interval:
+                self._scale *= self._growth_factor
+                self._growth_tracker = 0
+
+    def state_dict(self):
+        return {"scale": self._scale, "growth_tracker": self._growth_tracker}
+
+    def load_state_dict(self, state):
+        self._scale = state["scale"]
+        self._growth_tracker = state["growth_tracker"]
+
+
+# ---------------------------------------------------------------------------
 # Step profiler (CUDA sync + perf_counter per stage)
 # ---------------------------------------------------------------------------
 class StepProfiler:
@@ -195,17 +234,26 @@ def main(rank, world_size, args, gpu_id):
         logging.info("PROFILE mode enabled - cuda.synchronize() between every stage (adds overhead)")
 
     # AMP setup
+    grad_scaler = None
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         amp_device = "cuda"
-        amp_dtype = torch.bfloat16
-        use_amp = True
+        if args.amp_dtype == "fp16":
+            amp_dtype = torch.float16
+            use_amp = True
+            grad_scaler = SimpleGradScaler()
+        elif args.amp_dtype == "none":
+            amp_dtype = torch.bfloat16  # placeholder, not used
+            use_amp = False
+        else:  # bf16 (default)
+            amp_dtype = torch.bfloat16
+            use_amp = True
     elif device.type == "mps":
         amp_device = "mps"
         amp_dtype = torch.bfloat16
-        use_amp = True
+        use_amp = args.amp_dtype != "none"
     else:
         amp_device = "cpu"
         amp_dtype = torch.bfloat16
@@ -459,6 +507,9 @@ def main(rank, world_size, args, gpu_id):
             logging.info("EMA state loaded")
         elif ema is not None:
             logging.info("No EMA state in checkpoint, initialized from current params")
+        if "grad_scaler" in state and grad_scaler is not None:
+            grad_scaler.load_state_dict(state["grad_scaler"])
+            logging.info(f"GradScaler state loaded (scale={grad_scaler.get_scale():.1f})")
     # ZeRO gradient reducer: overlap reduce with backward
     if dp_zero and args.overlap_reduce:
         grad_reducer = ZeROGradReducer(
@@ -570,6 +621,8 @@ def main(rank, world_size, args, gpu_id):
                 state_dict["shampoo_state"] = shampoo_state_gathered if shampoo_state_gathered is not None else shampoo_opt.state_dict()
             if ema is not None:
                 state_dict["ema_shadow"] = ema.state_dict()
+            if grad_scaler is not None:
+                state_dict["grad_scaler"] = grad_scaler.state_dict()
 
             # Capture values for logging in background thread
             _step, _samples = global_step, total_samples_trained
@@ -645,6 +698,8 @@ def main(rank, world_size, args, gpu_id):
             tb_writer.add_scalar("perf/tokens_per_sec", tokens_per_sec, total_samples_trained)
             tb_writer.add_scalar("perf/achieved_tflops_per_gpu", achieved_tflops_per_gpu, total_samples_trained)
             tb_writer.add_scalar("perf/mfu", mfu, total_samples_trained)
+            if grad_scaler is not None:
+                tb_writer.add_scalar("train/grad_scale", grad_scaler.get_scale(), total_samples_trained)
         profile_line = profiler.report_and_reset()
         if profile_line is not None:
             logging.info(f"  {profile_line}")
@@ -654,6 +709,7 @@ def main(rank, world_size, args, gpu_id):
     logging.info("=" * 60)
     logging.info(f"Starting training: {total_samples_trained}/{args.max_training_samples} samples done")
     logging.info(f"Effective batch size: {effective_batch} (micro={batch_size} x gpus={world_size} x accum={grad_accum_steps})")
+    logging.info(f"AMP: dtype={args.amp_dtype}, GradScaler={'yes (scale=%.1f)' % grad_scaler.get_scale() if grad_scaler is not None else 'no'}")
     logging.info("=" * 60)
 
     last_save_samples = total_samples_trained
@@ -744,7 +800,10 @@ def main(rank, world_size, args, gpu_id):
                 # Scale loss for gradient averaging across accumulation steps
                 if grad_reducer is not None and is_last_micro:
                     grad_reducer.enable()
-                (loss / grad_accum_steps).backward()
+                scaled_loss = loss / grad_accum_steps
+                if grad_scaler is not None:
+                    scaled_loss = grad_scaler.scale(scaled_loss)
+                scaled_loss.backward()
             profiler.tick("bwd")
 
             # Accumulate micro-step metrics and seki moving average
@@ -780,54 +839,91 @@ def main(rank, world_size, args, gpu_id):
                     reduce_zero_grads([zero_adam, muon_opt, shampoo_opt], rank=rank, world_size=world_size)
                     profiler.tick("reduce")
 
-                # Gradient clipping + optimizer step
-                if dp_zero:
-                    # Distributed clip: each rank only has its partition's gradients.
-                    owned_params = [
-                        p for opt in [zero_adam, muon_opt, shampoo_opt]
-                        if opt is not None
-                        for p in opt.partitions[rank].values()
-                        if p.grad is not None
-                    ]
-                    local_norm_sq = sum((p.grad.norm() ** 2 for p in owned_params),
-                                        torch.tensor(0.0, device=device))
-                    global_norm_sq = local_norm_sq.unsqueeze(0)
-                    torch.distributed.all_reduce(global_norm_sq)
-                    grad_norm = global_norm_sq.sqrt()
-                    clip_coef = torch.clamp(1.0 / (grad_norm + 1e-6), max=1.0)
-                    if clip_coef < 1.0:
-                        for p in owned_params:
-                            p.grad.mul_(clip_coef)
-                    grad_norm = grad_norm.item()
-                else:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                profiler.tick("clip")
-                if zero_adam is not None:
-                    # Defer ZeRO param sync and do one coalesced sync after all optimizers step.
-                    zero_adam.step(sync=False)
-                else:
-                    inner_optimizer.step()
-                scheduler.step()
-                base_lr = scheduler.get_last_lr()[0]
+                # Unscale gradients (FP16 only) and check for inf/nan
+                skip_step = False
+                if grad_scaler is not None:
+                    inv_scale = 1.0 / grad_scaler.get_scale()
+                    found_inf = torch.zeros(1, device=device)
+                    if dp_zero:
+                        params_to_check = [
+                            p for opt in [zero_adam, muon_opt, shampoo_opt]
+                            if opt is not None
+                            for p in opt.partitions[rank].values()
+                        ]
+                    else:
+                        params_to_check = list(model.parameters())
+                    for p in params_to_check:
+                        if p.grad is not None:
+                            p.grad.mul_(inv_scale)
+                            if not torch.isfinite(p.grad).all():
+                                found_inf.fill_(1.0)
+                    if world_size > 1:
+                        torch.distributed.all_reduce(found_inf, op=torch.distributed.ReduceOp.MAX)
+                    skip_step = found_inf.item() > 0.0
+                    profiler.tick("unscale")
 
-                # Muon / Shampoo update (use same LR as AdamW for this step)
-                if muon_opt is not None:
-                    if zero_adam is not None:
-                        muon_opt.step(base_lr, sync=False)
+                if skip_step:
+                    logging.warning(
+                        f"Step {global_step}: inf/nan in gradients, skipping optimizer step "
+                        f"(scale={grad_scaler.get_scale():.1f})"
+                    )
+                    for p in model.parameters():
+                        p.grad = None
+                    grad_norm = 0.0
+                    grad_scaler.update(found_inf=True)
+                    scheduler.step()
+                    base_lr = scheduler.get_last_lr()[0]
+                else:
+                    # Gradient clipping + optimizer step
+                    if dp_zero:
+                        # Distributed clip: each rank only has its partition's gradients.
+                        owned_params = [
+                            p for opt in [zero_adam, muon_opt, shampoo_opt]
+                            if opt is not None
+                            for p in opt.partitions[rank].values()
+                            if p.grad is not None
+                        ]
+                        local_norm_sq = sum((p.grad.norm() ** 2 for p in owned_params),
+                                            torch.tensor(0.0, device=device))
+                        global_norm_sq = local_norm_sq.unsqueeze(0)
+                        torch.distributed.all_reduce(global_norm_sq)
+                        grad_norm = global_norm_sq.sqrt()
+                        clip_coef = torch.clamp(1.0 / (grad_norm + 1e-6), max=1.0)
+                        if clip_coef < 1.0:
+                            for p in owned_params:
+                                p.grad.mul_(clip_coef)
+                        grad_norm = grad_norm.item()
                     else:
-                        muon_opt.step(base_lr)
-                if shampoo_opt is not None:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    profiler.tick("clip")
                     if zero_adam is not None:
-                        shampoo_opt.step(base_lr, sync=False)
+                        # Defer ZeRO param sync and do one coalesced sync after all optimizers step.
+                        zero_adam.step(sync=False)
                     else:
-                        shampoo_opt.step(base_lr)
-                profiler.tick("optim")
-                if zero_adam is not None:
-                    # Sync Adam + Muon/Shampoo owned parameters in a single collective pass.
-                    sync_zero_params([zero_adam, muon_opt, shampoo_opt], rank=rank, world_size=world_size)
-                    profiler.tick("sync")
-                if ema is not None:
-                    ema.update(model)
+                        inner_optimizer.step()
+                    scheduler.step()
+                    base_lr = scheduler.get_last_lr()[0]
+
+                    # Muon / Shampoo update (use same LR as AdamW for this step)
+                    if muon_opt is not None:
+                        if zero_adam is not None:
+                            muon_opt.step(base_lr, sync=False)
+                        else:
+                            muon_opt.step(base_lr)
+                    if shampoo_opt is not None:
+                        if zero_adam is not None:
+                            shampoo_opt.step(base_lr, sync=False)
+                        else:
+                            shampoo_opt.step(base_lr)
+                    profiler.tick("optim")
+                    if zero_adam is not None:
+                        # Sync Adam + Muon/Shampoo owned parameters in a single collective pass.
+                        sync_zero_params([zero_adam, muon_opt, shampoo_opt], rank=rank, world_size=world_size)
+                        profiler.tick("sync")
+                    if ema is not None:
+                        ema.update(model)
+                    if grad_scaler is not None:
+                        grad_scaler.update(found_inf=False)
                 profiler.step_done()
                 global_step += 1
                 total_samples_trained += batch_size * world_size * grad_accum_steps
@@ -995,6 +1091,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--use-te", action="store_true", help="Use TransformerEngine model (model_te.py) for fused kernels")
     parser.add_argument("--use-fp8", action="store_true", help="Enable FP8 training (requires --use-te and Hopper/Ada GPU)")
+    parser.add_argument("--amp-dtype", type=str, default="bf16", choices=["bf16", "fp16", "none"],
+                        help="AMP dtype: bf16 (default), fp16 (with loss scaling), none (disable AMP)")
     parser.add_argument("--profile", action="store_true",
                         help="Enable per-stage CUDA-synced profiling (adds sync overhead)")
     parser.add_argument("--ema-decay", type=float, default=0.0,
@@ -1014,6 +1112,8 @@ if __name__ == "__main__":
         parser.error("--print-every must be >= 1")
     if args.symmetry_type == "all" and args.batch_size % 8 != 0:
         parser.error("--batch-size must be divisible by 8 when --symmetry-type is 'all'")
+    if args.amp_dtype == "fp16" and not torch.cuda.is_available():
+        parser.error("--amp-dtype fp16 requires CUDA")
 
     # Detect torchrun launch (torchrun sets RANK, LOCAL_RANK, WORLD_SIZE env vars)
     torchrun_rank = os.environ.get("RANK")
