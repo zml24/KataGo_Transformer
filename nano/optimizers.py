@@ -253,7 +253,7 @@ class ShampooOptimizer:
                 precond = inv_quarter_sandwich(
                     state["L"] / bias_corr2, momentum_2d_hat, state["R"] / bias_corr2,
                 )
-                precond = precond * (precond.size(-2) * precond.size(-1)) ** 0.25
+                precond = precond * max(precond.size(-2), precond.size(-1)) ** 0.5
 
                 rms_sum += precond.norm() * self.lr_multiplier / precond.numel() ** 0.5
                 rms_cnt += 1
