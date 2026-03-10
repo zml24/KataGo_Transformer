@@ -195,6 +195,56 @@ def _looks_like_te_checkpoint(model_state):
     return any(".layer.self_attention." in key for key in model_state)
 
 
+def _detect_checkpoint_format_standalone(state_dict):
+    """Standalone version of detect_checkpoint_format (no TE dependency)."""
+    for key in state_dict:
+        if ".layer.self_attention." in key:
+            return "te"
+    return "pt"
+
+
+def _convert_checkpoint_te_to_model_standalone(state_dict):
+    """Standalone version of convert_checkpoint_te_to_model (no TE dependency).
+
+    Converts TE (te.TransformerLayer) state_dict back to model.py format.
+    Filters out TE-specific _extra_state keys.
+    """
+    new_sd = {}
+    for key, value in state_dict.items():
+        if "_extra_state" in key:
+            continue
+        if ".layer.layernorm_mlp.fc1_weight" in key:
+            block_prefix = key.rsplit(".layer.layernorm_mlp.fc1_weight", 1)[0]
+            half = value.shape[0] // 2
+            new_sd[block_prefix + ".ffn_w1.weight"] = value[:half]
+            new_sd[block_prefix + ".ffn_wgate.weight"] = value[half:]
+        elif ".layer.layernorm_mlp.fc2_weight" in key:
+            new_sd[key.replace(".layer.layernorm_mlp.fc2_weight", ".ffn_w2.weight")] = value
+        elif ".layer.self_attention.layernorm_qkv.layer_norm_weight" in key:
+            new_sd[key.replace(".layer.self_attention.layernorm_qkv.layer_norm_weight", ".norm1.norm.weight")] = value
+        elif ".layer.self_attention.layernorm_qkv.layer_norm_bias" in key:
+            continue
+        elif ".layer.layernorm_mlp.layer_norm_weight" in key:
+            new_sd[key.replace(".layer.layernorm_mlp.layer_norm_weight", ".norm2.norm.weight")] = value
+        elif ".layer.layernorm_mlp.layer_norm_bias" in key:
+            continue
+        elif ".layer.self_attention.layernorm_qkv.query_weight" in key:
+            new_sd[key.replace(".layer.self_attention.layernorm_qkv.query_weight", ".q_proj.weight")] = value
+        elif ".layer.self_attention.layernorm_qkv.key_weight" in key:
+            new_sd[key.replace(".layer.self_attention.layernorm_qkv.key_weight", ".k_proj.weight")] = value
+        elif ".layer.self_attention.layernorm_qkv.value_weight" in key:
+            new_sd[key.replace(".layer.self_attention.layernorm_qkv.value_weight", ".v_proj.weight")] = value
+        elif ".layer.self_attention.proj.weight" in key:
+            new_sd[key.replace(".layer.self_attention.proj.weight", ".out_proj.weight")] = value
+        elif key == "norm_final.weight":
+            new_sd["norm_final.norm.weight"] = value
+        elif key.endswith(".norm_final.weight"):
+            new_sd[key.replace(".norm_final.weight", ".norm_final.norm.weight")] = value
+        else:
+            new_sd[key] = value
+    return new_sd
+
+
 def _make_dummy_inputs(config, pos_len, device, batch_size=1):
     num_bin = get_num_bin_input_features(config)
     num_global = get_num_global_input_features(config)
@@ -329,6 +379,42 @@ def _save_summary(output_path):
     for path in artifacts[1:]:
         size_mb = os.path.getsize(path) / (1024 * 1024)
         print(f"  External data: {path} ({size_mb:.1f} MB)")
+
+
+def _add_metadata(output_path, config, args):
+    """Add KataGo-required metadata to the exported ONNX model."""
+    try:
+        import onnx
+    except ImportError:
+        print("WARNING: onnx package not installed, skipping metadata addition")
+        return
+
+    onnx_model = onnx.load(output_path)
+
+    num_spatial_inputs = get_num_bin_input_features(config)
+    num_global_inputs = get_num_global_input_features(config)
+
+    meta = {
+        "modelVersion": str(config["version"]),
+        "opset_version": str(DEFAULT_ONNX_OPSET if args.opset is None else args.opset),
+        "num_spatial_inputs": str(num_spatial_inputs),
+        "num_global_inputs": str(num_global_inputs),
+        "pos_len": str(args.pos_len),
+        "pos_len_x": str(args.pos_len),
+        "pos_len_y": str(args.pos_len),
+        "model_config": str(config),
+    }
+
+    if hasattr(onnx_model, "metadata_props"):
+        del onnx_model.metadata_props[:]
+
+    for key, value in meta.items():
+        entry = onnx_model.metadata_props.add()
+        entry.key = key
+        entry.value = value
+
+    onnx.save(onnx_model, output_path)
+    print(f"Added metadata to ONNX model (modelVersion={config['version']})")
 
 
 def _resolve_te_support():
@@ -477,12 +563,10 @@ def _export_legacy(args, state, config):
     if should_try_te_conversion:
         try:
             from model_te import detect_checkpoint_format, convert_checkpoint_te_to_model
-        except ImportError as exc:
-            if _looks_like_te_checkpoint(model_state):
-                print("ERROR: legacy export detected a TE checkpoint but could not import model_te for conversion")
-            else:
-                print("ERROR: --use-te requires Transformer Engine and model_te.py dependencies to be installed")
-            raise SystemExit(1) from exc
+        except ImportError:
+            # TransformerEngine not available – use standalone conversion functions
+            detect_checkpoint_format = _detect_checkpoint_format_standalone
+            convert_checkpoint_te_to_model = _convert_checkpoint_te_to_model_standalone
         if detect_checkpoint_format(model_state) == "te":
             print("Converting TE checkpoint to model.py format for legacy ONNX export")
             model_state = convert_checkpoint_te_to_model(model_state)
@@ -516,6 +600,7 @@ def _export_legacy(args, state, config):
         )
 
     _save_summary(output_path)
+    _add_metadata(output_path, config, args)
     return output_path, wrapper, verify_input0, verify_input1
 
 
@@ -590,6 +675,7 @@ def _export_te_official(args, state, config):
             )
 
     _save_summary(output_path)
+    _add_metadata(output_path, config, args)
     return output_path, wrapper, verify_input0, verify_input1
 
 
@@ -670,6 +756,7 @@ def _export_te_decomposed(args, state, config):
             )
 
     _save_summary(output_path)
+    _add_metadata(output_path, config, args)
     return output_path, wrapper, verify_input0, verify_input1
 
 
@@ -810,10 +897,9 @@ def _export_fp8_manual(args, state, config):
     if should_try_te_conversion:
         try:
             from model_te import detect_checkpoint_format, convert_checkpoint_te_to_model
-        except ImportError as exc:
-            if _looks_like_te_checkpoint(model_state):
-                print("ERROR: fp8-manual export detected a TE checkpoint but could not import model_te for conversion")
-            raise SystemExit(1) from exc
+        except ImportError:
+            detect_checkpoint_format = _detect_checkpoint_format_standalone
+            convert_checkpoint_te_to_model = _convert_checkpoint_te_to_model_standalone
         if detect_checkpoint_format(model_state) == "te":
             print("Converting TE checkpoint to model.py format for FP8 manual export")
             model_state = convert_checkpoint_te_to_model(model_state)
@@ -867,6 +953,7 @@ def _export_fp8_manual(args, state, config):
     verify_fp8_qdq_structure(output_path, num_blocks)
 
     _save_summary(output_path)
+    _add_metadata(output_path, config, args)
     return output_path, wrapper, verify_input0, verify_input1
 
 
