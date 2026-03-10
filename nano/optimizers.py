@@ -3,6 +3,8 @@
 import torch
 import torch.nn.functional as F
 
+# Enable TF32 for fp32 matmuls (inv_quarter_sandwich)
+torch.backends.cuda.matmul.allow_tf32 = True
 
 # ---------------------------------------------------------------------------
 # Newton-Schulz coefficients for matrix orthogonalization (polar_express)
