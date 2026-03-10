@@ -364,7 +364,7 @@ class Model(nn.Module):
             nn.init.normal_(self.pos_embed.weight, mean=0.0, std=init_std)
         if self.rpe == "rpb":
             for table in self.rpb_tables:
-                nn.init.zeros_(table)
+                nn.init.normal_(table, mean=0.0, std=init_std)
 
     def _forward_trunk_impl(self, input_spatial, input_global):
         x = self._forward_stem_impl(input_spatial, input_global)
@@ -397,7 +397,7 @@ class Model(nn.Module):
             x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
             x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
         if self.ape != "cnn":
-            x = x + self.pos_embed(self.edge_index_map)
+            x = x + self.pos_embed(self.edge_index_map).to(dtype=x.dtype)
         return x
 
     def forward_stem_for_onnx_export(self, input_spatial, input_global):
