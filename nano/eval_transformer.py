@@ -36,6 +36,28 @@ def parse_args():
     return parser.parse_args()
 
 
+def _convert_te_to_pt(state_dict):
+    """Convert TE-format state dict to PT format if needed."""
+    try:
+        from model_te import detect_checkpoint_format, convert_checkpoint_te_to_model
+        if detect_checkpoint_format(state_dict) == "te":
+            print("  Converting TE checkpoint to model.py format")
+            return convert_checkpoint_te_to_model(state_dict)
+    except ImportError:
+        pass
+    return state_dict
+
+
+def _detect_score_mode(state_dict):
+    """Auto-detect score_mode from checkpoint keys."""
+    for key in state_dict:
+        if "linear_s_mix" in key:
+            return "mixop"
+        if "linear_s_simple" in key:
+            return "simple"
+    return "simple"
+
+
 def load_model_from_checkpoint(checkpoint_path, pos_len, score_mode, use_ema=False):
     """Load model and config from a training checkpoint."""
     from model import Model
@@ -43,32 +65,34 @@ def load_model_from_checkpoint(checkpoint_path, pos_len, score_mode, use_ema=Fal
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     model_config = configs.migrate_config(state.get("config", {}))
+
+    # Auto-detect score_mode from checkpoint weights
+    ref_state = state.get("ema_shadow", state["model"]) if use_ema else state["model"]
+    detected_score_mode = _detect_score_mode(ref_state)
+    if score_mode != detected_score_mode:
+        print(f"  Auto-detected score_mode='{detected_score_mode}' from checkpoint (overriding '{score_mode}')")
+        score_mode = detected_score_mode
+
     model = Model(model_config, pos_len, score_mode=score_mode)
 
     # Choose weights: EMA shadow or regular model
     if use_ema and "ema_shadow" in state:
-        print("Using EMA shadow weights")
-        # EMA shadow is a flat dict of param name -> tensor (same keys as named_parameters)
-        ema_state = state["ema_shadow"]
+        print("  Using EMA shadow weights")
+        ema_state = _convert_te_to_pt(state["ema_shadow"])
+        # EMA shadow only contains trainable params; merge into full state dict
         model_state = model.state_dict()
+        matched = 0
         for k, v in ema_state.items():
             if k in model_state:
                 model_state[k] = v
+                matched += 1
+        print(f"  Loaded {matched}/{len(ema_state)} EMA params")
         model.load_state_dict(model_state)
     elif use_ema:
-        print("WARNING: --use-ema requested but no EMA state in checkpoint, using regular weights")
-        model.load_state_dict(state["model"])
+        print("  WARNING: --use-ema requested but no EMA state in checkpoint, using regular weights")
+        model.load_state_dict(_convert_te_to_pt(state["model"]))
     else:
-        model_state = state["model"]
-        # Handle potential TE->PT conversion
-        try:
-            from model_te import detect_checkpoint_format, convert_checkpoint_te_to_model
-            if detect_checkpoint_format(model_state) == "te":
-                print("Converting TE checkpoint to model.py format")
-                model_state = convert_checkpoint_te_to_model(model_state)
-        except ImportError:
-            pass
-        model.load_state_dict(model_state)
+        model.load_state_dict(_convert_te_to_pt(state["model"]))
 
     # Restore seki moving average state
     model.moving_unowned_proportion_sum = state.get("moving_unowned_proportion_sum", 0.0)
