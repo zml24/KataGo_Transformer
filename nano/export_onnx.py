@@ -89,7 +89,7 @@ class SingleBlockExportWrapper(nn.Module):
     """
 
     def __init__(self, block, rope_cos=None, rope_sin=None, norm_final=None,
-                 pos_embed=None, edge_index_map=None, rpb_bias=None):
+                 rpb_bias=None):
         super().__init__()
         self.block = block
         if rope_cos is not None:
@@ -101,9 +101,6 @@ class SingleBlockExportWrapper(nn.Module):
         else:
             self.rope_sin = None
         self.norm_final = norm_final
-        self.pos_embed = pos_embed
-        if edge_index_map is not None:
-            self.register_buffer("edge_index_map", edge_index_map)
         if rpb_bias is not None:
             self.register_buffer("rpb_bias", rpb_bias)
         else:
@@ -112,8 +109,6 @@ class SingleBlockExportWrapper(nn.Module):
         self._export_output_names = BLOCKS_OUTPUT_NAMES
 
     def forward(self, x):
-        if self.pos_embed is not None:
-            x = x + self.pos_embed(self.edge_index_map)
         if self.rpb_bias is not None:
             x = self.block(x, attn_bias=self.rpb_bias)
         else:
@@ -752,11 +747,9 @@ def export_per_block(args):
 
     x = input_stem
     block_paths = []
-    model_ape = getattr(model, "ape", "cnn")
     model_rpe = getattr(model, "rpe", "rope")
     for i in range(num_blocks):
         is_last = (i == num_blocks - 1)
-        use_ape_all = model_ape == "ape-all"
         use_rpb = model_rpe == "rpb"
 
         rpb_bias = None
@@ -768,8 +761,6 @@ def export_per_block(args):
             rope_cos=None if use_rpb else model.rope_cos,
             rope_sin=None if use_rpb else model.rope_sin,
             norm_final=model.norm_final if is_last else None,
-            pos_embed=model.pos_embeds[i] if use_ape_all else None,
-            edge_index_map=model.edge_index_map if use_ape_all else None,
             rpb_bias=rpb_bias,
         )
         wrapper.eval()
@@ -793,8 +784,6 @@ def export_per_block(args):
         # Compute this block's output (raw, without norm_final / .float())
         # to use as the next block's input.
         with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
-            if use_ape_all:
-                x = x + model.pos_embeds[i](model.edge_index_map)
             if use_rpb:
                 x = model.blocks[i](x, attn_bias=rpb_bias.to(x.dtype))
             else:

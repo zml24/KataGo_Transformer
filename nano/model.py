@@ -302,13 +302,7 @@ class Model(nn.Module):
             half = (pos_len - 1) // 2
             num_edge_positions = (half + 1) * (half + 2) // 2
             self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
-            if self.ape == "ape-stem":
-                self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
-            else:  # ape-all: per-layer independent embeddings
-                self.pos_embeds = nn.ModuleList([
-                    nn.Embedding(num_edge_positions, self.c_trunk)
-                    for _ in range(config["num_layers"])
-                ])
+            self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
         else:
             self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
         self.linear_global = nn.Linear(num_global_features, self.c_trunk, bias=False)
@@ -368,9 +362,6 @@ class Model(nn.Module):
 
         if self.ape == "ape-stem":
             nn.init.normal_(self.pos_embed.weight, mean=0.0, std=init_std)
-        elif self.ape == "ape-all":
-            for emb in self.pos_embeds:
-                nn.init.normal_(emb.weight, mean=0.0, std=init_std)
         if self.rpe == "rpb":
             for table in self.rpb_tables:
                 nn.init.zeros_(table)
@@ -383,8 +374,6 @@ class Model(nn.Module):
 
         # Trunk
         for i, block in enumerate(self.blocks):
-            if self.ape == "ape-all":
-                x = x + self.pos_embeds[i](self.edge_index_map)
             if self.rpe == "rpb":
                 attn_bias = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0)  # (1, H, L, L)
                 x = block(x, attn_bias=attn_bias.to(x.dtype))
@@ -407,7 +396,7 @@ class Model(nn.Module):
             x_spatial = self.conv_spatial(input_spatial)
             x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
             x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
-        if self.ape == "ape-stem":
+        if self.ape != "cnn":
             x = x + self.pos_embed(self.edge_index_map)
         return x
 

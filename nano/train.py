@@ -999,9 +999,9 @@ if __name__ == "__main__":
                         help="Enable per-stage CUDA-synced profiling (adds sync overhead)")
     parser.add_argument("--ema-decay", type=float, default=0.0,
                         help="EMA decay rate for model params (0=disabled, typical: 0.999 or 0.9999)")
-    parser.add_argument("--ape", type=str, default="cnn", choices=["cnn", "ape-stem", "ape-all"],
+    parser.add_argument("--ape", type=str, default="cnn", choices=["cnn", "ape-stem"],
                         help="Absolute position encoding: cnn=3x3 conv stem, "
-                             "ape-stem=1x1 linear stem + APE on stem, ape-all=1x1 linear stem + APE on every layer")
+                             "ape-stem=1x1 linear stem + APE on stem")
     parser.add_argument("--rpe", type=str, default="rope", choices=["rope", "rpb"],
                         help="Relative position encoding: rope=2D RoPE on Q,K, "
                              "rpb=per-layer per-head scalar bias on attention logits")

@@ -165,13 +165,7 @@ class Model(nn.Module):
             half = (pos_len - 1) // 2
             num_edge_positions = (half + 1) * (half + 2) // 2
             self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
-            if self.ape == "ape-stem":
-                self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
-            else:  # ape-all: per-layer independent embeddings
-                self.pos_embeds = nn.ModuleList([
-                    nn.Embedding(num_edge_positions, self.c_trunk)
-                    for _ in range(config["num_layers"])
-                ])
+            self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
         else:
             # Conv2d stays as nn (TE has no Conv2d)
             self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
@@ -220,8 +214,6 @@ class Model(nn.Module):
 
     def _run_trunk_impl(self, x):
         for i, block in enumerate(self.blocks):
-            if self.ape == "ape-all":
-                x = x + self.pos_embeds[i](self.edge_index_map)
             if self.rpe == "rpb":
                 attn_bias = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0)  # (1, H, L, L)
                 x = block(x, core_attention_bias=attn_bias.to(x.dtype))
@@ -268,9 +260,6 @@ class Model(nn.Module):
         # APE embedding
         if self.ape == "ape-stem":
             init_fn(self.pos_embed.weight)
-        elif self.ape == "ape-all":
-            for emb in self.pos_embeds:
-                init_fn(emb.weight)
         # RPB
         if self.rpe == "rpb":
             for table in self.rpb_tables:
@@ -291,7 +280,7 @@ class Model(nn.Module):
             x_spatial = self.conv_spatial(input_spatial)
             x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
             x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
-        if self.ape == "ape-stem":
+        if self.ape != "cnn":
             x = x + self.pos_embed(self.edge_index_map)
         return x
 
@@ -411,13 +400,7 @@ class ModelDecomposedExport(nn.Module):
             half = (pos_len - 1) // 2
             num_edge_positions = (half + 1) * (half + 2) // 2
             self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
-            if self.ape == "ape-stem":
-                self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
-            else:  # ape-all: per-layer independent embeddings
-                self.pos_embeds = nn.ModuleList([
-                    nn.Embedding(num_edge_positions, self.c_trunk)
-                    for _ in range(config["num_layers"])
-                ])
+            self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
         else:
             self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
         self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
@@ -458,8 +441,6 @@ class ModelDecomposedExport(nn.Module):
 
     def _run_trunk_impl(self, x):
         for i, block in enumerate(self.blocks):
-            if self.ape == "ape-all":
-                x = x + self.pos_embeds[i](self.edge_index_map)
             if self.rpe == "rpb":
                 attn_bias = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0)
                 x = block(x, attn_bias=attn_bias.to(x.dtype))
@@ -478,7 +459,7 @@ class ModelDecomposedExport(nn.Module):
             x_spatial = self.conv_spatial(input_spatial)
             x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
             x = x.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
-        if self.ape == "ape-stem":
+        if self.ape != "cnn":
             x = x + self.pos_embed(self.edge_index_map)
         return x
 

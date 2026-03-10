@@ -40,8 +40,7 @@ def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebelie
         num_scorebeliefs: Number of score belief mixtures. Default: 8.
         version: Data format version. Default: 15.
         ape: Absolute position encoding. "cnn" (3x3 conv stem, no APE),
-            "ape-stem" (1x1 linear stem + APE on stem),
-            "ape-all" (1x1 linear stem + APE on every layer).
+            "ape-stem" (1x1 linear stem + APE on stem).
         rpe: Relative position encoding. "rope" (2D RoPE on Q,K),
             "rpb" (per-layer per-head scalar bias on attention logits).
     """
@@ -69,7 +68,7 @@ def migrate_config(old: ModelConfig) -> ModelConfig:
             _POS_ENC_MAP = {
                 "rope": ("cnn", "rope"),
                 "ape-stem": ("ape-stem", "rope"),
-                "ape-all": ("ape-all", "rope"),
+
                 "rpb": ("cnn", "rpb"),
             }
             ape, rpe = _POS_ENC_MAP[pos_enc]
