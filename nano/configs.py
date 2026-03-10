@@ -29,7 +29,8 @@ def get_num_global_input_features(config: ModelConfig):
         assert False
 
 
-def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebeliefs=8, version=15, ape="cnn", rpe="rope"):
+def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebeliefs=8, version=15,
+                ape="cnn", rpe="rope", use_gab=False):
     """Create a model config from minimal parameters.
 
     Args:
@@ -43,6 +44,10 @@ def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebelie
             "ape-stem" (1x1 linear stem + APE on stem).
         rpe: Relative position encoding. "rope" (2D RoPE on Q,K),
             "rpb" (per-layer per-head scalar bias on attention logits).
+        use_gab: Enable Geometric Attention Bias (GAB). Adds learned position-dependent
+            bias to attention logits via shared Fourier templates + per-layer mixing.
+            GAB hyperparams (gab_d1, gab_d2, gab_num_templates, gab_num_fourier_features,
+            gab_mlp_hidden) can be overridden by setting them in the returned config dict.
     """
     if ffn_dim is None:
         ffn_dim = hidden_size * 8 // 3
@@ -55,6 +60,7 @@ def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebelie
         "num_scorebeliefs": num_scorebeliefs,
         "ape": ape,
         "rpe": rpe,
+        "use_gab": use_gab,
     }
 
 
@@ -87,6 +93,7 @@ def migrate_config(old: ModelConfig) -> ModelConfig:
         version=old.get("version", 15),
         ape=old.get("ape", "cnn"),
         rpe=old.get("rpe", "rope"),
+        use_gab=old.get("use_gab", False),
     )
 
 

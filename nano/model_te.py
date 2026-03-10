@@ -27,6 +27,7 @@ import transformer_engine.pytorch as te
 from configs import get_num_bin_input_features, get_num_global_input_features
 from model import (
     EXTRA_SCORE_DISTR_RADIUS,
+    GABTemplateMLP,
     SoftPlusWithGradientFloor,
     apply_rotary_emb,
     build_edge_index_map,
@@ -68,15 +69,15 @@ class TransformerBlockTE(nn.Module):
         """
         x: (N, L, C)
         rope: (L, 1, 1, dim_half) raw RoPE embeddings for TE (None when using RPB)
-        core_attention_bias: (1, H, L, L) relative position bias (None when using RoPE)
+        core_attention_bias: (B, H, L, L) attention bias — RPB, GAB, or both (additive)
         """
+        kwargs = {}
+        if rope is not None:
+            kwargs["rotary_pos_emb"] = rope
         if core_attention_bias is not None:
-            return self.layer(
-                x,
-                core_attention_bias_type="post_scale_bias",
-                core_attention_bias=core_attention_bias,
-            )
-        return self.layer(x, rotary_pos_emb=rope)
+            kwargs["core_attention_bias_type"] = "post_scale_bias"
+            kwargs["core_attention_bias"] = core_attention_bias
+        return self.layer(x, **kwargs)
 
 
 class TransformerBlockTEDecomposed(nn.Module):
@@ -139,6 +140,40 @@ def _replace_nn_linear_with_te(module):
             _replace_nn_linear_with_te(child)
 
 
+def _rms_norm_fp32(x, weight, eps=1e-6):
+    """Functional RMSNorm in FP32, matching RMSNormFP32 / TE RMSNorm behavior."""
+    with torch.amp.autocast(x.device.type, enabled=False):
+        x_f = x.float()
+        return (x_f * torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + eps) * weight.float()).to(x.dtype)
+
+
+class GABMixer(nn.Module):
+    """Per-layer GAB mixing: projects normalized tokens to per-head template mixing weights.
+
+    Weight-compatible with model.py TransformerBlock.gab_* parameters via
+    checkpoint conversion (blocks.X.gab_* <-> gab_mixers.X.gab_*).
+    """
+    def __init__(self, c_main, num_heads, gab_num_templates, gab_d1=16, gab_d2=16):
+        super().__init__()
+        self.num_heads = num_heads
+        self.gab_num_templates = gab_num_templates
+        self.gab_proj1 = nn.Linear(c_main, gab_d1, bias=False)
+        self.gab_proj2 = nn.Linear(gab_d1, gab_d2, bias=False)
+        self.gab_norm1 = nn.LayerNorm(gab_d2)
+        self.gab_proj3 = nn.Linear(gab_d2, num_heads * gab_num_templates, bias=False)
+        self.gab_norm2 = nn.LayerNorm(num_heads * gab_num_templates)
+
+    def forward(self, x_norm, gab_templates):
+        B = x_norm.shape[0]
+        pooled = self.gab_proj1(x_norm).mean(dim=1)       # (B, d1)
+        z = F.gelu(self.gab_proj2(pooled))                 # (B, d2)
+        z = self.gab_norm1(z)
+        z = F.gelu(self.gab_proj3(z))                      # (B, H*T)
+        z = self.gab_norm2(z)
+        z = z.view(B, self.num_heads, self.gab_num_templates)  # (B, H, T)
+        return torch.einsum("bhd,std->bhst", z, gab_templates)
+
+
 # ---------------------------------------------------------------------------
 # Model (same API as model.py)
 # ---------------------------------------------------------------------------
@@ -187,6 +222,25 @@ class Model(nn.Module):
             emb_full = torch.cat([emb, emb], dim=-1)              # (L, 1, 1, dim)
             self.register_buffer("rope", emb_full, persistent=False)
 
+        # GAB: shared template MLP + per-layer mixers
+        self.use_gab = config.get("use_gab", False)
+        if self.use_gab:
+            self.gab_template_mlp = GABTemplateMLP(
+                num_templates=config.get("gab_num_templates", 16),
+                num_fourier_features=config.get("gab_num_fourier_features", 8),
+                mlp_hidden=config.get("gab_mlp_hidden", 64),
+                pos_len=pos_len,
+            )
+            self.gab_mixers = nn.ModuleList([
+                GABMixer(
+                    self.c_trunk, num_heads,
+                    config.get("gab_num_templates", 16),
+                    config.get("gab_d1", 16),
+                    config.get("gab_d2", 16),
+                )
+                for _ in range(config["num_layers"])
+            ])
+
         # Transformer blocks
         BlockClass = TransformerBlockTE
         self.blocks = nn.ModuleList()
@@ -213,12 +267,25 @@ class Model(nn.Module):
         self.moving_unowned_proportion_weight = 0.0
 
     def _run_trunk_impl(self, x):
+        gab_templates = self.gab_template_mlp() if self.use_gab else None
+
         for i, block in enumerate(self.blocks):
+            # GAB bias: use block's internal norm weight to compute x_norm
+            attn_bias = None
+            if self.use_gab:
+                norm_weight = block.layer.self_attention.layernorm_qkv.layer_norm_weight
+                x_norm = _rms_norm_fp32(x, norm_weight)
+                attn_bias = self.gab_mixers[i](x_norm, gab_templates)
+
             if self.rpe == "rpb":
-                attn_bias = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0)  # (1, H, L, L)
-                x = block(x, core_attention_bias=attn_bias.to(x.dtype))
+                rpb = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0).to(x.dtype)
+                attn_bias = rpb if attn_bias is None else rpb + attn_bias
+
+            if self.rpe == "rope":
+                x = block(x, rope=self.rope, core_attention_bias=attn_bias)
             else:
-                x = block(x, self.rope)
+                x = block(x, core_attention_bias=attn_bias)
+
         return self.norm_final(x)
 
     @torch._dynamo.disable
@@ -264,6 +331,23 @@ class Model(nn.Module):
         if self.rpe == "rpb":
             for table in self.rpb_tables:
                 nn.init.normal_(table, mean=0.0, std=init_std)
+        # GAB
+        if self.use_gab:
+            init_fn(self.gab_template_mlp.linear1.weight)
+            nn.init.zeros_(self.gab_template_mlp.linear1.bias)
+            init_fn(self.gab_template_mlp.linear2.weight)
+            nn.init.zeros_(self.gab_template_mlp.linear2.bias)
+            num_ff = self.config.get("gab_num_fourier_features", 8)
+            with torch.no_grad():
+                self.gab_template_mlp.gab_freqs.copy_(
+                    torch.exp(torch.linspace(math.log(1.0), math.log(1.0 / 50.0), num_ff))
+                )
+            for mixer in self.gab_mixers:
+                for name, p in mixer.named_parameters():
+                    if p.dim() >= 2:
+                        init_fn(p)
+                    elif "norm" not in name:
+                        nn.init.zeros_(p)
 
     def forward_trunk_for_onnx_export(self, input_spatial, input_global):
         x = self._forward_stem_impl(input_spatial, input_global)
@@ -419,6 +503,25 @@ class ModelDecomposedExport(nn.Module):
             self.register_buffer("rope_cos", emb_expanded.cos(), persistent=False)
             self.register_buffer("rope_sin", emb_expanded.sin(), persistent=False)
 
+        # GAB: shared template MLP + per-layer mixers
+        self.use_gab = config.get("use_gab", False)
+        if self.use_gab:
+            self.gab_template_mlp = GABTemplateMLP(
+                num_templates=config.get("gab_num_templates", 16),
+                num_fourier_features=config.get("gab_num_fourier_features", 8),
+                mlp_hidden=config.get("gab_mlp_hidden", 64),
+                pos_len=pos_len,
+            )
+            self.gab_mixers = nn.ModuleList([
+                GABMixer(
+                    self.c_trunk, num_heads,
+                    config.get("gab_num_templates", 16),
+                    config.get("gab_d1", 16),
+                    config.get("gab_d2", 16),
+                )
+                for _ in range(config["num_layers"])
+            ])
+
         self.blocks = nn.ModuleList([
             TransformerBlockTEDecomposed(
                 c_main=self.c_trunk,
@@ -440,12 +543,25 @@ class ModelDecomposedExport(nn.Module):
         self.moving_unowned_proportion_weight = 0.0
 
     def _run_trunk_impl(self, x):
+        gab_templates = self.gab_template_mlp() if self.use_gab else None
+
         for i, block in enumerate(self.blocks):
+            # GAB bias: use block's internal norm weight to compute x_norm
+            attn_bias = None
+            if self.use_gab:
+                norm_weight = block.ln_qkv.layer_norm_weight
+                x_norm = _rms_norm_fp32(x, norm_weight)
+                attn_bias = self.gab_mixers[i](x_norm, gab_templates)
+
             if self.rpe == "rpb":
-                attn_bias = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0)
-                x = block(x, attn_bias=attn_bias.to(x.dtype))
+                rpb = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0).to(x.dtype)
+                attn_bias = rpb if attn_bias is None else rpb + attn_bias
+
+            if self.rpe == "rope":
+                x = block(x, self.rope_cos, self.rope_sin, attn_bias=attn_bias)
             else:
-                x = block(x, self.rope_cos, self.rope_sin)
+                x = block(x, attn_bias=attn_bias)
+
         return self.norm_final(x)
 
     def _forward_stem_impl(self, input_spatial, input_global):
@@ -509,6 +625,10 @@ def convert_checkpoint_model_to_te(state_dict):
     """Convert model.py state_dict to TE (te.TransformerLayer) format."""
     new_sd = {}
     for key, value in state_dict.items():
+        # GAB per-layer keys: blocks.X.gab_* → gab_mixers.X.gab_*
+        if key.startswith("blocks.") and ".gab_" in key:
+            new_sd[key.replace("blocks.", "gab_mixers.", 1)] = value
+            continue
         if ".ffn_w1.weight" in key:
             block_prefix = key.rsplit(".ffn_w1.weight", 1)[0]
             wgate_key = block_prefix + ".ffn_wgate.weight"
@@ -550,6 +670,10 @@ def convert_checkpoint_model_to_te_decomposed(state_dict):
     """Convert model.py state_dict to the export-only decomposed TE format."""
     new_sd = {}
     for key, value in state_dict.items():
+        # GAB per-layer keys: blocks.X.gab_* → gab_mixers.X.gab_*
+        if key.startswith("blocks.") and ".gab_" in key:
+            new_sd[key.replace("blocks.", "gab_mixers.", 1)] = value
+            continue
         if ".ffn_w1.weight" in key:
             block_prefix = key.rsplit(".ffn_w1.weight", 1)[0]
             wgate_key = block_prefix + ".ffn_wgate.weight"
@@ -595,6 +719,10 @@ def convert_checkpoint_te_to_model(state_dict):
     new_sd = {}
     for key, value in state_dict.items():
         if "_extra_state" in key:
+            continue
+        # GAB per-layer keys: gab_mixers.X.gab_* → blocks.X.gab_*
+        if key.startswith("gab_mixers."):
+            new_sd[key.replace("gab_mixers.", "blocks.", 1)] = value
             continue
         if ".layer.layernorm_mlp.fc1_weight" in key:
             block_prefix = key.rsplit(".layer.layernorm_mlp.fc1_weight", 1)[0]

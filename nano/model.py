@@ -118,14 +118,67 @@ class RMSNormFP32(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# GAB (Geometric Attention Bias)
+# ---------------------------------------------------------------------------
+def compute_gab_fourier_features(dr, dc, freqs):
+    """Compute Fourier features for relative (dr, dc) offsets.
+    dr, dc: (...) float tensors of row/col offsets
+    freqs: (F,) learnable frequency parameters
+    Returns: (..., 8*F)
+    """
+    dr_f = dr.unsqueeze(-1) * freqs   # (..., F)
+    dc_f = dc.unsqueeze(-1) * freqs
+    dp_f = (dr + dc).unsqueeze(-1) * freqs
+    dm_f = (dr - dc).unsqueeze(-1) * freqs
+    features = torch.stack([
+        torch.sin(dr_f), torch.cos(dr_f),
+        torch.sin(dc_f), torch.cos(dc_f),
+        torch.sin(dp_f), torch.cos(dp_f),
+        torch.sin(dm_f), torch.cos(dm_f),
+    ], dim=-1)  # (..., F, 8)
+    return features.flatten(-2)  # (..., 8*F)
+
+
+class GABTemplateMLP(nn.Module):
+    """Shared MLP mapping relative (dr, dc) offsets to T template values.
+    Computed once per forward pass and shared across all transformer blocks.
+    """
+    def __init__(self, num_templates, num_fourier_features, mlp_hidden, pos_len):
+        super().__init__()
+        assert num_fourier_features >= 2
+        fourier_dim = 8 * num_fourier_features
+
+        init_freqs = torch.exp(torch.linspace(
+            math.log(1.0), math.log(1.0 / 50.0), num_fourier_features
+        ))
+        self.gab_freqs = nn.Parameter(init_freqs)
+
+        self.linear1 = nn.Linear(fourier_dim, mlp_hidden)
+        self.linear2 = nn.Linear(mlp_hidden, num_templates)
+
+        S = pos_len * pos_len
+        idx = torch.arange(S)
+        rows, cols = idx // pos_len, idx % pos_len
+        self.register_buffer("offset_dr", (rows.unsqueeze(1) - rows.unsqueeze(0)).float(), persistent=False)
+        self.register_buffer("offset_dc", (cols.unsqueeze(1) - cols.unsqueeze(0)).float(), persistent=False)
+
+    def forward(self):
+        """Returns: (S, S, T) templates for all position pairs."""
+        feats = compute_gab_fourier_features(self.offset_dr, self.offset_dc, self.gab_freqs)
+        return self.linear2(F.gelu(self.linear1(feats)))
+
+
+# ---------------------------------------------------------------------------
 # Transformer Block (NLC format, RoPE + MHA + SwiGLU + RMSNorm)
 # ---------------------------------------------------------------------------
 class TransformerBlock(nn.Module):
-    def __init__(self, c_main: int, num_heads: int, ffn_dim: int):
+    def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
+                 gab_num_templates: int = 0, gab_d1: int = 16, gab_d2: int = 16):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c_main // num_heads
         self.ffn_dim = ffn_dim
+        self.use_gab = gab_num_templates > 0
 
         self.q_proj = nn.Linear(c_main, c_main, bias=False)
         self.k_proj = nn.Linear(c_main, c_main, bias=False)
@@ -140,14 +193,42 @@ class TransformerBlock(nn.Module):
         self.norm1 = RMSNormFP32(c_main, eps=1e-6)
         self.norm2 = RMSNormFP32(c_main, eps=1e-6)
 
-    def forward(self, x, rope_cos=None, rope_sin=None, attn_bias=None):
+        if self.use_gab:
+            self.gab_num_templates = gab_num_templates
+            self.gab_proj1 = nn.Linear(c_main, gab_d1, bias=False)
+            self.gab_proj2 = nn.Linear(gab_d1, gab_d2, bias=False)
+            self.gab_norm1 = nn.LayerNorm(gab_d2)
+            self.gab_proj3 = nn.Linear(gab_d2, num_heads * gab_num_templates, bias=False)
+            self.gab_norm2 = nn.LayerNorm(num_heads * gab_num_templates)
+
+    def _compute_gab_bias(self, x_norm, gab_templates):
+        """Compute GAB attention bias from board state and shared templates.
+        x_norm: (B, S, C) normalized token representations
+        gab_templates: (S, S, T) shared templates from GABTemplateMLP
+        Returns: (B, H, S, S) attention bias
+        """
+        B = x_norm.shape[0]
+        pooled = self.gab_proj1(x_norm).mean(dim=1)       # (B, d1)
+        z = F.gelu(self.gab_proj2(pooled))                 # (B, d2)
+        z = self.gab_norm1(z)
+        z = F.gelu(self.gab_proj3(z))                      # (B, H*T)
+        z = self.gab_norm2(z)
+        z = z.view(B, self.num_heads, self.gab_num_templates)  # (B, H, T)
+        return torch.einsum("bhd,std->bhst", z, gab_templates)
+
+    def forward(self, x, rope_cos=None, rope_sin=None, attn_bias=None, gab_templates=None):
         """
         x: (N, L, C)
         rope_cos, rope_sin: (L, head_dim) precomputed RoPE embeddings (None when using RPB)
         attn_bias: (1, H, L, L) relative position bias (None when using RoPE)
+        gab_templates: (S, S, T) shared GAB templates (None when not using GAB)
         """
         B, L, C = x.shape
         x_normed = self.norm1(x)
+
+        if self.use_gab and gab_templates is not None:
+            gab_bias = self._compute_gab_bias(x_normed, gab_templates)
+            attn_bias = gab_bias if attn_bias is None else attn_bias + gab_bias
 
         q = self.q_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
         k = self.k_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
@@ -323,13 +404,29 @@ class Model(nn.Module):
             self.register_buffer("rope_cos", emb_expanded.cos(), persistent=False)
             self.register_buffer("rope_sin", emb_expanded.sin(), persistent=False)
 
+        # GAB: shared template MLP
+        self.use_gab = config.get("use_gab", False)
+        if self.use_gab:
+            self.gab_template_mlp = GABTemplateMLP(
+                num_templates=config.get("gab_num_templates", 16),
+                num_fourier_features=config.get("gab_num_fourier_features", 8),
+                mlp_hidden=config.get("gab_mlp_hidden", 64),
+                pos_len=pos_len,
+            )
+
         # Transformer blocks
+        gab_kwargs = dict(
+            gab_num_templates=config.get("gab_num_templates", 16),
+            gab_d1=config.get("gab_d1", 16),
+            gab_d2=config.get("gab_d2", 16),
+        ) if self.use_gab else {}
         self.blocks = nn.ModuleList()
         for _ in range(config["num_layers"]):
             self.blocks.append(TransformerBlock(
                 c_main=self.c_trunk,
                 num_heads=num_heads,
                 ffn_dim=ffn_dim,
+                **gab_kwargs,
             ))
 
         # Final normalization
@@ -365,20 +462,30 @@ class Model(nn.Module):
         if self.rpe == "rpb":
             for table in self.rpb_tables:
                 nn.init.normal_(table, mean=0.0, std=init_std)
+        if self.use_gab:
+            # Restore geometric initialization for GAB frequencies (zeroed by loop above)
+            num_ff = self.config.get("gab_num_fourier_features", 8)
+            with torch.no_grad():
+                self.gab_template_mlp.gab_freqs.copy_(
+                    torch.exp(torch.linspace(math.log(1.0), math.log(1.0 / 50.0), num_ff))
+                )
 
     def _forward_trunk_impl(self, input_spatial, input_global):
         x = self._forward_stem_impl(input_spatial, input_global)
         return self._forward_blocks_impl(x)
 
     def _forward_blocks_impl(self, x):
+        gab_templates = self.gab_template_mlp() if self.use_gab else None
 
         # Trunk
         for i, block in enumerate(self.blocks):
             if self.rpe == "rpb":
                 attn_bias = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0)  # (1, H, L, L)
-                x = block(x, attn_bias=attn_bias.to(x.dtype))
+                x = block(x, attn_bias=attn_bias.to(x.dtype), gab_templates=gab_templates)
+            elif self.rpe == "rope":
+                x = block(x, self.rope_cos, self.rope_sin, gab_templates=gab_templates)
             else:
-                x = block(x, self.rope_cos, self.rope_sin)
+                x = block(x, gab_templates=gab_templates)
 
         return self.norm_final(x)
 
