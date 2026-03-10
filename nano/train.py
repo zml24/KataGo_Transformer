@@ -217,12 +217,15 @@ def main(rank, world_size, args, gpu_id):
             num_layers=args.num_layers,
             hidden_size=args.hidden_size,
             num_heads=args.num_heads,
-            pos_enc=args.pos_enc,
+            ape=args.ape,
+            rpe=args.rpe,
         )
     else:
         model_config = configs.config_of_name[args.model_kind].copy()
-        if args.pos_enc != "rope":
-            model_config["pos_enc"] = args.pos_enc
+        if args.ape != "cnn":
+            model_config["ape"] = args.ape
+        if args.rpe != "rope":
+            model_config["rpe"] = args.rpe
     logging.info(f"Model config: {json.dumps(model_config, indent=2, default=str)}")
 
     pos_len = args.pos_len
@@ -996,9 +999,12 @@ if __name__ == "__main__":
                         help="Enable per-stage CUDA-synced profiling (adds sync overhead)")
     parser.add_argument("--ema-decay", type=float, default=0.0,
                         help="EMA decay rate for model params (0=disabled, typical: 0.999 or 0.9999)")
-    parser.add_argument("--pos-enc", type=str, default="rope", choices=["rope", "ape-stem", "ape-all"],
-                        help="Position encoding mode: rope=3x3 conv + RoPE only, "
-                             "ape-stem=1x1 conv + APE on stem + RoPE, ape-all=1x1 conv + APE on every layer + RoPE")
+    parser.add_argument("--ape", type=str, default="cnn", choices=["cnn", "ape-stem", "ape-all"],
+                        help="Absolute position encoding: cnn=3x3 conv stem, "
+                             "ape-stem=1x1 linear stem + APE on stem, ape-all=1x1 linear stem + APE on every layer")
+    parser.add_argument("--rpe", type=str, default="rope", choices=["rope", "rpb"],
+                        help="Relative position encoding: rope=2D RoPE on Q,K, "
+                             "rpb=per-layer per-head scalar bias on attention logits")
     args = parser.parse_args()
 
     # Validation

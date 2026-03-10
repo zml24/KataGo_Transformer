@@ -30,6 +30,7 @@ from model import (
     SoftPlusWithGradientFloor,
     apply_rotary_emb,
     build_edge_index_map,
+    build_rpb_index_map,
     cross_entropy,
     precompute_freqs_cos_sin_2d,
     PolicyHead,
@@ -63,11 +64,18 @@ class TransformerBlockTE(nn.Module):
             attn_input_format="bshd",
         )
 
-    def forward(self, x, rope):
+    def forward(self, x, rope=None, core_attention_bias=None):
         """
         x: (N, L, C)
-        rope: (L, 1, 1, dim_half) raw RoPE embeddings for TE
+        rope: (L, 1, 1, dim_half) raw RoPE embeddings for TE (None when using RPB)
+        core_attention_bias: (1, H, L, L) relative position bias (None when using RoPE)
         """
+        if core_attention_bias is not None:
+            return self.layer(
+                x,
+                core_attention_bias_type="post_scale_bias",
+                core_attention_bias=core_attention_bias,
+            )
         return self.layer(x, rotary_pos_emb=rope)
 
 
@@ -102,13 +110,21 @@ class TransformerBlockTEDecomposed(nn.Module):
             activation="swiglu",
         )
 
-    def forward(self, x, rope_cos, rope_sin):
+    def forward(self, x, rope_cos=None, rope_sin=None, attn_bias=None):
         batch_size, seq_len, _ = x.shape
         residual = x
         qkv = self.ln_qkv(x).view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
-        q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
-        x = residual + self.proj(self.attention(q, k, v))
+        if rope_cos is not None:
+            q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
+        if attn_bias is not None:
+            x = residual + self.proj(self.attention(
+                q, k, v,
+                core_attention_bias_type="post_scale_bias",
+                core_attention_bias=attn_bias,
+            ))
+        else:
+            x = residual + self.proj(self.attention(q, k, v))
         return x + self.ln_mlp(x)
 
 
@@ -140,15 +156,16 @@ class Model(nn.Module):
         ffn_dim = config["ffn_dim"]
         head_dim = self.c_trunk // num_heads
 
-        # Stem
-        self.pos_enc = config.get("pos_enc", "rope")
+        # Stem: APE determines stem type
+        self.ape = config.get("ape", "cnn")
+        self.rpe = config.get("rpe", "rope")
         Linear = nn.Linear if use_fp8 else te.Linear
-        if self.pos_enc in ("ape-stem", "ape-all"):
+        if self.ape != "cnn":
             self.linear_spatial = Linear(num_bin_features, self.c_trunk, bias=False)
             half = (pos_len - 1) // 2
             num_edge_positions = (half + 1) * (half + 2) // 2
             self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
-            if self.pos_enc == "ape-stem":
+            if self.ape == "ape-stem":
                 self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
             else:  # ape-all: per-layer independent embeddings
                 self.pos_embeds = nn.ModuleList([
@@ -161,10 +178,20 @@ class Model(nn.Module):
         # Non-FP8: use te.Linear for fused kernels; FP8: nn.Linear (dims not FP8-aligned)
         self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
 
-        # Precompute RoPE embeddings (rotate_half)
-        emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)  # (L, 1, 1, dim_half)
-        emb_full = torch.cat([emb, emb], dim=-1)              # (L, 1, 1, dim)
-        self.register_buffer("rope", emb_full, persistent=False)
+        # RPE: RPB parameters
+        if self.rpe == "rpb":
+            num_rpb_classes = pos_len * (pos_len + 1) // 2  # 190 for 19x19
+            self.register_buffer("rpb_index_map", build_rpb_index_map(pos_len), persistent=False)
+            self.rpb_tables = nn.ParameterList([
+                nn.Parameter(torch.zeros(num_heads, num_rpb_classes))
+                for _ in range(config["num_layers"])
+            ])
+
+        # RPE: precompute RoPE embeddings (rotate_half)
+        if self.rpe == "rope":
+            emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)  # (L, 1, 1, dim_half)
+            emb_full = torch.cat([emb, emb], dim=-1)              # (L, 1, 1, dim)
+            self.register_buffer("rope", emb_full, persistent=False)
 
         # Transformer blocks
         BlockClass = TransformerBlockTE
@@ -193,9 +220,13 @@ class Model(nn.Module):
 
     def _run_trunk_impl(self, x):
         for i, block in enumerate(self.blocks):
-            if self.pos_enc == "ape-all":
+            if self.ape == "ape-all":
                 x = x + self.pos_embeds[i](self.edge_index_map)
-            x = block(x, self.rope)
+            if self.rpe == "rpb":
+                attn_bias = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0)  # (1, H, L, L)
+                x = block(x, core_attention_bias=attn_bias.to(x.dtype))
+            else:
+                x = block(x, self.rope)
         return self.norm_final(x)
 
     @torch._dynamo.disable
@@ -222,7 +253,7 @@ class Model(nn.Module):
         ])
 
         # Stem
-        if self.pos_enc in ("ape-stem", "ape-all"):
+        if self.ape != "cnn":
             init_fn(self.linear_spatial.weight)
         else:
             init_fn(self.conv_spatial.weight)
@@ -235,11 +266,15 @@ class Model(nn.Module):
                     init_fn(p)
 
         # APE embedding
-        if self.pos_enc == "ape-stem":
+        if self.ape == "ape-stem":
             init_fn(self.pos_embed.weight)
-        elif self.pos_enc == "ape-all":
+        elif self.ape == "ape-all":
             for emb in self.pos_embeds:
                 init_fn(emb.weight)
+        # RPB
+        if self.rpe == "rpb":
+            for table in self.rpb_tables:
+                nn.init.zeros_(table)
 
     def forward_trunk_for_onnx_export(self, input_spatial, input_global):
         x = self._forward_stem_impl(input_spatial, input_global)
@@ -249,14 +284,14 @@ class Model(nn.Module):
         N = input_spatial.shape[0]
         L = self.pos_len * self.pos_len
         x_global = self.linear_global(input_global)
-        if self.pos_enc in ("ape-stem", "ape-all"):
+        if self.ape != "cnn":
             x_spatial = self.linear_spatial(input_spatial.view(N, -1, L).permute(0, 2, 1))
             x = x_spatial + x_global.unsqueeze(1)
         else:
             x_spatial = self.conv_spatial(input_spatial)
             x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
             x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
-        if self.pos_enc == "ape-stem":
+        if self.ape == "ape-stem":
             x = x + self.pos_embed(self.edge_index_map)
         return x
 
@@ -368,14 +403,15 @@ class ModelDecomposedExport(nn.Module):
         ffn_dim = config["ffn_dim"]
         head_dim = self.c_trunk // num_heads
 
-        self.pos_enc = config.get("pos_enc", "rope")
+        self.ape = config.get("ape", "cnn")
+        self.rpe = config.get("rpe", "rope")
         Linear = nn.Linear if use_fp8 else te.Linear
-        if self.pos_enc in ("ape-stem", "ape-all"):
+        if self.ape != "cnn":
             self.linear_spatial = Linear(num_bin_features, self.c_trunk, bias=False)
             half = (pos_len - 1) // 2
             num_edge_positions = (half + 1) * (half + 2) // 2
             self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
-            if self.pos_enc == "ape-stem":
+            if self.ape == "ape-stem":
                 self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
             else:  # ape-all: per-layer independent embeddings
                 self.pos_embeds = nn.ModuleList([
@@ -386,10 +422,19 @@ class ModelDecomposedExport(nn.Module):
             self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
         self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
 
-        emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)
-        emb_expanded = torch.cat([emb, emb], dim=-1)
-        self.register_buffer("rope_cos", emb_expanded.cos(), persistent=False)
-        self.register_buffer("rope_sin", emb_expanded.sin(), persistent=False)
+        if self.rpe == "rpb":
+            num_rpb_classes = pos_len * (pos_len + 1) // 2
+            self.register_buffer("rpb_index_map", build_rpb_index_map(pos_len), persistent=False)
+            self.rpb_tables = nn.ParameterList([
+                nn.Parameter(torch.zeros(num_heads, num_rpb_classes))
+                for _ in range(config["num_layers"])
+            ])
+
+        if self.rpe == "rope":
+            emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)
+            emb_expanded = torch.cat([emb, emb], dim=-1)
+            self.register_buffer("rope_cos", emb_expanded.cos(), persistent=False)
+            self.register_buffer("rope_sin", emb_expanded.sin(), persistent=False)
 
         self.blocks = nn.ModuleList([
             TransformerBlockTEDecomposed(
@@ -413,23 +458,27 @@ class ModelDecomposedExport(nn.Module):
 
     def _run_trunk_impl(self, x):
         for i, block in enumerate(self.blocks):
-            if self.pos_enc == "ape-all":
+            if self.ape == "ape-all":
                 x = x + self.pos_embeds[i](self.edge_index_map)
-            x = block(x, self.rope_cos, self.rope_sin)
+            if self.rpe == "rpb":
+                attn_bias = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0)
+                x = block(x, attn_bias=attn_bias.to(x.dtype))
+            else:
+                x = block(x, self.rope_cos, self.rope_sin)
         return self.norm_final(x)
 
     def _forward_stem_impl(self, input_spatial, input_global):
         batch_size = input_spatial.shape[0]
         seq_len = self.pos_len * self.pos_len
         x_global = self.linear_global(input_global)
-        if self.pos_enc in ("ape-stem", "ape-all"):
+        if self.ape != "cnn":
             x_spatial = self.linear_spatial(input_spatial.view(batch_size, -1, seq_len).permute(0, 2, 1))
             x = x_spatial + x_global.unsqueeze(1)
         else:
             x_spatial = self.conv_spatial(input_spatial)
             x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
             x = x.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
-        if self.pos_enc == "ape-stem":
+        if self.ape == "ape-stem":
             x = x + self.pos_embed(self.edge_index_map)
         return x
 

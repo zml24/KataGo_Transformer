@@ -88,23 +88,36 @@ class SingleBlockExportWrapper(nn.Module):
     final RMSNorm so the full ``blocks`` computation is covered.
     """
 
-    def __init__(self, block, rope_cos, rope_sin, norm_final=None,
-                 pos_embed=None, edge_index_map=None):
+    def __init__(self, block, rope_cos=None, rope_sin=None, norm_final=None,
+                 pos_embed=None, edge_index_map=None, rpb_bias=None):
         super().__init__()
         self.block = block
-        self.register_buffer("rope_cos", rope_cos)
-        self.register_buffer("rope_sin", rope_sin)
+        if rope_cos is not None:
+            self.register_buffer("rope_cos", rope_cos)
+        else:
+            self.rope_cos = None
+        if rope_sin is not None:
+            self.register_buffer("rope_sin", rope_sin)
+        else:
+            self.rope_sin = None
         self.norm_final = norm_final
         self.pos_embed = pos_embed
         if edge_index_map is not None:
             self.register_buffer("edge_index_map", edge_index_map)
+        if rpb_bias is not None:
+            self.register_buffer("rpb_bias", rpb_bias)
+        else:
+            self.rpb_bias = None
         self._export_input_names = BLOCKS_INPUT_NAMES
         self._export_output_names = BLOCKS_OUTPUT_NAMES
 
     def forward(self, x):
         if self.pos_embed is not None:
             x = x + self.pos_embed(self.edge_index_map)
-        x = self.block(x, self.rope_cos, self.rope_sin)
+        if self.rpb_bias is not None:
+            x = self.block(x, attn_bias=self.rpb_bias)
+        else:
+            x = self.block(x, self.rope_cos, self.rope_sin)
         if self.norm_final is not None:
             x = self.norm_final(x)
         return (x.float(),)
@@ -739,16 +752,25 @@ def export_per_block(args):
 
     x = input_stem
     block_paths = []
+    model_ape = getattr(model, "ape", "cnn")
+    model_rpe = getattr(model, "rpe", "rope")
     for i in range(num_blocks):
         is_last = (i == num_blocks - 1)
-        use_ape_all = getattr(model, "pos_enc", "rope") == "ape-all"
+        use_ape_all = model_ape == "ape-all"
+        use_rpb = model_rpe == "rpb"
+
+        rpb_bias = None
+        if use_rpb:
+            rpb_bias = model.rpb_tables[i][:, model.rpb_index_map].unsqueeze(0)  # (1, H, L, L)
+
         wrapper = SingleBlockExportWrapper(
             model.blocks[i],
-            model.rope_cos,
-            model.rope_sin,
+            rope_cos=None if use_rpb else model.rope_cos,
+            rope_sin=None if use_rpb else model.rope_sin,
             norm_final=model.norm_final if is_last else None,
             pos_embed=model.pos_embeds[i] if use_ape_all else None,
             edge_index_map=model.edge_index_map if use_ape_all else None,
+            rpb_bias=rpb_bias,
         )
         wrapper.eval()
 
@@ -773,7 +795,10 @@ def export_per_block(args):
         with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
             if use_ape_all:
                 x = x + model.pos_embeds[i](model.edge_index_map)
-            x = model.blocks[i](x, model.rope_cos, model.rope_sin)
+            if use_rpb:
+                x = model.blocks[i](x, attn_bias=rpb_bias.to(x.dtype))
+            else:
+                x = model.blocks[i](x, model.rope_cos, model.rope_sin)
 
         block_paths.append(block_path)
 
