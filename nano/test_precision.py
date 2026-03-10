@@ -8,20 +8,22 @@ from optimizers import inv_quarter_sandwich, polar_express
 
 def make_spd(size, cond_number, device):
     """Generate a random symmetric positive definite matrix with given condition number."""
-    # Random orthogonal matrix via QR
-    A = torch.randn(size, size, device=device, dtype=torch.float64)
+    # QR on CPU to avoid broken CUDA linalg
+    A = torch.randn(size, size, dtype=torch.float64)
     Q, _ = torch.linalg.qr(A)
-    # Eigenvalues log-spaced from 1 to cond_number
     eigvals = torch.logspace(0, torch.log10(torch.tensor(cond_number, dtype=torch.float64)),
-                             size, device=device, dtype=torch.float64)
-    return Q @ torch.diag(eigvals) @ Q.T
+                             size, dtype=torch.float64)
+    spd = Q @ torch.diag(eigvals) @ Q.T
+    return spd.to(device)
 
 
 def inv_quarter_root_exact(M, dtype=torch.float64):
-    """Compute M^{-1/4} via eigendecomposition (fp64)."""
-    eigvals, eigvecs = torch.linalg.eigh(M.to(dtype))
+    """Compute M^{-1/4} via eigendecomposition (fp64, on CPU)."""
+    M_cpu = M.to(dtype).cpu()
+    eigvals, eigvecs = torch.linalg.eigh(M_cpu)
     eigvals = eigvals.clamp(min=1e-12)
-    return eigvecs @ torch.diag(eigvals ** (-0.25)) @ eigvecs.T
+    result = eigvecs @ torch.diag(eigvals ** (-0.25)) @ eigvecs.T
+    return result.to(M.device)
 
 
 def test_shampoo(device):
@@ -78,19 +80,19 @@ def test_muon(device):
     for (m, n, cond) in configs:
         torch.manual_seed(42)
 
-        # Generate matrix with specified condition number via SVD
-        U, _ = torch.linalg.qr(torch.randn(m, m, device=device, dtype=torch.float64))
-        V, _ = torch.linalg.qr(torch.randn(n, n, device=device, dtype=torch.float64))
+        # Generate matrix with specified condition number via SVD (on CPU)
+        U, _ = torch.linalg.qr(torch.randn(m, m, dtype=torch.float64))
+        V, _ = torch.linalg.qr(torch.randn(n, n, dtype=torch.float64))
         k = min(m, n)
         sing_vals = torch.logspace(0, torch.log10(torch.tensor(cond, dtype=torch.float64)),
-                                   k, device=device, dtype=torch.float64)
-        S = torch.zeros(m, n, device=device, dtype=torch.float64)
+                                   k, dtype=torch.float64)
+        S = torch.zeros(m, n, dtype=torch.float64)
         S[:k, :k] = torch.diag(sing_vals)
-        G = U @ S @ V.T
+        G = (U @ S @ V.T).to(device)
 
-        # Ground truth: polar factor U @ V^T (using thin SVD)
-        U_svd, _, Vh_svd = torch.linalg.svd(G, full_matrices=False)
-        exact = U_svd @ Vh_svd
+        # Ground truth: polar factor U @ V^T (thin SVD on CPU)
+        U_svd, _, Vh_svd = torch.linalg.svd(G.cpu().double(), full_matrices=False)
+        exact = (U_svd @ Vh_svd).to(device)
 
         # Approximation via Newton-Schulz (bf16)
         approx = polar_express(G.float())  # polar_express internally converts to bf16
