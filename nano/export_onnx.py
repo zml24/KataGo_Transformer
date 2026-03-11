@@ -43,8 +43,8 @@ DEFAULT_ONNX_OPSET = 25
 FULL_OUTPUT_NAMES = [
     "out_policy",       # (N, 6, L+1)
     "out_value",        # (N, 3)
-    "out_misc",         # (N, 10)
-    "out_moremisc",     # (N, 8)
+    "out_miscvalue",     # (N, 10)
+    "out_moremiscvalue", # (N, 8)
     "out_ownership",    # (N, 1, H, W)
     "out_scoring",      # (N, 1, H, W)
     "out_futurepos",    # (N, 2, H, W)
@@ -394,15 +394,24 @@ def _add_metadata(output_path, config, args):
     num_spatial_inputs = get_num_bin_input_features(config)
     num_global_inputs = get_num_global_input_features(config)
 
+    save_name = os.path.splitext(os.path.basename(output_path))[0]
+    method = getattr(args, "method", "legacy")
+
     meta = {
+        "name": save_name,
         "modelVersion": str(config["version"]),
+        "auto_fp16_already": "false",
         "opset_version": str(DEFAULT_ONNX_OPSET if args.opset is None else args.opset),
+        "exported_with_dynamo": "true" if method in ("te-official", "te-decomposed") else "false",
         "num_spatial_inputs": str(num_spatial_inputs),
         "num_global_inputs": str(num_global_inputs),
         "pos_len": str(args.pos_len),
         "pos_len_x": str(args.pos_len),
         "pos_len_y": str(args.pos_len),
+        "has_mask": "false",
         "model_config": str(config),
+        "author": "unknown",
+        "comment": "",
     }
 
     if hasattr(onnx_model, "metadata_props"):
