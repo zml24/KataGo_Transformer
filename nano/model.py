@@ -393,6 +393,14 @@ class Model(nn.Module):
             self.pos_embed = nn.Embedding(pos_len * pos_len, self.c_trunk)
         self.linear_global = nn.Linear(num_global_features, self.c_trunk, bias=False)
 
+        # Stem normalization: per-component RMSNorm before summing
+        self.stem_norm = config.get("stem_norm", False)
+        if self.stem_norm:
+            self.norm_spatial = RMSNormFP32(self.c_trunk, eps=1e-6)
+            self.norm_global = RMSNormFP32(self.c_trunk, eps=1e-6)
+            if self.ape in ("d4", "per_pos"):
+                self.norm_ape = RMSNormFP32(self.c_trunk, eps=1e-6)
+
         # RPE: RPB parameters
         if self.use_rpb:
             num_rpb_classes = pos_len * (pos_len + 1) // 2  # 190 for 19x19
@@ -447,13 +455,15 @@ class Model(nn.Module):
         self.moving_unowned_proportion_sum = 0.0
         self.moving_unowned_proportion_weight = 0.0
 
-    def initialize(self, init_std=0.02, use_fan_in_init=True):
+    def initialize(self, init_std=0.02, use_fan_in_init=True, stem_init_aligned=False):
         """Weight initialization.
 
         When use_fan_in_init=True: Megatron-LM style, Linear/Conv std = 1/sqrt(fan_in).
         When use_fan_in_init=False: all Linear/Conv layers use fixed init_std.
         In both modes, output layers (out_proj, ffn_w2) additionally scale by 1/sqrt(2*num_blocks).
         init_std is always used for non-linear/conv parameters (APE, RPB, etc.).
+        When stem_init_aligned=True: override stem (conv_spatial, linear_global) weight std to
+        init_std/sqrt(fan_in), aligning their output variance with APE's init_std.
         """
         num_blocks = len(self.blocks)
 
@@ -483,6 +493,31 @@ class Model(nn.Module):
                     torch.exp(torch.linspace(math.log(1.0), math.log(1.0 / 50.0), num_ff))
                 )
 
+        if stem_init_aligned:
+            # Override stem weights so output std ≈ init_std (matching APE)
+            fan_in_spatial = self.conv_spatial.weight[0].numel()
+            nn.init.normal_(self.conv_spatial.weight, mean=0.0,
+                            std=init_std / math.sqrt(fan_in_spatial))
+            fan_in_global = self.linear_global.weight.shape[1]
+            nn.init.normal_(self.linear_global.weight, mean=0.0,
+                            std=init_std / math.sqrt(fan_in_global))
+
+    @torch.no_grad()
+    def compute_stem_norms(self, input_spatial, input_global):
+        """Compute per-component RMS of stem signals for diagnostics."""
+        x_spatial = self.conv_spatial(input_spatial)
+        x_global = self.linear_global(input_global)
+        norms = {
+            "spatial_rms": x_spatial.float().pow(2).mean().sqrt().item(),
+            "global_rms": x_global.float().pow(2).mean().sqrt().item(),
+        }
+        if self.ape == "d4":
+            ape = self.pos_embed(self.edge_index_map)
+            norms["ape_rms"] = ape.float().pow(2).mean().sqrt().item()
+        elif self.ape == "per_pos":
+            norms["ape_rms"] = self.pos_embed.weight.float().pow(2).mean().sqrt().item()
+        return norms
+
     def _forward_trunk_impl(self, input_spatial, input_global):
         x = self._forward_stem_impl(input_spatial, input_global)
         return self._forward_blocks_impl(x)
@@ -510,12 +545,19 @@ class Model(nn.Module):
         # Stem: NCHW -> NLC
         x_global = self.linear_global(input_global)
         x_spatial = self.conv_spatial(input_spatial)
-        x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-        x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
+        if self.stem_norm:
+            x_spatial_nlc = x_spatial.view(N, self.c_trunk, L).permute(0, 2, 1)
+            x_global_nlc = x_global.unsqueeze(1).expand(-1, L, -1)
+            x = self.norm_spatial(x_spatial_nlc) + self.norm_global(x_global_nlc)
+        else:
+            x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
+            x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
         if self.ape == "d4":
-            x = x + self.pos_embed(self.edge_index_map).to(dtype=x.dtype)
+            ape = self.pos_embed(self.edge_index_map).to(dtype=x.dtype)
+            x = x + (self.norm_ape(ape) if self.stem_norm else ape)
         elif self.ape == "per_pos":
-            x = x + self.pos_embed.weight.to(dtype=x.dtype)
+            ape = self.pos_embed.weight.to(dtype=x.dtype)
+            x = x + (self.norm_ape(ape) if self.stem_norm else ape)
         return x
 
     def forward_stem_for_onnx_export(self, input_spatial, input_global):
