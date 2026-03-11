@@ -294,21 +294,28 @@ class Model(nn.Module):
     def _run_trunk_no_compile(self, x):
         return self._run_trunk_impl(x)
 
-    def initialize(self, init_std=0.02):
-        """Megatron-LM style initialization using TE-native init_method.
+    def initialize(self, init_std=0.02, use_fan_in_init=True):
+        """Weight initialization using TE-native init_method.
 
-        Linear/Conv layers use std = 1/sqrt(fan_in).
-        Output layers additionally scale by 1/sqrt(2*num_blocks).
-        init_std is only used for non-linear/conv parameters (APE, RPB, etc.).
+        When use_fan_in_init=True: Megatron-LM style, Linear/Conv std = 1/sqrt(fan_in).
+        When use_fan_in_init=False: all Linear/Conv layers use fixed init_std.
+        In both modes, output layers additionally scale by 1/sqrt(2*num_blocks).
+        init_std is always used for non-linear/conv parameters (APE, RPB, etc.).
         """
         num_blocks = len(self.blocks)
 
         def init_fn(tensor):
-            std = 1.0 / math.sqrt(tensor[0].numel())
+            if use_fan_in_init:
+                std = 1.0 / math.sqrt(tensor[0].numel())
+            else:
+                std = init_std
             nn.init.normal_(tensor, mean=0.0, std=std)
 
         def output_init_fn(tensor):
-            std = 1.0 / math.sqrt(tensor[0].numel()) / math.sqrt(2.0 * num_blocks)
+            if use_fan_in_init:
+                std = 1.0 / math.sqrt(tensor[0].numel()) / math.sqrt(2.0 * num_blocks)
+            else:
+                std = init_std / math.sqrt(2.0 * num_blocks)
             nn.init.normal_(tensor, mean=0.0, std=std)
 
         # Rebuild blocks with TE-native init methods

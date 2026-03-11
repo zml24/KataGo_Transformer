@@ -346,8 +346,10 @@ def main(rank, world_size, args, gpu_id):
     else:
         logging.info("Creating new model")
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
-        model.initialize(init_std=args.init_std)
-        logging.info(f"Initialized weights: linear/conv std=1/sqrt(fan_in), output scaling /sqrt(2*{len(model.blocks)}), other std={args.init_std}")
+        use_fan_in_init = not args.no_fan_in_init
+        model.initialize(init_std=args.init_std, use_fan_in_init=use_fan_in_init)
+        init_desc = "1/sqrt(fan_in)" if use_fan_in_init else str(args.init_std)
+        logging.info(f"Initialized weights: linear/conv std={init_desc}, output scaling /sqrt(2*{len(model.blocks)}), other std={args.init_std}")
         global_step = 0
         total_samples_trained = 0
 
@@ -1065,6 +1067,8 @@ if __name__ == "__main__":
                         help="Optimizer: adam (pure AdamW), muon (Muon for blocks + AdamW), shampoo (Shampoo for blocks + AdamW)")
     parser.add_argument("--shampoo-lr-multiplier", type=float, default=2.0, help="Shampoo LR multiplier over base lr")
     parser.add_argument("--init-std", type=float, default=0.02, help="Init std for non-linear/conv params (APE, RPB, etc.)")
+    parser.add_argument("--no-fan-in-init", action="store_true", default=False,
+                        help="Disable Megatron-LM fan_in init; use fixed init_std for all Linear/Conv layers instead.")
     parser.add_argument("--max-training-samples", type=int, default=100000000, help="Total training samples")
     parser.add_argument("--save-every-samples", type=int, default=1000000, help="Save checkpoint every N samples")
     parser.add_argument("--symmetry-type", type=str, default="xyt",

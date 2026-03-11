@@ -445,12 +445,13 @@ class Model(nn.Module):
         self.moving_unowned_proportion_sum = 0.0
         self.moving_unowned_proportion_weight = 0.0
 
-    def initialize(self, init_std=0.02):
-        """Megatron-LM style initialization.
+    def initialize(self, init_std=0.02, use_fan_in_init=True):
+        """Weight initialization.
 
-        Linear/Conv layers use std = 1/sqrt(fan_in).
-        Output layers (out_proj, ffn_w2) additionally scale by 1/sqrt(2*num_blocks).
-        init_std is only used for non-linear/conv parameters (APE, RPB, etc.).
+        When use_fan_in_init=True: Megatron-LM style, Linear/Conv std = 1/sqrt(fan_in).
+        When use_fan_in_init=False: all Linear/Conv layers use fixed init_std.
+        In both modes, output layers (out_proj, ffn_w2) additionally scale by 1/sqrt(2*num_blocks).
+        init_std is always used for non-linear/conv parameters (APE, RPB, etc.).
         """
         num_blocks = len(self.blocks)
 
@@ -459,7 +460,10 @@ class Model(nn.Module):
                 if "norm" not in name:
                     nn.init.zeros_(p)
             else:
-                std = 1.0 / math.sqrt(p[0].numel())  # 1/sqrt(fan_in)
+                if use_fan_in_init:
+                    std = 1.0 / math.sqrt(p[0].numel())  # 1/sqrt(fan_in)
+                else:
+                    std = init_std
                 if ".out_proj." in name or ".ffn_w2." in name:
                     std = std / math.sqrt(2.0 * num_blocks)
                 nn.init.normal_(p, mean=0.0, std=std)
