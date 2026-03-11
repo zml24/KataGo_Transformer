@@ -43,7 +43,8 @@ def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebelie
         stem: Stem convolution kernel size. "cnn1" (1x1), "cnn3" (3x3), "cnn5" (5x5).
         use_ape: Enable absolute position encoding (edge-distance embedding on stem).
         rpe: Relative position encoding. "rope" (2D RoPE on Q,K),
-            "rpb" (per-layer per-head scalar bias on attention logits).
+            "rpb" (per-layer per-head scalar bias on attention logits),
+            "rope+rpb" (both RoPE and RPB simultaneously).
         use_gab: Enable Geometric Attention Bias (GAB). Adds learned position-dependent
             bias to attention logits via shared Fourier templates + per-layer mixing.
             GAB hyperparams (gab_d1, gab_d2, gab_num_templates, gab_num_fourier_features,

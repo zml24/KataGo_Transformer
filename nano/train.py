@@ -1104,9 +1104,10 @@ if __name__ == "__main__":
                         help="Stem conv kernel: cnn1 (1x1), cnn3 (3x3), cnn5 (5x5)")
     parser.add_argument("--use-ape", action="store_true",
                         help="Enable absolute position encoding (edge-distance embedding)")
-    parser.add_argument("--rpe", type=str, default="rope", choices=["rope", "rpb"],
+    parser.add_argument("--rpe", type=str, default="rope", choices=["rope", "rpb", "rope+rpb"],
                         help="Relative position encoding: rope=2D RoPE on Q,K, "
-                             "rpb=per-layer per-head scalar bias on attention logits")
+                             "rpb=per-layer per-head scalar bias on attention logits, "
+                             "rope+rpb=both simultaneously")
     args = parser.parse_args()
 
     # Validation

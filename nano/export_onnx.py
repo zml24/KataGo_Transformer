@@ -109,10 +109,10 @@ class SingleBlockExportWrapper(nn.Module):
         self._export_output_names = BLOCKS_OUTPUT_NAMES
 
     def forward(self, x):
-        if self.rpb_bias is not None:
-            x = self.block(x, attn_bias=self.rpb_bias)
+        if self.rope_cos is not None:
+            x = self.block(x, self.rope_cos, self.rope_sin, attn_bias=self.rpb_bias)
         else:
-            x = self.block(x, self.rope_cos, self.rope_sin)
+            x = self.block(x, attn_bias=self.rpb_bias)
         if self.norm_final is not None:
             x = self.norm_final(x)
         return (x.float(),)
@@ -843,10 +843,10 @@ def export_per_block(args):
 
     x = input_stem
     block_paths = []
-    model_rpe = getattr(model, "rpe", "rope")
+    use_rpb = getattr(model, "use_rpb", False)
+    use_rope = getattr(model, "use_rope", True)
     for i in range(num_blocks):
         is_last = (i == num_blocks - 1)
-        use_rpb = model_rpe == "rpb"
 
         rpb_bias = None
         if use_rpb:
@@ -854,8 +854,8 @@ def export_per_block(args):
 
         wrapper = SingleBlockExportWrapper(
             model.blocks[i],
-            rope_cos=None if use_rpb else model.rope_cos,
-            rope_sin=None if use_rpb else model.rope_sin,
+            rope_cos=model.rope_cos if use_rope else None,
+            rope_sin=model.rope_sin if use_rope else None,
             norm_final=model.norm_final if is_last else None,
             rpb_bias=rpb_bias,
         )
@@ -880,10 +880,11 @@ def export_per_block(args):
         # Compute this block's output (raw, without norm_final / .float())
         # to use as the next block's input.
         with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
-            if use_rpb:
-                x = model.blocks[i](x, attn_bias=rpb_bias.to(x.dtype))
+            rpb_arg = rpb_bias.to(x.dtype) if rpb_bias is not None else None
+            if use_rope:
+                x = model.blocks[i](x, model.rope_cos, model.rope_sin, attn_bias=rpb_arg)
             else:
-                x = model.blocks[i](x, model.rope_cos, model.rope_sin)
+                x = model.blocks[i](x, attn_bias=rpb_arg)
 
         block_paths.append(block_path)
 

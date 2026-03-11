@@ -379,6 +379,8 @@ class Model(nn.Module):
         self.stem = config.get("stem", "cnn3")
         self.use_ape = config.get("use_ape", False)
         self.rpe = config.get("rpe", "rope")
+        self.use_rpb = self.rpe in ("rpb", "rope+rpb")
+        self.use_rope = self.rpe in ("rope", "rope+rpb")
         kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5}[self.stem]
         self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
                                       kernel_size=kernel_size, padding="same", bias=False)
@@ -390,7 +392,7 @@ class Model(nn.Module):
         self.linear_global = nn.Linear(num_global_features, self.c_trunk, bias=False)
 
         # RPE: RPB parameters
-        if self.rpe == "rpb":
+        if self.use_rpb:
             num_rpb_classes = pos_len * (pos_len + 1) // 2  # 190 for 19x19
             self.register_buffer("rpb_index_map", build_rpb_index_map(pos_len), persistent=False)
             self.rpb_tables = nn.ParameterList([
@@ -399,7 +401,7 @@ class Model(nn.Module):
             ])
 
         # RPE: precompute RoPE embeddings once for the whole model (rotate_half style)
-        if self.rpe == "rope":
+        if self.use_rope:
             emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)           # (L, 1, 1, dim_half)
             emb_expanded = torch.cat([emb, emb], dim=-1)                   # (L, 1, 1, dim)
             self.register_buffer("rope_cos", emb_expanded.cos(), persistent=False)
@@ -464,9 +466,9 @@ class Model(nn.Module):
 
         if self.use_ape:
             nn.init.normal_(self.pos_embed.weight, mean=0.0, std=init_std)
-        if self.rpe == "rpb":
+        if self.use_rpb:
             for table in self.rpb_tables:
-                nn.init.normal_(table, mean=0.0, std=init_std)
+                nn.init.zeros_(table)
         if self.use_gab:
             # Restore geometric initialization for GAB frequencies (zeroed by loop above)
             num_ff = self.config.get("gab_num_fourier_features", 8)
@@ -484,13 +486,13 @@ class Model(nn.Module):
 
         # Trunk
         for i, block in enumerate(self.blocks):
-            if self.rpe == "rpb":
-                attn_bias = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0)  # (1, H, L, L)
-                x = block(x, attn_bias=attn_bias.to(x.dtype), gab_templates=gab_templates)
-            elif self.rpe == "rope":
-                x = block(x, self.rope_cos, self.rope_sin, gab_templates=gab_templates)
+            attn_bias = None
+            if self.use_rpb:
+                attn_bias = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0).to(x.dtype)  # (1, H, L, L)
+            if self.use_rope:
+                x = block(x, self.rope_cos, self.rope_sin, attn_bias=attn_bias, gab_templates=gab_templates)
             else:
-                x = block(x, gab_templates=gab_templates)
+                x = block(x, attn_bias=attn_bias, gab_templates=gab_templates)
 
         return self.norm_final(x)
 

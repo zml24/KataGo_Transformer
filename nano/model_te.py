@@ -195,6 +195,8 @@ class Model(nn.Module):
         self.stem = config.get("stem", "cnn3")
         self.use_ape = config.get("use_ape", False)
         self.rpe = config.get("rpe", "rope")
+        self.use_rpb = self.rpe in ("rpb", "rope+rpb")
+        self.use_rope = self.rpe in ("rope", "rope+rpb")
         kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5}[self.stem]
         self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
                                       kernel_size=kernel_size, padding="same", bias=False)
@@ -208,7 +210,7 @@ class Model(nn.Module):
         self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
 
         # RPE: RPB parameters
-        if self.rpe == "rpb":
+        if self.use_rpb:
             num_rpb_classes = pos_len * (pos_len + 1) // 2  # 190 for 19x19
             self.register_buffer("rpb_index_map", build_rpb_index_map(pos_len), persistent=False)
             self.rpb_tables = nn.ParameterList([
@@ -217,7 +219,7 @@ class Model(nn.Module):
             ])
 
         # RPE: precompute RoPE embeddings (rotate_half)
-        if self.rpe == "rope":
+        if self.use_rope:
             emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)  # (L, 1, 1, dim_half)
             emb_full = torch.cat([emb, emb], dim=-1)              # (L, 1, 1, dim)
             self.register_buffer("rope", emb_full, persistent=False)
@@ -277,11 +279,11 @@ class Model(nn.Module):
                 x_norm = _rms_norm_fp32(x, norm_weight)
                 attn_bias = self.gab_mixers[i](x_norm, gab_templates)
 
-            if self.rpe == "rpb":
+            if self.use_rpb:
                 rpb = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0).to(x.dtype)
                 attn_bias = rpb if attn_bias is None else rpb + attn_bias
 
-            if self.rpe == "rope":
+            if self.use_rope:
                 x = block(x, rope=self.rope, core_attention_bias=attn_bias)
             else:
                 x = block(x, core_attention_bias=attn_bias)
@@ -335,9 +337,9 @@ class Model(nn.Module):
         if self.use_ape:
             nn.init.normal_(self.pos_embed.weight, mean=0.0, std=init_std)
         # RPB
-        if self.rpe == "rpb":
+        if self.use_rpb:
             for table in self.rpb_tables:
-                nn.init.normal_(table, mean=0.0, std=init_std)
+                nn.init.zeros_(table)
         # GAB
         if self.use_gab:
             init_fn(self.gab_template_mlp.linear1.weight)
@@ -482,6 +484,8 @@ class ModelDecomposedExport(nn.Module):
         self.stem = config.get("stem", "cnn3")
         self.use_ape = config.get("use_ape", False)
         self.rpe = config.get("rpe", "rope")
+        self.use_rpb = self.rpe in ("rpb", "rope+rpb")
+        self.use_rope = self.rpe in ("rope", "rope+rpb")
         kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5}[self.stem]
         self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
                                       kernel_size=kernel_size, padding="same", bias=False)
@@ -493,7 +497,7 @@ class ModelDecomposedExport(nn.Module):
         Linear = nn.Linear if use_fp8 else te.Linear
         self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
 
-        if self.rpe == "rpb":
+        if self.use_rpb:
             num_rpb_classes = pos_len * (pos_len + 1) // 2
             self.register_buffer("rpb_index_map", build_rpb_index_map(pos_len), persistent=False)
             self.rpb_tables = nn.ParameterList([
@@ -501,7 +505,7 @@ class ModelDecomposedExport(nn.Module):
                 for _ in range(config["num_layers"])
             ])
 
-        if self.rpe == "rope":
+        if self.use_rope:
             emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)
             emb_expanded = torch.cat([emb, emb], dim=-1)
             self.register_buffer("rope_cos", emb_expanded.cos(), persistent=False)
@@ -557,11 +561,11 @@ class ModelDecomposedExport(nn.Module):
                 x_norm = _rms_norm_fp32(x, norm_weight)
                 attn_bias = self.gab_mixers[i](x_norm, gab_templates)
 
-            if self.rpe == "rpb":
+            if self.use_rpb:
                 rpb = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0).to(x.dtype)
                 attn_bias = rpb if attn_bias is None else rpb + attn_bias
 
-            if self.rpe == "rope":
+            if self.use_rope:
                 x = block(x, self.rope_cos, self.rope_sin, attn_bias=attn_bias)
             else:
                 x = block(x, attn_bias=attn_bias)
