@@ -293,11 +293,21 @@ class Model(nn.Module):
         return self._run_trunk_impl(x)
 
     def initialize(self, init_std=0.02):
-        """Megatron-LM style initialization using TE-native init_method."""
+        """Megatron-LM style initialization using TE-native init_method.
+
+        Linear/Conv layers use std = 1/sqrt(fan_in).
+        Output layers additionally scale by 1/sqrt(2*num_blocks).
+        init_std is only used for non-linear/conv parameters (APE, RPB, etc.).
+        """
         num_blocks = len(self.blocks)
-        output_std = init_std / math.sqrt(2.0 * num_blocks)
-        init_fn = partial(nn.init.normal_, mean=0.0, std=init_std)
-        output_init_fn = partial(nn.init.normal_, mean=0.0, std=output_std)
+
+        def init_fn(tensor):
+            std = 1.0 / math.sqrt(tensor[0].numel())
+            nn.init.normal_(tensor, mean=0.0, std=std)
+
+        def output_init_fn(tensor):
+            std = 1.0 / math.sqrt(tensor[0].numel()) / math.sqrt(2.0 * num_blocks)
+            nn.init.normal_(tensor, mean=0.0, std=std)
 
         # Rebuild blocks with TE-native init methods
         BlockClass = TransformerBlockTE
@@ -324,9 +334,9 @@ class Model(nn.Module):
                 if p.dim() >= 2:
                     init_fn(p)
 
-        # APE embedding
+        # APE embedding (fixed init_std, not fan_in)
         if self.ape == "ape-stem":
-            init_fn(self.pos_embed.weight)
+            nn.init.normal_(self.pos_embed.weight, mean=0.0, std=init_std)
         # RPB
         if self.rpe == "rpb":
             for table in self.rpb_tables:

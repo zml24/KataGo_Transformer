@@ -443,19 +443,23 @@ class Model(nn.Module):
         self.moving_unowned_proportion_weight = 0.0
 
     def initialize(self, init_std=0.02):
-        """Megatron-LM style initialization."""
+        """Megatron-LM style initialization.
+
+        Linear/Conv layers use std = 1/sqrt(fan_in).
+        Output layers (out_proj, ffn_w2) additionally scale by 1/sqrt(2*num_blocks).
+        init_std is only used for non-linear/conv parameters (APE, RPB, etc.).
+        """
         num_blocks = len(self.blocks)
-        output_std = init_std / math.sqrt(2.0 * num_blocks)
 
         for name, p in self.named_parameters():
             if p.dim() < 2:
                 if "norm" not in name:
                     nn.init.zeros_(p)
             else:
+                std = 1.0 / math.sqrt(p[0].numel())  # 1/sqrt(fan_in)
                 if ".out_proj." in name or ".ffn_w2." in name:
-                    nn.init.normal_(p, mean=0.0, std=output_std)
-                else:
-                    nn.init.normal_(p, mean=0.0, std=init_std)
+                    std = std / math.sqrt(2.0 * num_blocks)
+                nn.init.normal_(p, mean=0.0, std=std)
 
         if self.ape == "ape-stem":
             nn.init.normal_(self.pos_embed.weight, mean=0.0, std=init_std)
