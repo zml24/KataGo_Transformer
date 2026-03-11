@@ -30,7 +30,7 @@ def get_num_global_input_features(config: ModelConfig):
 
 
 def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebeliefs=8, version=15,
-                ape="cnn", rpe="rope", use_gab=False):
+                stem="cnn3", use_ape=False, rpe="rope", use_gab=False):
     """Create a model config from minimal parameters.
 
     Args:
@@ -40,8 +40,8 @@ def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebelie
         ffn_dim: SwiGLU FFN intermediate dimension. Default: hidden_size * 8 // 3.
         num_scorebeliefs: Number of score belief mixtures. Default: 8.
         version: Data format version. Default: 15.
-        ape: Absolute position encoding. "cnn" (3x3 conv stem, no APE),
-            "ape-stem" (1x1 linear stem + APE on stem).
+        stem: Stem convolution kernel size. "cnn1" (1x1), "cnn3" (3x3), "cnn5" (5x5).
+        use_ape: Enable absolute position encoding (edge-distance embedding on stem).
         rpe: Relative position encoding. "rope" (2D RoPE on Q,K),
             "rpb" (per-layer per-head scalar bias on attention logits).
         use_gab: Enable Geometric Attention Bias (GAB). Adds learned position-dependent
@@ -58,7 +58,8 @@ def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebelie
         "num_heads": num_heads,
         "ffn_dim": ffn_dim,
         "num_scorebeliefs": num_scorebeliefs,
-        "ape": ape,
+        "stem": stem,
+        "use_ape": use_ape,
         "rpe": rpe,
         "use_gab": use_gab,
     }
@@ -68,20 +69,31 @@ def migrate_config(old: ModelConfig) -> ModelConfig:
     """Convert old-format config (with trunk_num_channels etc.) to new minimal format."""
     if "hidden_size" in old:
         old = dict(old)
-        # Migrate old pos_enc → ape + rpe
+        # Migrate old ape → stem + use_ape
+        if "ape" in old:
+            ape = old.pop("ape")
+            _APE_MAP = {
+                "cnn": ("cnn3", False),
+                "ape-stem": ("cnn1", True),
+            }
+            stem, use_ape = _APE_MAP[ape]
+            old.setdefault("stem", stem)
+            old.setdefault("use_ape", use_ape)
+        # Migrate old pos_enc → stem + use_ape + rpe
         if "pos_enc" in old:
             pos_enc = old.pop("pos_enc")
             _POS_ENC_MAP = {
-                "rope": ("cnn", "rope"),
-                "ape-stem": ("ape-stem", "rope"),
-
-                "rpb": ("cnn", "rpb"),
+                "rope": ("cnn3", False, "rope"),
+                "ape-stem": ("cnn1", True, "rope"),
+                "rpb": ("cnn3", False, "rpb"),
             }
-            ape, rpe = _POS_ENC_MAP[pos_enc]
-            old.setdefault("ape", ape)
+            stem, use_ape, rpe = _POS_ENC_MAP[pos_enc]
+            old.setdefault("stem", stem)
+            old.setdefault("use_ape", use_ape)
             old.setdefault("rpe", rpe)
         else:
-            old.setdefault("ape", "cnn")
+            old.setdefault("stem", "cnn3")
+            old.setdefault("use_ape", False)
             old.setdefault("rpe", "rope")
         return old
     return make_config(
@@ -91,7 +103,8 @@ def migrate_config(old: ModelConfig) -> ModelConfig:
         ffn_dim=old.get("transformer_ffn_channels", old["trunk_num_channels"] * 8 // 3),
         num_scorebeliefs=old.get("num_scorebeliefs", 8),
         version=old.get("version", 15),
-        ape=old.get("ape", "cnn"),
+        stem=old.get("stem", "cnn3"),
+        use_ape=old.get("use_ape", False),
         rpe=old.get("rpe", "rope"),
         use_gab=old.get("use_gab", False),
     )

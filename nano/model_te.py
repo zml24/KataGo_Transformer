@@ -191,20 +191,20 @@ class Model(nn.Module):
         ffn_dim = config["ffn_dim"]
         head_dim = self.c_trunk // num_heads
 
-        # Stem: APE determines stem type
-        self.ape = config.get("ape", "cnn")
+        # Stem
+        self.stem = config.get("stem", "cnn3")
+        self.use_ape = config.get("use_ape", False)
         self.rpe = config.get("rpe", "rope")
-        Linear = nn.Linear if use_fp8 else te.Linear
-        if self.ape != "cnn":
-            self.linear_spatial = Linear(num_bin_features, self.c_trunk, bias=False)
+        kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5}[self.stem]
+        self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
+                                      kernel_size=kernel_size, padding="same", bias=False)
+        if self.use_ape:
             half = (pos_len - 1) // 2
             num_edge_positions = (half + 1) * (half + 2) // 2
             self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
             self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
-        else:
-            # Conv2d stays as nn (TE has no Conv2d)
-            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
         # Non-FP8: use te.Linear for fused kernels; FP8: nn.Linear (dims not FP8-aligned)
+        Linear = nn.Linear if use_fp8 else te.Linear
         self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
 
         # RPE: RPB parameters
@@ -322,10 +322,7 @@ class Model(nn.Module):
         ])
 
         # Stem
-        if self.ape != "cnn":
-            init_fn(self.linear_spatial.weight)
-        else:
-            init_fn(self.conv_spatial.weight)
+        init_fn(self.conv_spatial.weight)
         init_fn(self.linear_global.weight)
 
         # Heads (nn.Linear from model.py, all bias=False)
@@ -335,7 +332,7 @@ class Model(nn.Module):
                     init_fn(p)
 
         # APE embedding (fixed init_std, not fan_in)
-        if self.ape == "ape-stem":
+        if self.use_ape:
             nn.init.normal_(self.pos_embed.weight, mean=0.0, std=init_std)
         # RPB
         if self.rpe == "rpb":
@@ -367,14 +364,10 @@ class Model(nn.Module):
         N = input_spatial.shape[0]
         L = self.pos_len * self.pos_len
         x_global = self.linear_global(input_global)
-        if self.ape != "cnn":
-            x_spatial = self.linear_spatial(input_spatial.view(N, -1, L).permute(0, 2, 1))
-            x = x_spatial + x_global.unsqueeze(1)
-        else:
-            x_spatial = self.conv_spatial(input_spatial)
-            x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-            x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
-        if self.ape != "cnn":
+        x_spatial = self.conv_spatial(input_spatial)
+        x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
+        x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
+        if self.use_ape:
             x = x + self.pos_embed(self.edge_index_map).to(dtype=x.dtype)
         return x
 
@@ -486,17 +479,18 @@ class ModelDecomposedExport(nn.Module):
         ffn_dim = config["ffn_dim"]
         head_dim = self.c_trunk // num_heads
 
-        self.ape = config.get("ape", "cnn")
+        self.stem = config.get("stem", "cnn3")
+        self.use_ape = config.get("use_ape", False)
         self.rpe = config.get("rpe", "rope")
-        Linear = nn.Linear if use_fp8 else te.Linear
-        if self.ape != "cnn":
-            self.linear_spatial = Linear(num_bin_features, self.c_trunk, bias=False)
+        kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5}[self.stem]
+        self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
+                                      kernel_size=kernel_size, padding="same", bias=False)
+        if self.use_ape:
             half = (pos_len - 1) // 2
             num_edge_positions = (half + 1) * (half + 2) // 2
             self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
             self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
-        else:
-            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
+        Linear = nn.Linear if use_fp8 else te.Linear
         self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
 
         if self.rpe == "rpb":
@@ -578,14 +572,10 @@ class ModelDecomposedExport(nn.Module):
         batch_size = input_spatial.shape[0]
         seq_len = self.pos_len * self.pos_len
         x_global = self.linear_global(input_global)
-        if self.ape != "cnn":
-            x_spatial = self.linear_spatial(input_spatial.view(batch_size, -1, seq_len).permute(0, 2, 1))
-            x = x_spatial + x_global.unsqueeze(1)
-        else:
-            x_spatial = self.conv_spatial(input_spatial)
-            x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-            x = x.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
-        if self.ape != "cnn":
+        x_spatial = self.conv_spatial(input_spatial)
+        x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
+        x = x.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
+        if self.use_ape:
             x = x + self.pos_embed(self.edge_index_map).to(dtype=x.dtype)
         return x
 

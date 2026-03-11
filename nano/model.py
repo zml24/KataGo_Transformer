@@ -375,17 +375,18 @@ class Model(nn.Module):
         ffn_dim = config["ffn_dim"]
         head_dim = self.c_trunk // num_heads
 
-        # Stem: APE determines stem type
-        self.ape = config.get("ape", "cnn")
+        # Stem
+        self.stem = config.get("stem", "cnn3")
+        self.use_ape = config.get("use_ape", False)
         self.rpe = config.get("rpe", "rope")
-        if self.ape != "cnn":
-            self.linear_spatial = nn.Linear(num_bin_features, self.c_trunk, bias=False)
+        kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5}[self.stem]
+        self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
+                                      kernel_size=kernel_size, padding="same", bias=False)
+        if self.use_ape:
             half = (pos_len - 1) // 2
             num_edge_positions = (half + 1) * (half + 2) // 2
             self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
             self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
-        else:
-            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk, kernel_size=3, padding="same", bias=False)
         self.linear_global = nn.Linear(num_global_features, self.c_trunk, bias=False)
 
         # RPE: RPB parameters
@@ -461,7 +462,7 @@ class Model(nn.Module):
                     std = std / math.sqrt(2.0 * num_blocks)
                 nn.init.normal_(p, mean=0.0, std=std)
 
-        if self.ape == "ape-stem":
+        if self.use_ape:
             nn.init.normal_(self.pos_embed.weight, mean=0.0, std=init_std)
         if self.rpe == "rpb":
             for table in self.rpb_tables:
@@ -500,14 +501,10 @@ class Model(nn.Module):
 
         # Stem: NCHW -> NLC
         x_global = self.linear_global(input_global)
-        if self.ape != "cnn":
-            x_spatial = self.linear_spatial(input_spatial.view(N, -1, L).permute(0, 2, 1))  # (N, L, C)
-            x = x_spatial + x_global.unsqueeze(1)
-        else:
-            x_spatial = self.conv_spatial(input_spatial)
-            x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-            x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
-        if self.ape != "cnn":
+        x_spatial = self.conv_spatial(input_spatial)
+        x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
+        x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
+        if self.use_ape:
             x = x + self.pos_embed(self.edge_index_map).to(dtype=x.dtype)
         return x
 
