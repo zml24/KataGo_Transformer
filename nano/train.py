@@ -266,15 +266,15 @@ def main(rank, world_size, args, gpu_id):
             hidden_size=args.hidden_size,
             num_heads=args.num_heads,
             stem=args.stem,
-            use_ape=args.use_ape,
+            ape=args.ape,
             rpe=args.rpe,
         )
     else:
         model_config = configs.config_of_name[args.model_kind].copy()
         if args.stem != "cnn3":
             model_config["stem"] = args.stem
-        if args.use_ape:
-            model_config["use_ape"] = True
+        if args.ape != "none":
+            model_config["ape"] = args.ape
         if args.rpe != "rope":
             model_config["rpe"] = args.rpe
     logging.info(f"Model config: {json.dumps(model_config, indent=2, default=str)}")
@@ -1106,8 +1106,9 @@ if __name__ == "__main__":
                         help="EMA decay rate for model params (0=disabled, typical: 0.999 or 0.9999)")
     parser.add_argument("--stem", type=str, default="cnn3", choices=["cnn1", "cnn3", "cnn5"],
                         help="Stem conv kernel: cnn1 (1x1), cnn3 (3x3), cnn5 (5x5)")
-    parser.add_argument("--use-ape", action="store_true",
-                        help="Enable absolute position encoding (edge-distance embedding)")
+    parser.add_argument("--ape", type=str, default="none", choices=["none", "d4", "per_pos"],
+                        help="Absolute position encoding: none (disabled), d4 (D4-symmetric edge-distance), "
+                             "per_pos (independent embedding per position)")
     parser.add_argument("--rpe", type=str, default="rope", choices=["rope", "rpb", "rope+rpb"],
                         help="Relative position encoding: rope=2D RoPE on Q,K, "
                              "rpb=per-layer per-head scalar bias on attention logits, "

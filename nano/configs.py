@@ -30,7 +30,7 @@ def get_num_global_input_features(config: ModelConfig):
 
 
 def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebeliefs=8, version=15,
-                stem="cnn3", use_ape=False, rpe="rope", use_gab=False):
+                stem="cnn3", ape="none", rpe="rope", use_gab=False):
     """Create a model config from minimal parameters.
 
     Args:
@@ -41,7 +41,9 @@ def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebelie
         num_scorebeliefs: Number of score belief mixtures. Default: 8.
         version: Data format version. Default: 15.
         stem: Stem convolution kernel size. "cnn1" (1x1), "cnn3" (3x3), "cnn5" (5x5).
-        use_ape: Enable absolute position encoding (edge-distance embedding on stem).
+        ape: Absolute position encoding. "none" (disabled), "d4" (D4-symmetric
+            edge-distance embedding, 55 classes for 19x19), "per_pos" (independent
+            embedding per board position, 361 for 19x19).
         rpe: Relative position encoding. "rope" (2D RoPE on Q,K),
             "rpb" (per-layer per-head scalar bias on attention logits),
             "rope+rpb" (both RoPE and RPB simultaneously).
@@ -60,41 +62,50 @@ def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebelie
         "ffn_dim": ffn_dim,
         "num_scorebeliefs": num_scorebeliefs,
         "stem": stem,
-        "use_ape": use_ape,
+        "ape": ape,
         "rpe": rpe,
         "use_gab": use_gab,
     }
 
 
+def _migrate_use_ape(val):
+    """Convert old bool use_ape to new string ape format."""
+    if isinstance(val, bool):
+        return "d4" if val else "none"
+    return val
+
 def migrate_config(old: ModelConfig) -> ModelConfig:
     """Convert old-format config (with trunk_num_channels etc.) to new minimal format."""
     if "hidden_size" in old:
         old = dict(old)
-        # Migrate old ape → stem + use_ape
-        if "ape" in old:
+        # Migrate old bool use_ape → string ape
+        if "use_ape" in old:
+            old["ape"] = _migrate_use_ape(old.pop("use_ape"))
+        # Migrate old ape field (legacy "cnn"/"ape-stem" format) → stem + ape
+        if "ape" in old and old["ape"] in ("cnn", "ape-stem"):
             ape = old.pop("ape")
             _APE_MAP = {
-                "cnn": ("cnn3", False),
-                "ape-stem": ("cnn1", True),
+                "cnn": ("cnn3", "none"),
+                "ape-stem": ("cnn1", "d4"),
             }
-            stem, use_ape = _APE_MAP[ape]
+            stem, ape_mode = _APE_MAP[ape]
             old.setdefault("stem", stem)
-            old.setdefault("use_ape", use_ape)
-        # Migrate old pos_enc → stem + use_ape + rpe
+            old.setdefault("ape", ape_mode)
+        # Migrate old pos_enc → stem + ape + rpe
         if "pos_enc" in old:
             pos_enc = old.pop("pos_enc")
             _POS_ENC_MAP = {
-                "rope": ("cnn3", False, "rope"),
-                "ape-stem": ("cnn1", True, "rope"),
-                "rpb": ("cnn3", False, "rpb"),
+                "rope": ("cnn3", "none", "rope"),
+                "ape-stem": ("cnn1", "d4", "rope"),
+                "rpb": ("cnn3", "none", "rpb"),
             }
-            stem, use_ape, rpe = _POS_ENC_MAP[pos_enc]
+            stem, ape_mode, rpe = _POS_ENC_MAP[pos_enc]
             old.setdefault("stem", stem)
-            old.setdefault("use_ape", use_ape)
+            old.setdefault("ape", ape_mode)
             old.setdefault("rpe", rpe)
         else:
             old.setdefault("stem", "cnn3")
-            old.setdefault("use_ape", False)
+            old.setdefault("ape", "none")
             old.setdefault("rpe", "rope")
         return old
     return make_config(
@@ -105,7 +116,7 @@ def migrate_config(old: ModelConfig) -> ModelConfig:
         num_scorebeliefs=old.get("num_scorebeliefs", 8),
         version=old.get("version", 15),
         stem=old.get("stem", "cnn3"),
-        use_ape=old.get("use_ape", False),
+        ape=_migrate_use_ape(old.get("use_ape", old.get("ape", "none"))),
         rpe=old.get("rpe", "rope"),
         use_gab=old.get("use_gab", False),
     )
