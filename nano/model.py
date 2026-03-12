@@ -59,6 +59,57 @@ def build_edge_index_map(pos_len: int) -> torch.Tensor:
     return (b * (b + 1) // 2 + a).flatten().long()
 
 
+class D4Conv2d(nn.Module):
+    """D4-equivariant Conv2d: kernel parameterized by D4 orbit representatives.
+
+    For 3x3: 3 orbits (corner*4, edge*4, center*1), theta shape [Cout, Cin, 3]
+    For 5x5: 6 orbits, theta shape [Cout, Cin, 6]
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, padding="same"):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.padding = padding
+
+        indices = self._build_expand_indices(kernel_size)
+        self.register_buffer("_expand_indices", indices, persistent=False)
+        num_orbits = int(indices.max().item()) + 1
+        self.theta = nn.Parameter(torch.empty(out_channels, in_channels, num_orbits))
+
+    @staticmethod
+    def _build_expand_indices(k):
+        """Build [k, k] index map: position (i,j) -> orbit index.
+
+        Uses the same sorted-distance trick as build_edge_index_map:
+        dist_i = min(i, k-1-i), dist_j = min(j, k-1-j),
+        a = min(dist_i, dist_j), b = max(dist_i, dist_j),
+        orbit = b*(b+1)/2 + a.
+        """
+        coords = torch.arange(k)
+        dist = torch.min(coords, k - 1 - coords)
+        grid_r, grid_c = torch.meshgrid(dist, dist, indexing="ij")
+        a = torch.min(grid_r, grid_c)
+        b = torch.max(grid_r, grid_c)
+        return (b * (b + 1) // 2 + a).long()
+
+    def expand_kernel(self):
+        """Expand theta [Cout, Cin, num_orbits] -> W [Cout, Cin, k, k]."""
+        return self.theta[:, :, self._expand_indices]
+
+    def forward(self, x):
+        W = self.expand_kernel()
+        return F.conv2d(x, W, bias=None, padding=self.padding)
+
+    def to_conv2d(self):
+        """Convert to standard nn.Conv2d with baked-in kernel (for export)."""
+        conv = nn.Conv2d(self.in_channels, self.out_channels,
+                         kernel_size=self.kernel_size, padding=self.padding, bias=False)
+        conv.weight.data.copy_(self.expand_kernel().detach())
+        return conv
+
+
 def build_rpb_index_map(pos_len: int) -> torch.Tensor:
     """Precompute pairwise relative position index map for RPB.
 
@@ -381,9 +432,14 @@ class Model(nn.Module):
         self.rpe = config.get("rpe", "rope")
         self.use_rpb = self.rpe in ("rpb", "rope+rpb")
         self.use_rope = self.rpe in ("rope", "rope+rpb")
+        self.stem_d4 = config.get("stem_d4", False)
         kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5}[self.stem]
-        self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
-                                      kernel_size=kernel_size, padding="same", bias=False)
+        if self.stem_d4 and kernel_size > 1:
+            self.conv_spatial = D4Conv2d(num_bin_features, self.c_trunk,
+                                          kernel_size=kernel_size, padding="same")
+        else:
+            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
+                                          kernel_size=kernel_size, padding="same", bias=False)
         if self.ape == "d4":
             half = (pos_len - 1) // 2
             num_edge_positions = (half + 1) * (half + 2) // 2
@@ -490,9 +546,15 @@ class Model(nn.Module):
 
         if stem_init_aligned:
             # Override stem weights so output std ≈ init_std (matching APE)
-            fan_in_spatial = self.conv_spatial.weight[0].numel()
-            nn.init.normal_(self.conv_spatial.weight, mean=0.0,
-                            std=init_std / math.sqrt(fan_in_spatial))
+            if isinstance(self.conv_spatial, D4Conv2d):
+                # effective fan_in = cin * k^2 (orbit mult sum = k^2)
+                effective_fan_in = self.conv_spatial.in_channels * self.conv_spatial.kernel_size ** 2
+                nn.init.normal_(self.conv_spatial.theta, mean=0.0,
+                                std=init_std / math.sqrt(effective_fan_in))
+            else:
+                fan_in_spatial = self.conv_spatial.weight[0].numel()
+                nn.init.normal_(self.conv_spatial.weight, mean=0.0,
+                                std=init_std / math.sqrt(fan_in_spatial))
             fan_in_global = self.linear_global.weight.shape[1]
             nn.init.normal_(self.linear_global.weight, mean=0.0,
                             std=init_std / math.sqrt(fan_in_global))

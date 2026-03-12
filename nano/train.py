@@ -277,6 +277,8 @@ def main(rank, world_size, args, gpu_id):
             model_config["ape"] = args.ape
         if args.rpe != "rope":
             model_config["rpe"] = args.rpe
+    if args.stem_d4:
+        model_config["stem_d4"] = True
     if args.stem_norm:
         model_config["stem_norm"] = True
     logging.info(f"Model config: {json.dumps(model_config, indent=2, default=str)}")
@@ -1121,6 +1123,8 @@ if __name__ == "__main__":
                         help="Relative position encoding: rope=2D RoPE on Q,K, "
                              "rpb=per-layer per-head scalar bias on attention logits, "
                              "rope+rpb=both simultaneously")
+    parser.add_argument("--stem-d4", action="store_true", default=False,
+                        help="Use D4-equivariant stem convolution (symmetric kernel, fewer params)")
     parser.add_argument("--stem-norm", action="store_true", default=False,
                         help="RMSNorm each stem component (spatial/global/APE) before summing")
     parser.add_argument("--stem-init-aligned", action="store_true", default=False,

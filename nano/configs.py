@@ -30,7 +30,7 @@ def get_num_global_input_features(config: ModelConfig):
 
 
 def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebeliefs=8, version=15,
-                stem="cnn3", ape="none", rpe="rope", use_gab=False):
+                stem="cnn3", ape="none", rpe="rope", use_gab=False, stem_d4=False):
     """Create a model config from minimal parameters.
 
     Args:
@@ -51,6 +51,8 @@ def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebelie
             bias to attention logits via shared Fourier templates + per-layer mixing.
             GAB hyperparams (gab_d1, gab_d2, gab_num_templates, gab_num_fourier_features,
             gab_mlp_hidden) can be overridden by setting them in the returned config dict.
+        stem_d4: Use D4-equivariant stem convolution (symmetric kernel, fewer params).
+            Only effective for cnn3/cnn5; cnn1 is unaffected.
     """
     if ffn_dim is None:
         ffn_dim = hidden_size * 8 // 3
@@ -65,6 +67,7 @@ def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebelie
         "ape": ape,
         "rpe": rpe,
         "use_gab": use_gab,
+        "stem_d4": stem_d4,
     }
 
 
@@ -107,6 +110,7 @@ def migrate_config(old: ModelConfig) -> ModelConfig:
             old.setdefault("stem", "cnn3")
             old.setdefault("ape", "none")
             old.setdefault("rpe", "rope")
+        old.setdefault("stem_d4", False)
         return old
     return make_config(
         num_layers=len(old["block_kind"]),

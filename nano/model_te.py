@@ -26,6 +26,7 @@ import transformer_engine.pytorch as te
 
 from configs import get_num_bin_input_features, get_num_global_input_features
 from model import (
+    D4Conv2d,
     EXTRA_SCORE_DISTR_RADIUS,
     GABTemplateMLP,
     RMSNormFP32,
@@ -194,13 +195,18 @@ class Model(nn.Module):
 
         # Stem
         self.stem = config.get("stem", "cnn3")
+        self.stem_d4 = config.get("stem_d4", False)
         self.ape = config.get("ape", "none")
         self.rpe = config.get("rpe", "rope")
         self.use_rpb = self.rpe in ("rpb", "rope+rpb")
         self.use_rope = self.rpe in ("rope", "rope+rpb")
         kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5}[self.stem]
-        self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
-                                      kernel_size=kernel_size, padding="same", bias=False)
+        if self.stem_d4 and kernel_size > 1:
+            self.conv_spatial = D4Conv2d(num_bin_features, self.c_trunk,
+                                          kernel_size=kernel_size, padding="same")
+        else:
+            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
+                                          kernel_size=kernel_size, padding="same", bias=False)
         if self.ape == "d4":
             half = (pos_len - 1) // 2
             num_edge_positions = (half + 1) * (half + 2) // 2
@@ -334,7 +340,10 @@ class Model(nn.Module):
         ])
 
         # Stem
-        init_fn(self.conv_spatial.weight)
+        if isinstance(self.conv_spatial, D4Conv2d):
+            init_fn(self.conv_spatial.theta)
+        else:
+            init_fn(self.conv_spatial.weight)
         init_fn(self.linear_global.weight)
 
         # Heads (nn.Linear from model.py, all bias=False)
@@ -370,9 +379,14 @@ class Model(nn.Module):
 
         if stem_init_aligned:
             # Override stem weights so output std ≈ init_std (matching APE)
-            fan_in_spatial = self.conv_spatial.weight[0].numel()
-            nn.init.normal_(self.conv_spatial.weight, mean=0.0,
-                            std=init_std / math.sqrt(fan_in_spatial))
+            if isinstance(self.conv_spatial, D4Conv2d):
+                effective_fan_in = self.conv_spatial.in_channels * self.conv_spatial.kernel_size ** 2
+                nn.init.normal_(self.conv_spatial.theta, mean=0.0,
+                                std=init_std / math.sqrt(effective_fan_in))
+            else:
+                fan_in_spatial = self.conv_spatial.weight[0].numel()
+                nn.init.normal_(self.conv_spatial.weight, mean=0.0,
+                                std=init_std / math.sqrt(fan_in_spatial))
             fan_in_global = self.linear_global.weight.shape[1]
             nn.init.normal_(self.linear_global.weight, mean=0.0,
                             std=init_std / math.sqrt(fan_in_global))
@@ -526,13 +540,18 @@ class ModelDecomposedExport(nn.Module):
         head_dim = self.c_trunk // num_heads
 
         self.stem = config.get("stem", "cnn3")
+        self.stem_d4 = config.get("stem_d4", False)
         self.ape = config.get("ape", "none")
         self.rpe = config.get("rpe", "rope")
         self.use_rpb = self.rpe in ("rpb", "rope+rpb")
         self.use_rope = self.rpe in ("rope", "rope+rpb")
         kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5}[self.stem]
-        self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
-                                      kernel_size=kernel_size, padding="same", bias=False)
+        if self.stem_d4 and kernel_size > 1:
+            self.conv_spatial = D4Conv2d(num_bin_features, self.c_trunk,
+                                          kernel_size=kernel_size, padding="same")
+        else:
+            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
+                                          kernel_size=kernel_size, padding="same", bias=False)
         if self.ape == "d4":
             half = (pos_len - 1) // 2
             num_edge_positions = (half + 1) * (half + 2) // 2

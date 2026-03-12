@@ -118,6 +118,17 @@ class SingleBlockExportWrapper(nn.Module):
         return (x.float(),)
 
 
+def _expand_d4_convolutions(model):
+    """Replace all D4Conv2d modules with standard Conv2d for export."""
+    from model import D4Conv2d
+    for name, module in list(model.named_modules()):
+        if isinstance(module, D4Conv2d):
+            parts = name.rsplit('.', 1)
+            parent = model if len(parts) == 1 else dict(model.named_modules())[parts[0]]
+            attr = parts[-1] if len(parts) == 2 else parts[0]
+            setattr(parent, attr, module.to_conv2d())
+
+
 class ExportWrapper(nn.Module):
     def __init__(self, model, export_scope="full"):
         super().__init__()
@@ -590,6 +601,7 @@ def _export_legacy(args, state, config):
     opset_version = DEFAULT_ONNX_OPSET if args.opset is None else args.opset
     output_names = _output_names(args.export_scope)
     wrapper = ExportWrapper(model, args.export_scope).eval()
+    _expand_d4_convolutions(wrapper.model)
     export_inputs, verify_input0, verify_input1 = _resolve_export_inputs(
         model, args.export_scope, input_spatial, input_global
     )
@@ -650,6 +662,7 @@ def _export_te_official(args, state, config):
     )
     output_names = _output_names(args.export_scope)
     wrapper = ExportWrapper(model, args.export_scope).eval()
+    _expand_d4_convolutions(wrapper.model)
     output_path = _resolve_output_path(args)
     export_inputs, verify_input0, verify_input1 = _resolve_export_inputs(
         model, args.export_scope, input_spatial, input_global
@@ -731,6 +744,7 @@ def _export_te_decomposed(args, state, config):
     )
     output_names = _output_names(args.export_scope)
     wrapper = ExportWrapper(model, args.export_scope).eval()
+    _expand_d4_convolutions(wrapper.model)
     output_path = _resolve_output_path(args)
     export_inputs, verify_input0, verify_input1 = _resolve_export_inputs(
         model, args.export_scope, input_spatial, input_global
@@ -800,6 +814,7 @@ def export_per_block(args):
     _validate_te_load_result(load_result)
     model.eval()
     model.to(device)
+    _expand_d4_convolutions(model)
     _print_param_count(model)
 
     batch_size = 1
@@ -917,6 +932,7 @@ def _export_fp8_manual(args, state, config):
     model = Model(config, args.pos_len, score_mode=args.score_mode)
     model.load_state_dict(model_state)
     model.eval()
+    _expand_d4_convolutions(model)
 
     # Replace transformer-block Linear layers with FP8Linear.
     print("Converting transformer block Linear layers to FP8Linear ...")
