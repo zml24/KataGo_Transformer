@@ -412,22 +412,53 @@ def main(rank, world_size, args, gpu_id):
 
     num_heads = model_config["num_heads"]
 
+    # HZY step-function LR/WD schedule (from lr_schedule.xlsx)
+    grad_accum_steps = args.grad_accum_steps
+    samples_per_step = batch_size * world_size * grad_accum_steps
+
+    _LR_WD_SCHEDULE = [
+        (0,           1.131371e-4, 0.377124),
+        (5_000_000,   3.200000e-4, 1.066667),
+        (100_000_000, 2.262742e-4, 0.754247),
+        (200_000_000, 1.600000e-4, 0.533333),
+        (300_000_000, 1.131371e-4, 0.377124),
+        (400_000_000, 8.000000e-5, 0.266667),
+        (500_000_000, 5.656854e-5, 0.188562),
+        (550_000_000, 4.000000e-5, 0.133333),
+        (600_000_000, 2.828427e-5, 0.094281),
+        (650_000_000, 2.000000e-5, 0.066667),
+        (675_000_000, 1.414214e-5, 0.047140),
+    ]
+
+    def get_lr_wd(total_samples):
+        lr, wd = _LR_WD_SCHEDULE[0][1], _LR_WD_SCHEDULE[0][2]
+        for s, lr_s, wd_s in _LR_WD_SCHEDULE:
+            if total_samples >= s:
+                lr, wd = lr_s, wd_s
+            else:
+                break
+        return lr, wd
+
+    base_lr, base_wd = get_lr_wd(total_samples_trained)
+    logging.info(f"HZY LR/WD schedule: {len(_LR_WD_SCHEDULE)} stages, "
+                 f"current lr={base_lr:.2e}, wd={base_wd:.4f} at {total_samples_trained} samples")
+
     # Optimizers: ZeRO Stage 1 when multi-GPU, plain otherwise
     if world_size > 1:
         zero_adam = ZeROAdamW(
-            adam_params, no_decay_params, lr=args.lr, betas=(0.9, 0.95),
-            wd=args.wd, device=device, rank=rank, world_size=world_size,
+            adam_params, no_decay_params, lr=base_lr, betas=(0.9, 0.95),
+            wd=base_wd, device=device, rank=rank, world_size=world_size,
         )
         inner_optimizer = zero_adam.optimizer
         muon_opt = ZeROMuon(
             muon_params, lr_multiplier=0.2,
-            momentum=0.95, wd=args.wd,
+            momentum=0.95, wd=base_wd,
             device=device, rank=rank, world_size=world_size, use_te=args.use_te,
             num_heads=num_heads,
         ) if muon_params else None
         shampoo_opt = ZeROShampoo(
             shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
-            momentum=0.9, wd=args.wd, beta2=0.95,
+            momentum=0.9, wd=base_wd, beta2=0.95,
             device=device, rank=rank, world_size=world_size, use_te=args.use_te,
             num_heads=num_heads,
         ) if shampoo_params else None
@@ -437,16 +468,16 @@ def main(rank, world_size, args, gpu_id):
             {"params": list(no_decay_params.values()), "weight_decay": 0.0},
         ]
         if adam_params:
-            adam_param_groups.append({"params": list(adam_params.values()), "weight_decay": args.wd})
-        inner_optimizer = torch.optim.AdamW(adam_param_groups, lr=args.lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
+            adam_param_groups.append({"params": list(adam_params.values()), "weight_decay": base_wd})
+        inner_optimizer = torch.optim.AdamW(adam_param_groups, lr=base_lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
         muon_opt = MuonOptimizer(
             muon_params, lr_multiplier=0.2,
-            momentum=0.95, wd=args.wd, device=device, use_te=args.use_te,
+            momentum=0.95, wd=base_wd, device=device, use_te=args.use_te,
             num_heads=num_heads,
         ) if muon_params else None
         shampoo_opt = ShampooOptimizer(
             shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
-            momentum=0.9, wd=args.wd, beta2=0.95, device=device,
+            momentum=0.9, wd=base_wd, beta2=0.95, device=device,
             use_te=args.use_te, num_heads=num_heads,
         ) if shampoo_params else None
 
@@ -514,37 +545,6 @@ def main(rank, world_size, args, gpu_id):
         )
     else:
         grad_reducer = None
-
-    # HZY step-function LR/WD schedule (from lr_schedule.xlsx)
-    grad_accum_steps = args.grad_accum_steps
-    samples_per_step = batch_size * world_size * grad_accum_steps
-
-    _LR_WD_SCHEDULE = [
-        (0,           1.131371e-4, 0.377124),
-        (5_000_000,   3.200000e-4, 1.066667),
-        (100_000_000, 2.262742e-4, 0.754247),
-        (200_000_000, 1.600000e-4, 0.533333),
-        (300_000_000, 1.131371e-4, 0.377124),
-        (400_000_000, 8.000000e-5, 0.266667),
-        (500_000_000, 5.656854e-5, 0.188562),
-        (550_000_000, 4.000000e-5, 0.133333),
-        (600_000_000, 2.828427e-5, 0.094281),
-        (650_000_000, 2.000000e-5, 0.066667),
-        (675_000_000, 1.414214e-5, 0.047140),
-    ]
-
-    def get_lr_wd(total_samples):
-        lr, wd = _LR_WD_SCHEDULE[0][1], _LR_WD_SCHEDULE[0][2]
-        for s, lr_s, wd_s in _LR_WD_SCHEDULE:
-            if total_samples >= s:
-                lr, wd = lr_s, wd_s
-            else:
-                break
-        return lr, wd
-
-    base_lr, base_wd = get_lr_wd(total_samples_trained)
-    logging.info(f"HZY LR/WD schedule: {len(_LR_WD_SCHEDULE)} stages, "
-                 f"current lr={base_lr:.2e}, wd={base_wd:.4f} at {total_samples_trained} samples")
 
     # Data directories
     train_dir = os.path.join(args.datadir, "train")
