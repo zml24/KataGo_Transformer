@@ -146,15 +146,19 @@ def precompute_freqs_cos_sin_2d(dim: int, pos_len: int, theta: float = 100.0):
 
 
 def apply_rotary_emb(xq, xk, cos, sin):
+    """Apply rotary position embedding (computed in FP32 for numerical stability)."""
     def rotate_half(x):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat([-x2, x1], dim=-1)
 
-    cos = cos.view(1, xq.shape[1], 1, xq.shape[-1])
-    sin = sin.view(1, xq.shape[1], 1, xq.shape[-1])
-    xq_out = xq * cos + rotate_half(xq) * sin
-    xk_out = xk * cos + rotate_half(xk) * sin
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    orig_dtype = xq.dtype
+    with torch.amp.autocast(xq.device.type, enabled=False):
+        xq, xk = xq.float(), xk.float()
+        cos = cos.float().view(1, xq.shape[1], 1, xq.shape[-1])
+        sin = sin.float().view(1, xq.shape[1], 1, xq.shape[-1])
+        xq_out = xq * cos + rotate_half(xq) * sin
+        xk_out = xk * cos + rotate_half(xk) * sin
+    return xq_out.to(orig_dtype), xk_out.to(orig_dtype)
 
 
 class RMSNormFP32(nn.Module):
@@ -296,9 +300,13 @@ class TransformerBlock(nn.Module):
         attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, C)
         x = x + self.out_proj(attn_out)
 
-        # SwiGLU FFN
+        # SwiGLU FFN (gate multiplication in FP32 for numerical stability)
         x_normed = self.norm2(x)
-        x = x + self.ffn_w2(F.silu(self.ffn_w1(x_normed)) * self.ffn_wgate(x_normed))
+        w1_out = F.silu(self.ffn_w1(x_normed))
+        wgate_out = self.ffn_wgate(x_normed)
+        with torch.amp.autocast(x.device.type, enabled=False):
+            ffn_hidden = w1_out.float() * wgate_out.float()
+        x = x + self.ffn_w2(ffn_hidden.to(x.dtype))
         return x
 
 
