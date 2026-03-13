@@ -266,21 +266,11 @@ def main(rank, world_size, args, gpu_id):
             hidden_size=args.hidden_size,
             num_heads=args.num_heads,
             stem=args.stem,
-            ape=args.ape,
-            rpe=args.rpe,
         )
     else:
         model_config = configs.config_of_name[args.model_kind].copy()
         if args.stem != "cnn3":
             model_config["stem"] = args.stem
-        if args.ape != "none":
-            model_config["ape"] = args.ape
-        if args.rpe != "rope":
-            model_config["rpe"] = args.rpe
-    if args.stem_d4:
-        model_config["stem_d4"] = True
-    if args.stem_norm:
-        model_config["stem_norm"] = True
     logging.info(f"Model config: {json.dumps(model_config, indent=2, default=str)}")
 
     pos_len = args.pos_len
@@ -350,9 +340,8 @@ def main(rank, world_size, args, gpu_id):
     else:
         logging.info("Creating new model")
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
-        model.initialize(init_std=args.init_std, stem_init_aligned=args.stem_init_aligned)
-        stem_desc = ", stem_init_aligned" if args.stem_init_aligned else ""
-        logging.info(f"Initialized weights: std={args.init_std}, output scaling /sqrt(2*{len(model.blocks)}){stem_desc}")
+        model.initialize(init_std=args.init_std)
+        logging.info(f"Initialized weights: std={args.init_std}, output scaling /sqrt(2*{len(model.blocks)})")
         global_step = 0
         total_samples_trained = 0
 
@@ -964,10 +953,6 @@ def main(rank, world_size, args, gpu_id):
                     if rank == 0:
                         time_now = time.perf_counter()
                         print_metrics(time_now - last_print_time)
-                        if tb_writer is not None and _last_spatial is not None:
-                            stem_norms = model.compute_stem_norms(_last_spatial, _last_global)
-                            for k, v in stem_norms.items():
-                                tb_writer.add_scalar(f"stem/{k}", v, total_samples_trained)
                         last_print_time = time_now
                     reset_running()
 
@@ -1116,20 +1101,6 @@ if __name__ == "__main__":
                         help="EMA decay rate for model params (0=disabled, typical: 0.999 or 0.9999)")
     parser.add_argument("--stem", type=str, default="cnn3", choices=["cnn1", "cnn3", "cnn5"],
                         help="Stem conv kernel: cnn1 (1x1), cnn3 (3x3), cnn5 (5x5)")
-    parser.add_argument("--ape", type=str, default="none", choices=["none", "d4", "per_pos"],
-                        help="Absolute position encoding: none (disabled), d4 (D4-symmetric edge-distance), "
-                             "per_pos (independent embedding per position)")
-    parser.add_argument("--rpe", type=str, default="rope", choices=["rope", "rpb", "rope+rpb"],
-                        help="Relative position encoding: rope=2D RoPE on Q,K, "
-                             "rpb=per-layer per-head scalar bias on attention logits, "
-                             "rope+rpb=both simultaneously")
-    parser.add_argument("--stem-d4", action="store_true", default=False,
-                        help="Use D4-equivariant stem convolution (symmetric kernel, fewer params)")
-    parser.add_argument("--stem-norm", action="store_true", default=False,
-                        help="RMSNorm each stem component (spatial/global/APE) before summing")
-    parser.add_argument("--stem-init-aligned", action="store_true", default=False,
-                        help="Align stem init: conv_spatial/linear_global weight std = init_std/sqrt(fan_in), "
-                             "matching APE output scale")
     args = parser.parse_args()
 
     # Validation

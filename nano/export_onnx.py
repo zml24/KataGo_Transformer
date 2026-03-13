@@ -88,45 +88,21 @@ class SingleBlockExportWrapper(nn.Module):
     final RMSNorm so the full ``blocks`` computation is covered.
     """
 
-    def __init__(self, block, rope_cos=None, rope_sin=None, norm_final=None,
-                 rpb_bias=None):
+    def __init__(self, block, rope_cos, rope_sin, norm_final=None):
         super().__init__()
         self.block = block
-        if rope_cos is not None:
-            self.register_buffer("rope_cos", rope_cos)
-        else:
-            self.rope_cos = None
-        if rope_sin is not None:
-            self.register_buffer("rope_sin", rope_sin)
-        else:
-            self.rope_sin = None
+        self.register_buffer("rope_cos", rope_cos)
+        self.register_buffer("rope_sin", rope_sin)
         self.norm_final = norm_final
-        if rpb_bias is not None:
-            self.register_buffer("rpb_bias", rpb_bias)
-        else:
-            self.rpb_bias = None
         self._export_input_names = BLOCKS_INPUT_NAMES
         self._export_output_names = BLOCKS_OUTPUT_NAMES
 
     def forward(self, x):
-        if self.rope_cos is not None:
-            x = self.block(x, self.rope_cos, self.rope_sin, attn_bias=self.rpb_bias)
-        else:
-            x = self.block(x, attn_bias=self.rpb_bias)
+        x = self.block(x, self.rope_cos, self.rope_sin)
         if self.norm_final is not None:
             x = self.norm_final(x)
         return (x.float(),)
 
-
-def _expand_d4_convolutions(model):
-    """Replace all D4Conv2d modules with standard Conv2d for export."""
-    from model import D4Conv2d
-    for name, module in list(model.named_modules()):
-        if isinstance(module, D4Conv2d):
-            parts = name.rsplit('.', 1)
-            parent = model if len(parts) == 1 else dict(model.named_modules())[parts[0]]
-            attr = parts[-1] if len(parts) == 2 else parts[0]
-            setattr(parent, attr, module.to_conv2d())
 
 
 class ExportWrapper(nn.Module):
@@ -601,7 +577,7 @@ def _export_legacy(args, state, config):
     opset_version = DEFAULT_ONNX_OPSET if args.opset is None else args.opset
     output_names = _output_names(args.export_scope)
     wrapper = ExportWrapper(model, args.export_scope).eval()
-    _expand_d4_convolutions(wrapper.model)
+
     export_inputs, verify_input0, verify_input1 = _resolve_export_inputs(
         model, args.export_scope, input_spatial, input_global
     )
@@ -662,7 +638,7 @@ def _export_te_official(args, state, config):
     )
     output_names = _output_names(args.export_scope)
     wrapper = ExportWrapper(model, args.export_scope).eval()
-    _expand_d4_convolutions(wrapper.model)
+
     output_path = _resolve_output_path(args)
     export_inputs, verify_input0, verify_input1 = _resolve_export_inputs(
         model, args.export_scope, input_spatial, input_global
@@ -744,7 +720,7 @@ def _export_te_decomposed(args, state, config):
     )
     output_names = _output_names(args.export_scope)
     wrapper = ExportWrapper(model, args.export_scope).eval()
-    _expand_d4_convolutions(wrapper.model)
+
     output_path = _resolve_output_path(args)
     export_inputs, verify_input0, verify_input1 = _resolve_export_inputs(
         model, args.export_scope, input_spatial, input_global
@@ -814,7 +790,7 @@ def export_per_block(args):
     _validate_te_load_result(load_result)
     model.eval()
     model.to(device)
-    _expand_d4_convolutions(model)
+
     _print_param_count(model)
 
     batch_size = 1
@@ -858,21 +834,14 @@ def export_per_block(args):
 
     x = input_stem
     block_paths = []
-    use_rpb = getattr(model, "use_rpb", False)
-    use_rope = getattr(model, "use_rope", True)
     for i in range(num_blocks):
         is_last = (i == num_blocks - 1)
 
-        rpb_bias = None
-        if use_rpb:
-            rpb_bias = model.rpb_tables[i][:, model.rpb_index_map].unsqueeze(0)  # (1, H, L, L)
-
         wrapper = SingleBlockExportWrapper(
             model.blocks[i],
-            rope_cos=model.rope_cos if use_rope else None,
-            rope_sin=model.rope_sin if use_rope else None,
+            rope_cos=model.rope_cos,
+            rope_sin=model.rope_sin,
             norm_final=model.norm_final if is_last else None,
-            rpb_bias=rpb_bias,
         )
         wrapper.eval()
 
@@ -895,11 +864,7 @@ def export_per_block(args):
         # Compute this block's output (raw, without norm_final / .float())
         # to use as the next block's input.
         with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
-            rpb_arg = rpb_bias.to(x.dtype) if rpb_bias is not None else None
-            if use_rope:
-                x = model.blocks[i](x, model.rope_cos, model.rope_sin, attn_bias=rpb_arg)
-            else:
-                x = model.blocks[i](x, attn_bias=rpb_arg)
+            x = model.blocks[i](x, model.rope_cos, model.rope_sin)
 
         block_paths.append(block_path)
 
@@ -932,7 +897,7 @@ def _export_fp8_manual(args, state, config):
     model = Model(config, args.pos_len, score_mode=args.score_mode)
     model.load_state_dict(model_state)
     model.eval()
-    _expand_d4_convolutions(model)
+
 
     # Replace transformer-block Linear layers with FP8Linear.
     print("Converting transformer block Linear layers to FP8Linear ...")

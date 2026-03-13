@@ -21,19 +21,14 @@ from functools import partial
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import transformer_engine.pytorch as te
 
 from configs import get_num_bin_input_features, get_num_global_input_features
 from model import (
-    D4Conv2d,
     EXTRA_SCORE_DISTR_RADIUS,
-    GABTemplateMLP,
     RMSNormFP32,
     SoftPlusWithGradientFloor,
     apply_rotary_emb,
-    build_edge_index_map,
-    build_rpb_index_map,
     cross_entropy,
     precompute_freqs_cos_sin_2d,
     PolicyHead,
@@ -67,19 +62,12 @@ class TransformerBlockTE(nn.Module):
             attn_input_format="bshd",
         )
 
-    def forward(self, x, rope=None, core_attention_bias=None):
+    def forward(self, x, rope):
         """
         x: (N, L, C)
-        rope: (L, 1, 1, dim_half) raw RoPE embeddings for TE (None when using RPB)
-        core_attention_bias: (B, H, L, L) attention bias — RPB, GAB, or both (additive)
+        rope: (L, 1, 1, dim_half) raw RoPE embeddings for TE
         """
-        kwargs = {}
-        if rope is not None:
-            kwargs["rotary_pos_emb"] = rope
-        if core_attention_bias is not None:
-            kwargs["core_attention_bias_type"] = "post_scale_bias"
-            kwargs["core_attention_bias"] = core_attention_bias
-        return self.layer(x, **kwargs)
+        return self.layer(x, rotary_pos_emb=rope)
 
 
 class TransformerBlockTEDecomposed(nn.Module):
@@ -113,21 +101,13 @@ class TransformerBlockTEDecomposed(nn.Module):
             activation="swiglu",
         )
 
-    def forward(self, x, rope_cos=None, rope_sin=None, attn_bias=None):
+    def forward(self, x, rope_cos, rope_sin):
         batch_size, seq_len, _ = x.shape
         residual = x
         qkv = self.ln_qkv(x).view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
-        if rope_cos is not None:
-            q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
-        if attn_bias is not None:
-            x = residual + self.proj(self.attention(
-                q, k, v,
-                core_attention_bias_type="post_scale_bias",
-                core_attention_bias=attn_bias,
-            ))
-        else:
-            x = residual + self.proj(self.attention(q, k, v))
+        q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
+        x = residual + self.proj(self.attention(q, k, v))
         return x + self.ln_mlp(x)
 
 
@@ -140,40 +120,6 @@ def _replace_nn_linear_with_te(module):
             ))
         else:
             _replace_nn_linear_with_te(child)
-
-
-def _rms_norm_fp32(x, weight, eps=1e-6):
-    """Functional RMSNorm in FP32, matching RMSNormFP32 / TE RMSNorm behavior."""
-    with torch.amp.autocast(x.device.type, enabled=False):
-        x_f = x.float()
-        return (x_f * torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + eps) * weight.float()).to(x.dtype)
-
-
-class GABMixer(nn.Module):
-    """Per-layer GAB mixing: projects normalized tokens to per-head template mixing weights.
-
-    Weight-compatible with model.py TransformerBlock.gab_* parameters via
-    checkpoint conversion (blocks.X.gab_* <-> gab_mixers.X.gab_*).
-    """
-    def __init__(self, c_main, num_heads, gab_num_templates, gab_d1=16, gab_d2=16):
-        super().__init__()
-        self.num_heads = num_heads
-        self.gab_num_templates = gab_num_templates
-        self.gab_proj1 = nn.Linear(c_main, gab_d1, bias=False)
-        self.gab_proj2 = nn.Linear(gab_d1, gab_d2, bias=False)
-        self.gab_norm1 = nn.LayerNorm(gab_d2)
-        self.gab_proj3 = nn.Linear(gab_d2, num_heads * gab_num_templates, bias=False)
-        self.gab_norm2 = nn.LayerNorm(num_heads * gab_num_templates)
-
-    def forward(self, x_norm, gab_templates):
-        B = x_norm.shape[0]
-        pooled = self.gab_proj1(x_norm).mean(dim=1)       # (B, d1)
-        z = F.gelu(self.gab_proj2(pooled))                 # (B, d2)
-        z = self.gab_norm1(z)
-        z = F.gelu(self.gab_proj3(z))                      # (B, H*T)
-        z = self.gab_norm2(z)
-        z = z.view(B, self.num_heads, self.gab_num_templates)  # (B, H, T)
-        return torch.einsum("bhd,std->bhst", z, gab_templates)
 
 
 # ---------------------------------------------------------------------------
@@ -195,70 +141,17 @@ class Model(nn.Module):
 
         # Stem
         self.stem = config.get("stem", "cnn3")
-        self.stem_d4 = config.get("stem_d4", False)
-        self.ape = config.get("ape", "none")
-        self.rpe = config.get("rpe", "rope")
-        self.use_rpb = self.rpe in ("rpb", "rope+rpb")
-        self.use_rope = self.rpe in ("rope", "rope+rpb")
         kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5}[self.stem]
-        if self.stem_d4 and kernel_size > 1:
-            self.conv_spatial = D4Conv2d(num_bin_features, self.c_trunk,
-                                          kernel_size=kernel_size, padding="same")
-        else:
-            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
-                                          kernel_size=kernel_size, padding="same", bias=False)
-        if self.ape == "d4":
-            half = (pos_len - 1) // 2
-            num_edge_positions = (half + 1) * (half + 2) // 2
-            self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
-            self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
-        elif self.ape == "per_pos":
-            self.pos_embed = nn.Embedding(pos_len * pos_len, self.c_trunk)
+        self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
+                                      kernel_size=kernel_size, padding="same", bias=False)
         # Non-FP8: use te.Linear for fused kernels; FP8: nn.Linear (dims not FP8-aligned)
         Linear = nn.Linear if use_fp8 else te.Linear
         self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
 
-        # Stem normalization: per-component RMSNorm before summing
-        self.stem_norm = config.get("stem_norm", False)
-        if self.stem_norm:
-            self.norm_spatial = RMSNormFP32(self.c_trunk, eps=1e-6)
-            self.norm_global = RMSNormFP32(self.c_trunk, eps=1e-6)
-            if self.ape in ("d4", "per_pos"):
-                self.norm_ape = RMSNormFP32(self.c_trunk, eps=1e-6)
-
-        # RPE: RPB parameters
-        if self.use_rpb:
-            num_rpb_classes = pos_len * (pos_len + 1) // 2  # 190 for 19x19
-            self.register_buffer("rpb_index_map", build_rpb_index_map(pos_len), persistent=False)
-            self.rpb_tables = nn.ParameterList([
-                nn.Parameter(torch.zeros(num_heads, num_rpb_classes))
-                for _ in range(config["num_layers"])
-            ])
-
-        # RPE: precompute RoPE embeddings (rotate_half)
-        if self.use_rope:
-            emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)  # (L, 1, 1, dim_half)
-            emb_full = torch.cat([emb, emb], dim=-1)              # (L, 1, 1, dim)
-            self.register_buffer("rope", emb_full, persistent=False)
-
-        # GAB: shared template MLP + per-layer mixers
-        self.use_gab = config.get("use_gab", False)
-        if self.use_gab:
-            self.gab_template_mlp = GABTemplateMLP(
-                num_templates=config.get("gab_num_templates", 16),
-                num_fourier_features=config.get("gab_num_fourier_features", 8),
-                mlp_hidden=config.get("gab_mlp_hidden", 64),
-                pos_len=pos_len,
-            )
-            self.gab_mixers = nn.ModuleList([
-                GABMixer(
-                    self.c_trunk, num_heads,
-                    config.get("gab_num_templates", 16),
-                    config.get("gab_d1", 16),
-                    config.get("gab_d2", 16),
-                )
-                for _ in range(config["num_layers"])
-            ])
+        # Precompute RoPE embeddings (rotate_half)
+        emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)  # (L, 1, 1, dim_half)
+        emb_full = torch.cat([emb, emb], dim=-1)              # (L, 1, 1, dim)
+        self.register_buffer("rope", emb_full, persistent=False)
 
         # Transformer blocks
         BlockClass = TransformerBlockTE
@@ -286,37 +179,19 @@ class Model(nn.Module):
         self.moving_unowned_proportion_weight = 0.0
 
     def _run_trunk_impl(self, x):
-        gab_templates = self.gab_template_mlp() if self.use_gab else None
-
-        for i, block in enumerate(self.blocks):
-            # GAB bias: use block's internal norm weight to compute x_norm
-            attn_bias = None
-            if self.use_gab:
-                norm_weight = block.layer.self_attention.layernorm_qkv.layer_norm_weight
-                x_norm = _rms_norm_fp32(x, norm_weight)
-                attn_bias = self.gab_mixers[i](x_norm, gab_templates)
-
-            if self.use_rpb:
-                rpb = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0).to(x.dtype)
-                attn_bias = rpb if attn_bias is None else rpb + attn_bias
-
-            if self.use_rope:
-                x = block(x, rope=self.rope, core_attention_bias=attn_bias)
-            else:
-                x = block(x, core_attention_bias=attn_bias)
-
+        for block in self.blocks:
+            x = block(x, rope=self.rope)
         return self.norm_final(x)
 
     @torch._dynamo.disable
     def _run_trunk_no_compile(self, x):
         return self._run_trunk_impl(x)
 
-    def initialize(self, init_std=0.02, stem_init_aligned=False):
+    def initialize(self, init_std=0.02):
         """Weight initialization using TE-native init_method.
 
         All Linear/Conv layers use fixed init_std.
         Output layers additionally scale by 1/sqrt(2*num_blocks).
-        When stem_init_aligned=True: override stem weights so output std ≈ init_std.
         """
         num_blocks = len(self.blocks)
 
@@ -340,10 +215,7 @@ class Model(nn.Module):
         ])
 
         # Stem
-        if isinstance(self.conv_spatial, D4Conv2d):
-            init_fn(self.conv_spatial.theta)
-        else:
-            init_fn(self.conv_spatial.weight)
+        init_fn(self.conv_spatial.weight)
         init_fn(self.linear_global.weight)
 
         # Heads (nn.Linear from model.py, all bias=False)
@@ -351,61 +223,6 @@ class Model(nn.Module):
             for p in m.parameters():
                 if p.dim() >= 2:
                     init_fn(p)
-
-        # APE embedding
-        if self.ape in ("d4", "per_pos"):
-            nn.init.normal_(self.pos_embed.weight, mean=0.0, std=init_std)
-        # RPB
-        if self.use_rpb:
-            for table in self.rpb_tables:
-                nn.init.zeros_(table)
-        # GAB
-        if self.use_gab:
-            init_fn(self.gab_template_mlp.linear1.weight)
-            nn.init.zeros_(self.gab_template_mlp.linear1.bias)
-            init_fn(self.gab_template_mlp.linear2.weight)
-            nn.init.zeros_(self.gab_template_mlp.linear2.bias)
-            num_ff = self.config.get("gab_num_fourier_features", 8)
-            with torch.no_grad():
-                self.gab_template_mlp.gab_freqs.copy_(
-                    torch.exp(torch.linspace(math.log(1.0), math.log(1.0 / 50.0), num_ff))
-                )
-            for mixer in self.gab_mixers:
-                for name, p in mixer.named_parameters():
-                    if p.dim() >= 2:
-                        init_fn(p)
-                    elif "norm" not in name:
-                        nn.init.zeros_(p)
-
-        if stem_init_aligned:
-            # Override stem weights so output std ≈ init_std (matching APE)
-            if isinstance(self.conv_spatial, D4Conv2d):
-                effective_fan_in = self.conv_spatial.in_channels * self.conv_spatial.kernel_size ** 2
-                nn.init.normal_(self.conv_spatial.theta, mean=0.0,
-                                std=init_std / math.sqrt(effective_fan_in))
-            else:
-                fan_in_spatial = self.conv_spatial.weight[0].numel()
-                nn.init.normal_(self.conv_spatial.weight, mean=0.0,
-                                std=init_std / math.sqrt(fan_in_spatial))
-            fan_in_global = self.linear_global.weight.shape[1]
-            nn.init.normal_(self.linear_global.weight, mean=0.0,
-                            std=init_std / math.sqrt(fan_in_global))
-
-    @torch.no_grad()
-    def compute_stem_norms(self, input_spatial, input_global):
-        """Compute per-component RMS of stem signals for diagnostics."""
-        x_spatial = self.conv_spatial(input_spatial)
-        x_global = self.linear_global(input_global)
-        norms = {
-            "spatial_rms": x_spatial.float().pow(2).mean().sqrt().item(),
-            "global_rms": x_global.float().pow(2).mean().sqrt().item(),
-        }
-        if self.ape == "d4":
-            ape = self.pos_embed(self.edge_index_map)
-            norms["ape_rms"] = ape.float().pow(2).mean().sqrt().item()
-        elif self.ape == "per_pos":
-            norms["ape_rms"] = self.pos_embed.weight.float().pow(2).mean().sqrt().item()
-        return norms
 
     def forward_trunk_for_onnx_export(self, input_spatial, input_global):
         x = self._forward_stem_impl(input_spatial, input_global)
@@ -416,19 +233,8 @@ class Model(nn.Module):
         L = self.pos_len * self.pos_len
         x_global = self.linear_global(input_global)
         x_spatial = self.conv_spatial(input_spatial)
-        if self.stem_norm:
-            x_spatial_nlc = x_spatial.view(N, self.c_trunk, L).permute(0, 2, 1)
-            x_global_nlc = x_global.unsqueeze(1).expand(-1, L, -1)
-            x = self.norm_spatial(x_spatial_nlc) + self.norm_global(x_global_nlc)
-        else:
-            x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-            x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
-        if self.ape == "d4":
-            ape = self.pos_embed(self.edge_index_map).to(dtype=x.dtype)
-            x = x + (self.norm_ape(ape) if self.stem_norm else ape)
-        elif self.ape == "per_pos":
-            ape = self.pos_embed.weight.to(dtype=x.dtype)
-            x = x + (self.norm_ape(ape) if self.stem_norm else ape)
+        x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
+        x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
         return x
 
     def forward_stem_for_onnx_export(self, input_spatial, input_global):
@@ -445,10 +251,6 @@ class Model(nn.Module):
         input_spatial: (N, C_bin, H, W)
         input_global:  (N, C_global)
         """
-        N = input_spatial.shape[0]
-        H = W = self.pos_len
-        L = H * W
-
         # Stem: NCHW -> NLC
         x = self._forward_stem_impl(input_spatial, input_global)
 
@@ -540,68 +342,17 @@ class ModelDecomposedExport(nn.Module):
         head_dim = self.c_trunk // num_heads
 
         self.stem = config.get("stem", "cnn3")
-        self.stem_d4 = config.get("stem_d4", False)
-        self.ape = config.get("ape", "none")
-        self.rpe = config.get("rpe", "rope")
-        self.use_rpb = self.rpe in ("rpb", "rope+rpb")
-        self.use_rope = self.rpe in ("rope", "rope+rpb")
         kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5}[self.stem]
-        if self.stem_d4 and kernel_size > 1:
-            self.conv_spatial = D4Conv2d(num_bin_features, self.c_trunk,
-                                          kernel_size=kernel_size, padding="same")
-        else:
-            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
-                                          kernel_size=kernel_size, padding="same", bias=False)
-        if self.ape == "d4":
-            half = (pos_len - 1) // 2
-            num_edge_positions = (half + 1) * (half + 2) // 2
-            self.register_buffer("edge_index_map", build_edge_index_map(pos_len), persistent=False)
-            self.pos_embed = nn.Embedding(num_edge_positions, self.c_trunk)
-        elif self.ape == "per_pos":
-            self.pos_embed = nn.Embedding(pos_len * pos_len, self.c_trunk)
+        self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
+                                      kernel_size=kernel_size, padding="same", bias=False)
         Linear = nn.Linear if use_fp8 else te.Linear
         self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
 
-        # Stem normalization: per-component RMSNorm before summing
-        self.stem_norm = config.get("stem_norm", False)
-        if self.stem_norm:
-            self.norm_spatial = RMSNormFP32(self.c_trunk, eps=1e-6)
-            self.norm_global = RMSNormFP32(self.c_trunk, eps=1e-6)
-            if self.ape in ("d4", "per_pos"):
-                self.norm_ape = RMSNormFP32(self.c_trunk, eps=1e-6)
-
-        if self.use_rpb:
-            num_rpb_classes = pos_len * (pos_len + 1) // 2
-            self.register_buffer("rpb_index_map", build_rpb_index_map(pos_len), persistent=False)
-            self.rpb_tables = nn.ParameterList([
-                nn.Parameter(torch.zeros(num_heads, num_rpb_classes))
-                for _ in range(config["num_layers"])
-            ])
-
-        if self.use_rope:
-            emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)
-            emb_expanded = torch.cat([emb, emb], dim=-1)
-            self.register_buffer("rope_cos", emb_expanded.cos(), persistent=False)
-            self.register_buffer("rope_sin", emb_expanded.sin(), persistent=False)
-
-        # GAB: shared template MLP + per-layer mixers
-        self.use_gab = config.get("use_gab", False)
-        if self.use_gab:
-            self.gab_template_mlp = GABTemplateMLP(
-                num_templates=config.get("gab_num_templates", 16),
-                num_fourier_features=config.get("gab_num_fourier_features", 8),
-                mlp_hidden=config.get("gab_mlp_hidden", 64),
-                pos_len=pos_len,
-            )
-            self.gab_mixers = nn.ModuleList([
-                GABMixer(
-                    self.c_trunk, num_heads,
-                    config.get("gab_num_templates", 16),
-                    config.get("gab_d1", 16),
-                    config.get("gab_d2", 16),
-                )
-                for _ in range(config["num_layers"])
-            ])
+        # Precompute RoPE embeddings (rotate_half)
+        emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)
+        emb_expanded = torch.cat([emb, emb], dim=-1)
+        self.register_buffer("rope_cos", emb_expanded.cos(), persistent=False)
+        self.register_buffer("rope_sin", emb_expanded.sin(), persistent=False)
 
         self.blocks = nn.ModuleList([
             TransformerBlockTEDecomposed(
@@ -624,25 +375,8 @@ class ModelDecomposedExport(nn.Module):
         self.moving_unowned_proportion_weight = 0.0
 
     def _run_trunk_impl(self, x):
-        gab_templates = self.gab_template_mlp() if self.use_gab else None
-
-        for i, block in enumerate(self.blocks):
-            # GAB bias: use block's internal norm weight to compute x_norm
-            attn_bias = None
-            if self.use_gab:
-                norm_weight = block.ln_qkv.layer_norm_weight
-                x_norm = _rms_norm_fp32(x, norm_weight)
-                attn_bias = self.gab_mixers[i](x_norm, gab_templates)
-
-            if self.use_rpb:
-                rpb = self.rpb_tables[i][:, self.rpb_index_map].unsqueeze(0).to(x.dtype)
-                attn_bias = rpb if attn_bias is None else rpb + attn_bias
-
-            if self.use_rope:
-                x = block(x, self.rope_cos, self.rope_sin, attn_bias=attn_bias)
-            else:
-                x = block(x, attn_bias=attn_bias)
-
+        for block in self.blocks:
+            x = block(x, self.rope_cos, self.rope_sin)
         return self.norm_final(x)
 
     def _forward_stem_impl(self, input_spatial, input_global):
@@ -650,19 +384,8 @@ class ModelDecomposedExport(nn.Module):
         seq_len = self.pos_len * self.pos_len
         x_global = self.linear_global(input_global)
         x_spatial = self.conv_spatial(input_spatial)
-        if self.stem_norm:
-            x_spatial_nlc = x_spatial.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
-            x_global_nlc = x_global.unsqueeze(1).expand(-1, seq_len, -1)
-            x = self.norm_spatial(x_spatial_nlc) + self.norm_global(x_global_nlc)
-        else:
-            x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
-            x = x.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
-        if self.ape == "d4":
-            ape = self.pos_embed(self.edge_index_map).to(dtype=x.dtype)
-            x = x + (self.norm_ape(ape) if self.stem_norm else ape)
-        elif self.ape == "per_pos":
-            ape = self.pos_embed.weight.to(dtype=x.dtype)
-            x = x + (self.norm_ape(ape) if self.stem_norm else ape)
+        x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
+        x = x.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
         return x
 
     def forward_stem_for_onnx_export(self, input_spatial, input_global):
@@ -711,10 +434,6 @@ def convert_checkpoint_model_to_te(state_dict):
     """Convert model.py state_dict to TE (te.TransformerLayer) format."""
     new_sd = {}
     for key, value in state_dict.items():
-        # GAB per-layer keys: blocks.X.gab_* → gab_mixers.X.gab_*
-        if key.startswith("blocks.") and ".gab_" in key:
-            new_sd[key.replace("blocks.", "gab_mixers.", 1)] = value
-            continue
         if ".ffn_w1.weight" in key:
             block_prefix = key.rsplit(".ffn_w1.weight", 1)[0]
             wgate_key = block_prefix + ".ffn_wgate.weight"
@@ -756,10 +475,6 @@ def convert_checkpoint_model_to_te_decomposed(state_dict):
     """Convert model.py state_dict to the export-only decomposed TE format."""
     new_sd = {}
     for key, value in state_dict.items():
-        # GAB per-layer keys: blocks.X.gab_* → gab_mixers.X.gab_*
-        if key.startswith("blocks.") and ".gab_" in key:
-            new_sd[key.replace("blocks.", "gab_mixers.", 1)] = value
-            continue
         if ".ffn_w1.weight" in key:
             block_prefix = key.rsplit(".ffn_w1.weight", 1)[0]
             wgate_key = block_prefix + ".ffn_wgate.weight"
@@ -805,10 +520,6 @@ def convert_checkpoint_te_to_model(state_dict):
     new_sd = {}
     for key, value in state_dict.items():
         if "_extra_state" in key:
-            continue
-        # GAB per-layer keys: gab_mixers.X.gab_* → blocks.X.gab_*
-        if key.startswith("gab_mixers."):
-            new_sd[key.replace("gab_mixers.", "blocks.", 1)] = value
             continue
         if ".layer.layernorm_mlp.fc1_weight" in key:
             block_prefix = key.rsplit(".layer.layernorm_mlp.fc1_weight", 1)[0]

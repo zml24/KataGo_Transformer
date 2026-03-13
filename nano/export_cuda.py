@@ -9,7 +9,7 @@ import struct
 import torch
 
 from configs import get_num_bin_input_features, get_num_global_input_features, migrate_config
-from model import Model, build_edge_index_map
+from model import Model
 
 
 MAGIC = b"KGTRN001"
@@ -105,19 +105,8 @@ def _make_model(checkpoint_path, pos_len, score_mode, use_ema):
 
     if config.get("version") != 15:
         raise RuntimeError("原生 CUDA 导出当前只支持 version=15")
-    if config.get("rpe", "rope") != "rope":
-        raise RuntimeError("原生 CUDA 导出当前只支持 rpe=rope")
-    if config.get("use_gab", False):
-        raise RuntimeError("原生 CUDA 导出当前不支持 GAB")
-    if config.get("stem_d4", False):
-        raise RuntimeError("原生 CUDA 导出当前不支持 stem_d4")
-    if config.get("stem_norm", False):
-        raise RuntimeError("原生 CUDA 导出当前不支持 stem_norm")
     if config.get("stem", "cnn3") not in {"cnn1", "cnn3", "cnn5"}:
         raise RuntimeError("原生 CUDA 导出当前只支持 stem=cnn1/cnn3/cnn5")
-    if config.get("ape", "none") not in {"none", "per_pos", "d4"}:
-        raise RuntimeError("原生 CUDA 导出当前只支持 ape=none/per_pos/d4")
-
     model = Model(config, pos_len=pos_len, score_mode=score_mode)
     model_state = _resolve_model_state(state, use_ema)
     if _looks_like_te_checkpoint(model_state):
@@ -126,17 +115,6 @@ def _make_model(checkpoint_path, pos_len, score_mode, use_ema):
     model.load_state_dict(model_state, strict=True)
     model.eval()
     return model, config
-
-
-def _full_pos_embed(model):
-    if model.ape == "none":
-        return None
-    if model.ape == "per_pos":
-        return model.pos_embed.weight
-    if model.ape == "d4":
-        index_map = build_edge_index_map(model.pos_len)
-        return model.pos_embed(index_map)
-    raise RuntimeError(f"不支持的 ape: {model.ape}")
 
 
 def _transpose_linear(weight):
@@ -201,10 +179,6 @@ def _collect_tensors(model):
     tensors = []
     tensors.append(("stem.conv.weight", model.conv_spatial.weight.detach().cpu().float().contiguous()))
     tensors.append(("stem.global.weight", _transpose_linear(model.linear_global.weight)))
-
-    pos_embed = _full_pos_embed(model)
-    if pos_embed is not None:
-        tensors.append(("stem.pos_embed", pos_embed.detach().cpu().float().contiguous()))
 
     rope_cos = model.rope_cos.squeeze(1).squeeze(1).detach().cpu().float().contiguous()
     rope_sin = model.rope_sin.squeeze(1).squeeze(1).detach().cpu().float().contiguous()
@@ -277,7 +251,7 @@ def export_checkpoint(checkpoint, output, pos_len, score_mode, use_ema):
         _write_i32(out, get_num_bin_input_features(config))
         _write_i32(out, get_num_global_input_features(config))
         _write_i32(out, {"cnn1": 1, "cnn3": 3, "cnn5": 5}[model.stem])
-        _write_i32(out, 0 if model.ape == "none" else 1)
+        _write_i32(out, 0)  # APE flag (always disabled)
         _write_i32(out, _score_mode_id(model.value_head.score_mode))
         _write_i32(out, model.value_head.num_scorebeliefs)
         _write_i32(out, model.value_head.scorebelief_len)
