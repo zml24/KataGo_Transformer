@@ -571,7 +571,7 @@ def main(rank, world_size, args, gpu_id):
             if step < warmup_steps:
                 return (step + 1) / warmup_steps
             progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-            return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
 
         if global_step > 0:
             for pg in inner_optimizer.param_groups:
