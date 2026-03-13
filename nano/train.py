@@ -412,36 +412,42 @@ def main(rank, world_size, args, gpu_id):
 
     num_heads = model_config["num_heads"]
 
-    # HZY step-function LR/WD schedule (from lr_schedule.xlsx)
+    # LR/WD schedule
     grad_accum_steps = args.grad_accum_steps
     samples_per_step = batch_size * world_size * grad_accum_steps
+    use_hzy_schedule = (args.lr_schedule == "hzy")
 
-    _LR_WD_SCHEDULE = [
-        (0,           1.131371e-4, 0.377124),
-        (5_000_000,   3.200000e-4, 1.066667),
-        (100_000_000, 2.262742e-4, 0.754247),
-        (200_000_000, 1.600000e-4, 0.533333),
-        (300_000_000, 1.131371e-4, 0.377124),
-        (400_000_000, 8.000000e-5, 0.266667),
-        (500_000_000, 5.656854e-5, 0.188562),
-        (550_000_000, 4.000000e-5, 0.133333),
-        (600_000_000, 2.828427e-5, 0.094281),
-        (650_000_000, 2.000000e-5, 0.066667),
-        (675_000_000, 1.414214e-5, 0.047140),
-    ]
+    if use_hzy_schedule:
+        # HZY step-function LR/WD schedule (from lr_schedule.xlsx)
+        _LR_WD_SCHEDULE = [
+            (0,           1.131371e-4, 0.377124),
+            (5_000_000,   3.200000e-4, 1.066667),
+            (100_000_000, 2.262742e-4, 0.754247),
+            (200_000_000, 1.600000e-4, 0.533333),
+            (300_000_000, 1.131371e-4, 0.377124),
+            (400_000_000, 8.000000e-5, 0.266667),
+            (500_000_000, 5.656854e-5, 0.188562),
+            (550_000_000, 4.000000e-5, 0.133333),
+            (600_000_000, 2.828427e-5, 0.094281),
+            (650_000_000, 2.000000e-5, 0.066667),
+            (675_000_000, 1.414214e-5, 0.047140),
+        ]
 
-    def get_lr_wd(total_samples):
-        lr, wd = _LR_WD_SCHEDULE[0][1], _LR_WD_SCHEDULE[0][2]
-        for s, lr_s, wd_s in _LR_WD_SCHEDULE:
-            if total_samples >= s:
-                lr, wd = lr_s, wd_s
-            else:
-                break
-        return lr, wd
+        def get_lr_wd(total_samples):
+            lr, wd = _LR_WD_SCHEDULE[0][1], _LR_WD_SCHEDULE[0][2]
+            for s, lr_s, wd_s in _LR_WD_SCHEDULE:
+                if total_samples >= s:
+                    lr, wd = lr_s, wd_s
+                else:
+                    break
+            return lr, wd
 
-    base_lr, base_wd = get_lr_wd(total_samples_trained)
-    logging.info(f"HZY LR/WD schedule: {len(_LR_WD_SCHEDULE)} stages, "
-                 f"current lr={base_lr:.2e}, wd={base_wd:.4f} at {total_samples_trained} samples")
+        base_lr, base_wd = get_lr_wd(total_samples_trained)
+        logging.info(f"HZY LR/WD schedule: {len(_LR_WD_SCHEDULE)} stages, "
+                     f"current lr={base_lr:.2e}, wd={base_wd:.4f} at {total_samples_trained} samples")
+    else:
+        base_lr = args.lr
+        base_wd = args.wd
 
     # Optimizers: ZeRO Stage 1 when multi-GPU, plain otherwise
     if world_size > 1:
@@ -545,6 +551,33 @@ def main(rank, world_size, args, gpu_id):
         )
     else:
         grad_reducer = None
+
+    # Cosine LR schedule (when not using HZY)
+    scheduler = None
+    if not use_hzy_schedule:
+        warmup_steps = args.warmup_samples // samples_per_step
+        total_steps = args.max_training_samples // samples_per_step
+
+        if global_step > 0:
+            saved_sps = state.get("samples_per_step")
+            if saved_sps is not None and saved_sps != samples_per_step:
+                logging.warning(
+                    f"samples_per_step changed: {saved_sps} -> {samples_per_step} "
+                    f"(batch_size*world_size*grad_accum_steps). "
+                    f"LR schedule may have a discontinuity."
+                )
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return (step + 1) / warmup_steps
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        if global_step > 0:
+            for pg in inner_optimizer.param_groups:
+                pg["lr"] = args.lr
+                pg["initial_lr"] = args.lr
+        scheduler = torch.optim.lr_scheduler.LambdaLR(inner_optimizer, lr_lambda, last_epoch=global_step - 1 if global_step > 0 else -1)
 
     # Data directories
     train_dir = os.path.join(args.datadir, "train")
@@ -868,17 +901,18 @@ def main(rank, world_size, args, gpu_id):
                     skip_step = found_inf.item() > 0.0
                     profiler.tick("unscale")
 
-                # Update LR/WD from step-function schedule
-                base_lr, base_wd = get_lr_wd(total_samples_trained)
-                for pg in inner_optimizer.param_groups:
-                    pg["lr"] = base_lr
-                    if pg.get("weight_decay", 0) > 0:
-                        pg["weight_decay"] = base_wd
-                for opt in [muon_opt, shampoo_opt]:
-                    if opt is not None:
-                        inner = getattr(opt, '_local_opt', opt)
-                        if inner is not None:
-                            inner.wd = base_wd
+                # Update LR/WD schedule
+                if use_hzy_schedule:
+                    base_lr, base_wd = get_lr_wd(total_samples_trained)
+                    for pg in inner_optimizer.param_groups:
+                        pg["lr"] = base_lr
+                        if pg.get("weight_decay", 0) > 0:
+                            pg["weight_decay"] = base_wd
+                    for opt in [muon_opt, shampoo_opt]:
+                        if opt is not None:
+                            inner = getattr(opt, '_local_opt', opt)
+                            if inner is not None:
+                                inner.wd = base_wd
 
                 if skip_step:
                     logging.warning(
@@ -889,6 +923,9 @@ def main(rank, world_size, args, gpu_id):
                         p.grad = None
                     grad_norm = 0.0
                     grad_scaler.update(found_inf=True)
+                    if scheduler is not None:
+                        scheduler.step()
+                        base_lr = scheduler.get_last_lr()[0]
                 else:
                     # Gradient clipping + optimizer step
                     if dp_zero:
@@ -917,6 +954,9 @@ def main(rank, world_size, args, gpu_id):
                         zero_adam.step(sync=False)
                     else:
                         inner_optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
+                        base_lr = scheduler.get_last_lr()[0]
 
                     # Muon / Shampoo update (use same LR as AdamW for this step)
                     if muon_opt is not None:
@@ -1070,8 +1110,10 @@ if __name__ == "__main__":
     parser.add_argument("--num-layers", type=int, default=None, help="Number of transformer layers (overrides --model-kind)")
     parser.add_argument("--hidden-size", type=int, default=192, help="Hidden dimension")
     parser.add_argument("--num-heads", type=int, default=6, help="Number of attention heads")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate")
-    parser.add_argument("--wd", type=float, default=0.1, help="Weight decay")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate (cosine schedule)")
+    parser.add_argument("--wd", type=float, default=0.1, help="Weight decay (cosine schedule)")
+    parser.add_argument("--lr-schedule", type=str, default="cosine", choices=["cosine", "hzy"],
+                        help="LR schedule: cosine (warmup+cosine decay) or hzy (step-function from lr_schedule.xlsx)")
     parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "muon", "shampoo"],
                         help="Optimizer: adam (pure AdamW), muon (Muon for blocks + AdamW), shampoo (Shampoo for blocks + AdamW)")
     parser.add_argument("--shampoo-lr-multiplier", type=float, default=2.0, help="Shampoo LR multiplier over base lr")
