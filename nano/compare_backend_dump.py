@@ -205,55 +205,116 @@ def _max_abs_err(lhs, rhs):
     return max(abs(float(a) - float(b)) for a, b in zip(lhs, rhs))
 
 
+def _new_diff_stats():
+    return {
+        "count": 0,
+        "sumAbs": 0.0,
+        "sum": 0.0,
+        "maxAbs": 0.0,
+    }
+
+
+def _update_diff_stats(stats, diff):
+    diff = float(diff)
+    abs_diff = abs(diff)
+    stats["count"] += 1
+    stats["sumAbs"] += abs_diff
+    stats["sum"] += diff
+    stats["maxAbs"] = max(stats["maxAbs"], abs_diff)
+
+
+def _compare_scalar(lhs, rhs, stats):
+    diff = float(lhs) - float(rhs)
+    _update_diff_stats(stats, diff)
+    return abs(diff)
+
+
+def _compare_list(lhs, rhs, stats):
+    if len(lhs) != len(rhs):
+        raise ValueError(f"length mismatch: {len(lhs)} vs {len(rhs)}")
+    max_abs = 0.0
+    for a, b in zip(lhs, rhs):
+        diff = float(a) - float(b)
+        _update_diff_stats(stats, diff)
+        max_abs = max(max_abs, abs(diff))
+    return max_abs
+
+
+def _finalize_diff_stats(stats):
+    count = int(stats["count"])
+    if count <= 0:
+        return {
+            "numComparedValues": 0,
+            "maxAbsErr": 0.0,
+            "meanAbsErr": 0.0,
+            "meanDiff": 0.0,
+        }
+    return {
+        "numComparedValues": count,
+        "maxAbsErr": float(stats["maxAbs"]),
+        "meanAbsErr": float(stats["sumAbs"] / count),
+        "meanDiff": float(stats["sum"] / count),
+    }
+
+
+def _merge_diff_stats(dst, src):
+    dst["count"] += src["count"]
+    dst["sumAbs"] += src["sumAbs"]
+    dst["sum"] += src["sum"]
+    dst["maxAbs"] = max(dst["maxAbs"], src["maxAbs"])
+
+
 def _compare_sample(sample_name, backend_sample, torch_sample):
+    stats = _new_diff_stats()
     report = {
         "name": sample_name,
         "raw": {
-            "policy": _max_abs_err(backend_sample["raw"]["policy"], torch_sample["raw"]["policy"]),
-            "policyPass": _max_abs_err(backend_sample["raw"]["policyPass"], torch_sample["raw"]["policyPass"]),
-            "value": _max_abs_err(backend_sample["raw"]["value"], torch_sample["raw"]["value"]),
-            "scoreValue": _max_abs_err(backend_sample["raw"]["scoreValue"], torch_sample["raw"]["scoreValue"]),
-            "ownership": _max_abs_err(backend_sample["raw"]["ownership"], torch_sample["raw"]["ownership"]),
+            "policy": _compare_list(backend_sample["raw"]["policy"], torch_sample["raw"]["policy"], stats),
+            "policyPass": _compare_list(backend_sample["raw"]["policyPass"], torch_sample["raw"]["policyPass"], stats),
+            "value": _compare_list(backend_sample["raw"]["value"], torch_sample["raw"]["value"], stats),
+            "scoreValue": _compare_list(backend_sample["raw"]["scoreValue"], torch_sample["raw"]["scoreValue"], stats),
+            "ownership": _compare_list(backend_sample["raw"]["ownership"], torch_sample["raw"]["ownership"], stats),
         },
         "nnOutput": {
-            "policyProbs": _max_abs_err(backend_sample["nnOutput"]["policyProbs"], torch_sample["nnOutput"]["policyProbs"]),
-            "whiteOwnerMap": _max_abs_err(backend_sample["nnOutput"]["whiteOwnerMap"], torch_sample["nnOutput"]["whiteOwnerMap"]),
-            "whiteWinProb": abs(float(backend_sample["nnOutput"]["whiteWinProb"]) - float(torch_sample["nnOutput"]["whiteWinProb"])),
-            "whiteLossProb": abs(float(backend_sample["nnOutput"]["whiteLossProb"]) - float(torch_sample["nnOutput"]["whiteLossProb"])),
-            "whiteNoResultProb": abs(float(backend_sample["nnOutput"]["whiteNoResultProb"]) - float(torch_sample["nnOutput"]["whiteNoResultProb"])),
-            "whiteScoreMean": abs(float(backend_sample["nnOutput"]["whiteScoreMean"]) - float(torch_sample["nnOutput"]["whiteScoreMean"])),
-            "whiteScoreMeanSq": abs(float(backend_sample["nnOutput"]["whiteScoreMeanSq"]) - float(torch_sample["nnOutput"]["whiteScoreMeanSq"])),
-            "whiteLead": abs(float(backend_sample["nnOutput"]["whiteLead"]) - float(torch_sample["nnOutput"]["whiteLead"])),
-            "varTimeLeft": abs(float(backend_sample["nnOutput"]["varTimeLeft"]) - float(torch_sample["nnOutput"]["varTimeLeft"])),
-            "shorttermWinlossError": abs(float(backend_sample["nnOutput"]["shorttermWinlossError"]) - float(torch_sample["nnOutput"]["shorttermWinlossError"])),
-            "shorttermScoreError": abs(float(backend_sample["nnOutput"]["shorttermScoreError"]) - float(torch_sample["nnOutput"]["shorttermScoreError"])),
+            "policyProbs": _compare_list(backend_sample["nnOutput"]["policyProbs"], torch_sample["nnOutput"]["policyProbs"], stats),
+            "whiteOwnerMap": _compare_list(backend_sample["nnOutput"]["whiteOwnerMap"], torch_sample["nnOutput"]["whiteOwnerMap"], stats),
+            "whiteWinProb": _compare_scalar(backend_sample["nnOutput"]["whiteWinProb"], torch_sample["nnOutput"]["whiteWinProb"], stats),
+            "whiteLossProb": _compare_scalar(backend_sample["nnOutput"]["whiteLossProb"], torch_sample["nnOutput"]["whiteLossProb"], stats),
+            "whiteNoResultProb": _compare_scalar(backend_sample["nnOutput"]["whiteNoResultProb"], torch_sample["nnOutput"]["whiteNoResultProb"], stats),
+            "whiteScoreMean": _compare_scalar(backend_sample["nnOutput"]["whiteScoreMean"], torch_sample["nnOutput"]["whiteScoreMean"], stats),
+            "whiteScoreMeanSq": _compare_scalar(backend_sample["nnOutput"]["whiteScoreMeanSq"], torch_sample["nnOutput"]["whiteScoreMeanSq"], stats),
+            "whiteLead": _compare_scalar(backend_sample["nnOutput"]["whiteLead"], torch_sample["nnOutput"]["whiteLead"], stats),
+            "varTimeLeft": _compare_scalar(backend_sample["nnOutput"]["varTimeLeft"], torch_sample["nnOutput"]["varTimeLeft"], stats),
+            "shorttermWinlossError": _compare_scalar(backend_sample["nnOutput"]["shorttermWinlossError"], torch_sample["nnOutput"]["shorttermWinlossError"], stats),
+            "shorttermScoreError": _compare_scalar(backend_sample["nnOutput"]["shorttermScoreError"], torch_sample["nnOutput"]["shorttermScoreError"], stats),
         },
     }
     if "rawFull" in backend_sample and "rawFull" in torch_sample:
         report["rawFull"] = {
-            "policy": _max_abs_err(backend_sample["rawFull"]["policy"], torch_sample["rawFull"]["policy"]),
-            "policyPass": _max_abs_err(backend_sample["rawFull"]["policyPass"], torch_sample["rawFull"]["policyPass"]),
-            "value": _max_abs_err(backend_sample["rawFull"]["value"], torch_sample["rawFull"]["value"]),
-            "misc": _max_abs_err(backend_sample["rawFull"]["misc"], torch_sample["rawFull"]["misc"]),
-            "moreMisc": _max_abs_err(backend_sample["rawFull"]["moreMisc"], torch_sample["rawFull"]["moreMisc"]),
-            "ownership": _max_abs_err(backend_sample["rawFull"]["ownership"], torch_sample["rawFull"]["ownership"]),
-            "scoring": _max_abs_err(backend_sample["rawFull"]["scoring"], torch_sample["rawFull"]["scoring"]),
-            "futurePos": _max_abs_err(backend_sample["rawFull"]["futurePos"], torch_sample["rawFull"]["futurePos"]),
-            "seki": _max_abs_err(backend_sample["rawFull"]["seki"], torch_sample["rawFull"]["seki"]),
-            "scoreBelief": _max_abs_err(backend_sample["rawFull"]["scoreBelief"], torch_sample["rawFull"]["scoreBelief"]),
+            "policy": _compare_list(backend_sample["rawFull"]["policy"], torch_sample["rawFull"]["policy"], stats),
+            "policyPass": _compare_list(backend_sample["rawFull"]["policyPass"], torch_sample["rawFull"]["policyPass"], stats),
+            "value": _compare_list(backend_sample["rawFull"]["value"], torch_sample["rawFull"]["value"], stats),
+            "misc": _compare_list(backend_sample["rawFull"]["misc"], torch_sample["rawFull"]["misc"], stats),
+            "moreMisc": _compare_list(backend_sample["rawFull"]["moreMisc"], torch_sample["rawFull"]["moreMisc"], stats),
+            "ownership": _compare_list(backend_sample["rawFull"]["ownership"], torch_sample["rawFull"]["ownership"], stats),
+            "scoring": _compare_list(backend_sample["rawFull"]["scoring"], torch_sample["rawFull"]["scoring"], stats),
+            "futurePos": _compare_list(backend_sample["rawFull"]["futurePos"], torch_sample["rawFull"]["futurePos"], stats),
+            "seki": _compare_list(backend_sample["rawFull"]["seki"], torch_sample["rawFull"]["seki"], stats),
+            "scoreBelief": _compare_list(backend_sample["rawFull"]["scoreBelief"], torch_sample["rawFull"]["scoreBelief"], stats),
         }
     if "postprocess" in backend_sample and "postprocess" in torch_sample:
         report["postprocess"] = {
-            "tdValueLogits": _max_abs_err(backend_sample["postprocess"]["tdValueLogits"], torch_sample["postprocess"]["tdValueLogits"]),
-            "predTdScore": _max_abs_err(backend_sample["postprocess"]["predTdScore"], torch_sample["postprocess"]["predTdScore"]),
-            "predScoreMean": abs(float(backend_sample["postprocess"]["predScoreMean"]) - float(torch_sample["postprocess"]["predScoreMean"])),
-            "predScoreStdev": abs(float(backend_sample["postprocess"]["predScoreStdev"]) - float(torch_sample["postprocess"]["predScoreStdev"])),
-            "predLead": abs(float(backend_sample["postprocess"]["predLead"]) - float(torch_sample["postprocess"]["predLead"])),
-            "predVarianceTime": abs(float(backend_sample["postprocess"]["predVarianceTime"]) - float(torch_sample["postprocess"]["predVarianceTime"])),
-            "predShorttermValueError": abs(float(backend_sample["postprocess"]["predShorttermValueError"]) - float(torch_sample["postprocess"]["predShorttermValueError"])),
-            "predShorttermScoreError": abs(float(backend_sample["postprocess"]["predShorttermScoreError"]) - float(torch_sample["postprocess"]["predShorttermScoreError"])),
+            "tdValueLogits": _compare_list(backend_sample["postprocess"]["tdValueLogits"], torch_sample["postprocess"]["tdValueLogits"], stats),
+            "predTdScore": _compare_list(backend_sample["postprocess"]["predTdScore"], torch_sample["postprocess"]["predTdScore"], stats),
+            "predScoreMean": _compare_scalar(backend_sample["postprocess"]["predScoreMean"], torch_sample["postprocess"]["predScoreMean"], stats),
+            "predScoreStdev": _compare_scalar(backend_sample["postprocess"]["predScoreStdev"], torch_sample["postprocess"]["predScoreStdev"], stats),
+            "predLead": _compare_scalar(backend_sample["postprocess"]["predLead"], torch_sample["postprocess"]["predLead"], stats),
+            "predVarianceTime": _compare_scalar(backend_sample["postprocess"]["predVarianceTime"], torch_sample["postprocess"]["predVarianceTime"], stats),
+            "predShorttermValueError": _compare_scalar(backend_sample["postprocess"]["predShorttermValueError"], torch_sample["postprocess"]["predShorttermValueError"], stats),
+            "predShorttermScoreError": _compare_scalar(backend_sample["postprocess"]["predShorttermScoreError"], torch_sample["postprocess"]["predShorttermScoreError"], stats),
         }
-    return report
+    report["aggregate"] = _finalize_diff_stats(stats)
+    return report, stats
 
 
 def main():
@@ -299,21 +360,16 @@ def main():
             torch_samples.append(torch_sample)
 
     sample_reports = []
-    global_max = 0.0
+    global_stats = _new_diff_stats()
     for backend_sample, torch_sample in zip(backend_dump["samples"], torch_samples):
         if "rawFull" in backend_sample:
             backend_sample = dict(backend_sample)
             backend_sample["postprocess"] = _backend_postprocess_from_raw_full(backend_sample["rawFull"], postprocess_params)
-        report = _compare_sample(backend_sample["name"], backend_sample, torch_sample)
+        report, sample_stats = _compare_sample(backend_sample["name"], backend_sample, torch_sample)
         sample_reports.append(report)
-        for group in report.values():
-            if isinstance(group, dict):
-                for value in group.values():
-                    if isinstance(value, dict):
-                        for sub_value in value.values():
-                            global_max = max(global_max, float(sub_value))
-                    else:
-                        global_max = max(global_max, float(value))
+        _merge_diff_stats(global_stats, sample_stats)
+
+    aggregate = _finalize_diff_stats(global_stats)
 
     result = {
         "checkpoint": args.checkpoint,
@@ -321,7 +377,10 @@ def main():
         "modelVersion": config["version"],
         "posLen": pos_len,
         "attentionMode": args.attention_mode,
-        "maxAbsErr": global_max,
+        "maxAbsErr": aggregate["maxAbsErr"],
+        "meanAbsErr": aggregate["meanAbsErr"],
+        "meanDiff": aggregate["meanDiff"],
+        "numComparedValues": aggregate["numComparedValues"],
         "samples": sample_reports,
     }
 
