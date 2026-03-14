@@ -223,19 +223,23 @@ def _update_diff_stats(stats, diff):
     stats["maxAbs"] = max(stats["maxAbs"], abs_diff)
 
 
-def _compare_scalar(lhs, rhs, stats):
+def _compare_scalar(lhs, rhs, stats, named_stats=None):
     diff = float(lhs) - float(rhs)
     _update_diff_stats(stats, diff)
+    if named_stats is not None:
+        _update_diff_stats(named_stats, diff)
     return abs(diff)
 
 
-def _compare_list(lhs, rhs, stats):
+def _compare_list(lhs, rhs, stats, named_stats=None):
     if len(lhs) != len(rhs):
         raise ValueError(f"length mismatch: {len(lhs)} vs {len(rhs)}")
     max_abs = 0.0
     for a, b in zip(lhs, rhs):
         diff = float(a) - float(b)
         _update_diff_stats(stats, diff)
+        if named_stats is not None:
+            _update_diff_stats(named_stats, diff)
         max_abs = max(max_abs, abs(diff))
     return max_abs
 
@@ -264,57 +268,84 @@ def _merge_diff_stats(dst, src):
     dst["maxAbs"] = max(dst["maxAbs"], src["maxAbs"])
 
 
+def _ensure_field_stats(field_stats, group_name, field_name):
+    group = field_stats.setdefault(group_name, {})
+    if field_name not in group:
+        group[field_name] = _new_diff_stats()
+    return group[field_name]
+
+
+def _merge_field_stats(dst, src):
+    for group_name, group in src.items():
+        dst_group = dst.setdefault(group_name, {})
+        for field_name, stats in group.items():
+            if field_name not in dst_group:
+                dst_group[field_name] = _new_diff_stats()
+            _merge_diff_stats(dst_group[field_name], stats)
+
+
+def _finalize_field_stats(field_stats):
+    result = {}
+    for group_name, group in field_stats.items():
+        result[group_name] = {}
+        for field_name, stats in group.items():
+            result[group_name][field_name] = _finalize_diff_stats(stats)
+    return result
+
+
 def _compare_sample(sample_name, backend_sample, torch_sample):
     stats = _new_diff_stats()
+    field_stats = {}
     report = {
         "name": sample_name,
         "raw": {
-            "policy": _compare_list(backend_sample["raw"]["policy"], torch_sample["raw"]["policy"], stats),
-            "policyPass": _compare_list(backend_sample["raw"]["policyPass"], torch_sample["raw"]["policyPass"], stats),
-            "value": _compare_list(backend_sample["raw"]["value"], torch_sample["raw"]["value"], stats),
-            "scoreValue": _compare_list(backend_sample["raw"]["scoreValue"], torch_sample["raw"]["scoreValue"], stats),
-            "ownership": _compare_list(backend_sample["raw"]["ownership"], torch_sample["raw"]["ownership"], stats),
+            "policy": _compare_list(backend_sample["raw"]["policy"], torch_sample["raw"]["policy"], stats, _ensure_field_stats(field_stats, "raw", "policy")),
+            "policyPass": _compare_list(backend_sample["raw"]["policyPass"], torch_sample["raw"]["policyPass"], stats, _ensure_field_stats(field_stats, "raw", "policyPass")),
+            "value": _compare_list(backend_sample["raw"]["value"], torch_sample["raw"]["value"], stats, _ensure_field_stats(field_stats, "raw", "value")),
+            "scoreValue": _compare_list(backend_sample["raw"]["scoreValue"], torch_sample["raw"]["scoreValue"], stats, _ensure_field_stats(field_stats, "raw", "scoreValue")),
+            "ownership": _compare_list(backend_sample["raw"]["ownership"], torch_sample["raw"]["ownership"], stats, _ensure_field_stats(field_stats, "raw", "ownership")),
         },
         "nnOutput": {
-            "policyProbs": _compare_list(backend_sample["nnOutput"]["policyProbs"], torch_sample["nnOutput"]["policyProbs"], stats),
-            "whiteOwnerMap": _compare_list(backend_sample["nnOutput"]["whiteOwnerMap"], torch_sample["nnOutput"]["whiteOwnerMap"], stats),
-            "whiteWinProb": _compare_scalar(backend_sample["nnOutput"]["whiteWinProb"], torch_sample["nnOutput"]["whiteWinProb"], stats),
-            "whiteLossProb": _compare_scalar(backend_sample["nnOutput"]["whiteLossProb"], torch_sample["nnOutput"]["whiteLossProb"], stats),
-            "whiteNoResultProb": _compare_scalar(backend_sample["nnOutput"]["whiteNoResultProb"], torch_sample["nnOutput"]["whiteNoResultProb"], stats),
-            "whiteScoreMean": _compare_scalar(backend_sample["nnOutput"]["whiteScoreMean"], torch_sample["nnOutput"]["whiteScoreMean"], stats),
-            "whiteScoreMeanSq": _compare_scalar(backend_sample["nnOutput"]["whiteScoreMeanSq"], torch_sample["nnOutput"]["whiteScoreMeanSq"], stats),
-            "whiteLead": _compare_scalar(backend_sample["nnOutput"]["whiteLead"], torch_sample["nnOutput"]["whiteLead"], stats),
-            "varTimeLeft": _compare_scalar(backend_sample["nnOutput"]["varTimeLeft"], torch_sample["nnOutput"]["varTimeLeft"], stats),
-            "shorttermWinlossError": _compare_scalar(backend_sample["nnOutput"]["shorttermWinlossError"], torch_sample["nnOutput"]["shorttermWinlossError"], stats),
-            "shorttermScoreError": _compare_scalar(backend_sample["nnOutput"]["shorttermScoreError"], torch_sample["nnOutput"]["shorttermScoreError"], stats),
+            "policyProbs": _compare_list(backend_sample["nnOutput"]["policyProbs"], torch_sample["nnOutput"]["policyProbs"], stats, _ensure_field_stats(field_stats, "nnOutput", "policyProbs")),
+            "whiteOwnerMap": _compare_list(backend_sample["nnOutput"]["whiteOwnerMap"], torch_sample["nnOutput"]["whiteOwnerMap"], stats, _ensure_field_stats(field_stats, "nnOutput", "whiteOwnerMap")),
+            "whiteWinProb": _compare_scalar(backend_sample["nnOutput"]["whiteWinProb"], torch_sample["nnOutput"]["whiteWinProb"], stats, _ensure_field_stats(field_stats, "nnOutput", "whiteWinProb")),
+            "whiteLossProb": _compare_scalar(backend_sample["nnOutput"]["whiteLossProb"], torch_sample["nnOutput"]["whiteLossProb"], stats, _ensure_field_stats(field_stats, "nnOutput", "whiteLossProb")),
+            "whiteNoResultProb": _compare_scalar(backend_sample["nnOutput"]["whiteNoResultProb"], torch_sample["nnOutput"]["whiteNoResultProb"], stats, _ensure_field_stats(field_stats, "nnOutput", "whiteNoResultProb")),
+            "whiteScoreMean": _compare_scalar(backend_sample["nnOutput"]["whiteScoreMean"], torch_sample["nnOutput"]["whiteScoreMean"], stats, _ensure_field_stats(field_stats, "nnOutput", "whiteScoreMean")),
+            "whiteScoreMeanSq": _compare_scalar(backend_sample["nnOutput"]["whiteScoreMeanSq"], torch_sample["nnOutput"]["whiteScoreMeanSq"], stats, _ensure_field_stats(field_stats, "nnOutput", "whiteScoreMeanSq")),
+            "whiteLead": _compare_scalar(backend_sample["nnOutput"]["whiteLead"], torch_sample["nnOutput"]["whiteLead"], stats, _ensure_field_stats(field_stats, "nnOutput", "whiteLead")),
+            "varTimeLeft": _compare_scalar(backend_sample["nnOutput"]["varTimeLeft"], torch_sample["nnOutput"]["varTimeLeft"], stats, _ensure_field_stats(field_stats, "nnOutput", "varTimeLeft")),
+            "shorttermWinlossError": _compare_scalar(backend_sample["nnOutput"]["shorttermWinlossError"], torch_sample["nnOutput"]["shorttermWinlossError"], stats, _ensure_field_stats(field_stats, "nnOutput", "shorttermWinlossError")),
+            "shorttermScoreError": _compare_scalar(backend_sample["nnOutput"]["shorttermScoreError"], torch_sample["nnOutput"]["shorttermScoreError"], stats, _ensure_field_stats(field_stats, "nnOutput", "shorttermScoreError")),
         },
     }
     if "rawFull" in backend_sample and "rawFull" in torch_sample:
         report["rawFull"] = {
-            "policy": _compare_list(backend_sample["rawFull"]["policy"], torch_sample["rawFull"]["policy"], stats),
-            "policyPass": _compare_list(backend_sample["rawFull"]["policyPass"], torch_sample["rawFull"]["policyPass"], stats),
-            "value": _compare_list(backend_sample["rawFull"]["value"], torch_sample["rawFull"]["value"], stats),
-            "misc": _compare_list(backend_sample["rawFull"]["misc"], torch_sample["rawFull"]["misc"], stats),
-            "moreMisc": _compare_list(backend_sample["rawFull"]["moreMisc"], torch_sample["rawFull"]["moreMisc"], stats),
-            "ownership": _compare_list(backend_sample["rawFull"]["ownership"], torch_sample["rawFull"]["ownership"], stats),
-            "scoring": _compare_list(backend_sample["rawFull"]["scoring"], torch_sample["rawFull"]["scoring"], stats),
-            "futurePos": _compare_list(backend_sample["rawFull"]["futurePos"], torch_sample["rawFull"]["futurePos"], stats),
-            "seki": _compare_list(backend_sample["rawFull"]["seki"], torch_sample["rawFull"]["seki"], stats),
-            "scoreBelief": _compare_list(backend_sample["rawFull"]["scoreBelief"], torch_sample["rawFull"]["scoreBelief"], stats),
+            "policy": _compare_list(backend_sample["rawFull"]["policy"], torch_sample["rawFull"]["policy"], stats, _ensure_field_stats(field_stats, "rawFull", "policy")),
+            "policyPass": _compare_list(backend_sample["rawFull"]["policyPass"], torch_sample["rawFull"]["policyPass"], stats, _ensure_field_stats(field_stats, "rawFull", "policyPass")),
+            "value": _compare_list(backend_sample["rawFull"]["value"], torch_sample["rawFull"]["value"], stats, _ensure_field_stats(field_stats, "rawFull", "value")),
+            "misc": _compare_list(backend_sample["rawFull"]["misc"], torch_sample["rawFull"]["misc"], stats, _ensure_field_stats(field_stats, "rawFull", "misc")),
+            "moreMisc": _compare_list(backend_sample["rawFull"]["moreMisc"], torch_sample["rawFull"]["moreMisc"], stats, _ensure_field_stats(field_stats, "rawFull", "moreMisc")),
+            "ownership": _compare_list(backend_sample["rawFull"]["ownership"], torch_sample["rawFull"]["ownership"], stats, _ensure_field_stats(field_stats, "rawFull", "ownership")),
+            "scoring": _compare_list(backend_sample["rawFull"]["scoring"], torch_sample["rawFull"]["scoring"], stats, _ensure_field_stats(field_stats, "rawFull", "scoring")),
+            "futurePos": _compare_list(backend_sample["rawFull"]["futurePos"], torch_sample["rawFull"]["futurePos"], stats, _ensure_field_stats(field_stats, "rawFull", "futurePos")),
+            "seki": _compare_list(backend_sample["rawFull"]["seki"], torch_sample["rawFull"]["seki"], stats, _ensure_field_stats(field_stats, "rawFull", "seki")),
+            "scoreBelief": _compare_list(backend_sample["rawFull"]["scoreBelief"], torch_sample["rawFull"]["scoreBelief"], stats, _ensure_field_stats(field_stats, "rawFull", "scoreBelief")),
         }
     if "postprocess" in backend_sample and "postprocess" in torch_sample:
         report["postprocess"] = {
-            "tdValueLogits": _compare_list(backend_sample["postprocess"]["tdValueLogits"], torch_sample["postprocess"]["tdValueLogits"], stats),
-            "predTdScore": _compare_list(backend_sample["postprocess"]["predTdScore"], torch_sample["postprocess"]["predTdScore"], stats),
-            "predScoreMean": _compare_scalar(backend_sample["postprocess"]["predScoreMean"], torch_sample["postprocess"]["predScoreMean"], stats),
-            "predScoreStdev": _compare_scalar(backend_sample["postprocess"]["predScoreStdev"], torch_sample["postprocess"]["predScoreStdev"], stats),
-            "predLead": _compare_scalar(backend_sample["postprocess"]["predLead"], torch_sample["postprocess"]["predLead"], stats),
-            "predVarianceTime": _compare_scalar(backend_sample["postprocess"]["predVarianceTime"], torch_sample["postprocess"]["predVarianceTime"], stats),
-            "predShorttermValueError": _compare_scalar(backend_sample["postprocess"]["predShorttermValueError"], torch_sample["postprocess"]["predShorttermValueError"], stats),
-            "predShorttermScoreError": _compare_scalar(backend_sample["postprocess"]["predShorttermScoreError"], torch_sample["postprocess"]["predShorttermScoreError"], stats),
+            "tdValueLogits": _compare_list(backend_sample["postprocess"]["tdValueLogits"], torch_sample["postprocess"]["tdValueLogits"], stats, _ensure_field_stats(field_stats, "postprocess", "tdValueLogits")),
+            "predTdScore": _compare_list(backend_sample["postprocess"]["predTdScore"], torch_sample["postprocess"]["predTdScore"], stats, _ensure_field_stats(field_stats, "postprocess", "predTdScore")),
+            "predScoreMean": _compare_scalar(backend_sample["postprocess"]["predScoreMean"], torch_sample["postprocess"]["predScoreMean"], stats, _ensure_field_stats(field_stats, "postprocess", "predScoreMean")),
+            "predScoreStdev": _compare_scalar(backend_sample["postprocess"]["predScoreStdev"], torch_sample["postprocess"]["predScoreStdev"], stats, _ensure_field_stats(field_stats, "postprocess", "predScoreStdev")),
+            "predLead": _compare_scalar(backend_sample["postprocess"]["predLead"], torch_sample["postprocess"]["predLead"], stats, _ensure_field_stats(field_stats, "postprocess", "predLead")),
+            "predVarianceTime": _compare_scalar(backend_sample["postprocess"]["predVarianceTime"], torch_sample["postprocess"]["predVarianceTime"], stats, _ensure_field_stats(field_stats, "postprocess", "predVarianceTime")),
+            "predShorttermValueError": _compare_scalar(backend_sample["postprocess"]["predShorttermValueError"], torch_sample["postprocess"]["predShorttermValueError"], stats, _ensure_field_stats(field_stats, "postprocess", "predShorttermValueError")),
+            "predShorttermScoreError": _compare_scalar(backend_sample["postprocess"]["predShorttermScoreError"], torch_sample["postprocess"]["predShorttermScoreError"], stats, _ensure_field_stats(field_stats, "postprocess", "predShorttermScoreError")),
         }
     report["aggregate"] = _finalize_diff_stats(stats)
-    return report, stats
+    report["aggregateByField"] = _finalize_field_stats(field_stats)
+    return report, stats, field_stats
 
 
 def main():
@@ -361,13 +392,15 @@ def main():
 
     sample_reports = []
     global_stats = _new_diff_stats()
+    global_field_stats = {}
     for backend_sample, torch_sample in zip(backend_dump["samples"], torch_samples):
         if "rawFull" in backend_sample:
             backend_sample = dict(backend_sample)
             backend_sample["postprocess"] = _backend_postprocess_from_raw_full(backend_sample["rawFull"], postprocess_params)
-        report, sample_stats = _compare_sample(backend_sample["name"], backend_sample, torch_sample)
+        report, sample_stats, sample_field_stats = _compare_sample(backend_sample["name"], backend_sample, torch_sample)
         sample_reports.append(report)
         _merge_diff_stats(global_stats, sample_stats)
+        _merge_field_stats(global_field_stats, sample_field_stats)
 
     aggregate = _finalize_diff_stats(global_stats)
 
@@ -381,6 +414,7 @@ def main():
         "meanAbsErr": aggregate["meanAbsErr"],
         "meanDiff": aggregate["meanDiff"],
         "numComparedValues": aggregate["numComparedValues"],
+        "aggregateByField": _finalize_field_stats(global_field_stats),
         "samples": sample_reports,
     }
 
