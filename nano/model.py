@@ -249,8 +249,7 @@ class ValueHead(nn.Module):
 # Model
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
-    def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
-                 fp32_head: str = "none"):
+    def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop"):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
@@ -290,7 +289,6 @@ class Model(nn.Module):
         # Output heads
         num_scorebeliefs = config["num_scorebeliefs"]
 
-        self.fp32_head = fp32_head
         self.policy_head = PolicyHead(self.c_trunk, pos_len)
         self.value_head = ValueHead(self.c_trunk, num_scorebeliefs, pos_len, score_mode=score_mode)
 
@@ -353,47 +351,21 @@ class Model(nn.Module):
         """
         x = self._forward_trunk_impl(input_spatial, input_global)
 
-        # Output heads
-        if self.fp32_head == "all":
-            with torch.amp.autocast(x.device.type, enabled=False):
-                x_fp32 = x.float()
-                out_policy = self.policy_head(x_fp32)
-                (
-                    out_value, out_misc, out_moremisc,
-                    out_ownership, out_scoring, out_futurepos, out_seki,
-                    out_scorebelief,
-                ) = self.value_head(x_fp32, input_global[:, -1:].float())
-            return (
-                out_policy, out_value, out_misc, out_moremisc,
-                out_ownership, out_scoring, out_futurepos, out_seki,
-                out_scorebelief,
-            )
-        elif self.fp32_head == "value":
-            out_policy = self.policy_head(x)
-            with torch.amp.autocast(x.device.type, enabled=False):
-                x_fp32 = x.float()
-                (
-                    out_value, out_misc, out_moremisc,
-                    out_ownership, out_scoring, out_futurepos, out_seki,
-                    out_scorebelief,
-                ) = self.value_head(x_fp32, input_global[:, -1:].float())
-            return (
-                out_policy.float(), out_value, out_misc, out_moremisc,
-                out_ownership, out_scoring, out_futurepos, out_seki,
-                out_scorebelief,
-            )
-        else:
-            out_policy = self.policy_head(x)
+        # Output heads (fp32, autocast disabled)
+        with torch.amp.autocast(x.device.type, enabled=False):
+            x_fp32 = x.float()
+            out_policy = self.policy_head(x_fp32)
             (
                 out_value, out_misc, out_moremisc,
                 out_ownership, out_scoring, out_futurepos, out_seki,
                 out_scorebelief,
-            ) = self.value_head(x, input_global[:, -1:])
-            return (
-                out_policy.float(), out_value.float(), out_misc.float(), out_moremisc.float(),
-                out_ownership.float(), out_scoring.float(), out_futurepos.float(), out_seki.float(),
-                out_scorebelief.float(),
-            )
+            ) = self.value_head(x_fp32, input_global[:, -1:].float())
+
+        return (
+            out_policy, out_value, out_misc, out_moremisc,
+            out_ownership, out_scoring, out_futurepos, out_seki,
+            out_scorebelief,
+        )
 
     def postprocess(self, outputs):
         (

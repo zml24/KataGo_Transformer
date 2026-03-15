@@ -163,10 +163,10 @@ def main(rank, world_size, args, gpu_id):
     # Conditional model import
     if args.use_te:
         from model_te import Model, detect_checkpoint_format, convert_checkpoint_model_to_te
-        model_extra_kwargs = {"use_fp8": args.use_fp8, "fp32_head": args.fp32_head}
+        model_extra_kwargs = {"use_fp8": args.use_fp8}
     else:
         from model import Model
-        model_extra_kwargs = {"fp32_head": args.fp32_head}
+        model_extra_kwargs = {}
 
     # Parse td_value_loss_scales
     td_value_loss_scales = [float(x) for x in args.td_value_loss_scales.split(",")]
@@ -1146,8 +1146,6 @@ if __name__ == "__main__":
     parser.add_argument("--use-fp8", action="store_true", help="Enable FP8 training (requires --use-te and Hopper/Ada GPU)")
     parser.add_argument("--amp-dtype", type=str, default="bf16", choices=["bf16", "fp16", "none"],
                         help="AMP dtype: bf16 (default), fp16 (with loss scaling), none (disable AMP)")
-    parser.add_argument("--fp32-head", type=str, default="none", choices=["none", "value", "all"],
-                        help="Run head in fp32: none (default), value (value head only), all (all heads)")
     parser.add_argument("--profile", action="store_true",
                         help="Enable per-stage CUDA-synced profiling (adds sync overhead)")
     parser.add_argument("--ema-decay", type=float, default=0.0,

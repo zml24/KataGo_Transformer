@@ -44,9 +44,6 @@ def main():
     parser.add_argument("--score-mode", type=str, default="simple",
                         choices=["mixop", "mix", "simple"],
                         help="Score head mode (default: simple)")
-    parser.add_argument("--fp32-head", type=str, default="none",
-                        choices=["none", "value", "all"],
-                        help="Run head in fp32: none (default), value (value head only), all (all heads)")
     args = parser.parse_args()
 
     assert torch.cuda.is_available(), "CUDA is required for this benchmark"
@@ -61,12 +58,11 @@ def main():
     if args.use_te:
         from model_te import Model
         model = Model(configs.config_of_name[args.model_kind], args.pos_len,
-                      score_mode=args.score_mode, use_fp8=args.use_fp8,
-                      fp32_head=args.fp32_head)
+                      score_mode=args.score_mode, use_fp8=args.use_fp8)
     else:
         from model import Model
         model = Model(configs.config_of_name[args.model_kind], args.pos_len,
-                      score_mode=args.score_mode, fp32_head=args.fp32_head)
+                      score_mode=args.score_mode)
 
     model_config = configs.config_of_name[args.model_kind]
     model.initialize()
@@ -99,7 +95,6 @@ def main():
     print(f"TransformerEngine: {'ON' if args.use_te else 'OFF'}")
     print(f"FP8:            {'ON' if args.use_fp8 else 'OFF'}")
     print(f"Score mode:     {args.score_mode}")
-    print(f"FP32 head:      {args.fp32_head}")
     print(f"FLOPs/sample:   {forward_flops/1e9:.2f} GFLOPs")
     print(f"GPU:            {gpu_name}")
     print(f"GPU BF16 peak:  {gpu_peak_tflops:.1f} TFLOPS")

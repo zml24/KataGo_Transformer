@@ -127,11 +127,10 @@ def _replace_nn_linear_with_te(module):
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
-                 use_fp8: bool = False, fp32_head: str = "none"):
+                 use_fp8: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
-        self.fp32_head = fp32_head
         self.c_trunk = config["hidden_size"]
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
@@ -262,47 +261,21 @@ class Model(nn.Module):
             # Trunk is isolated from torch.compile for TE compatibility during training/inference.
             x = self._run_trunk_no_compile(x)
 
-        # Output heads
-        if self.fp32_head == "all":
-            with torch.amp.autocast(x.device.type, enabled=False):
-                x_fp32 = x.float()
-                out_policy = self.policy_head(x_fp32)
-                (
-                    out_value, out_misc, out_moremisc,
-                    out_ownership, out_scoring, out_futurepos, out_seki,
-                    out_scorebelief,
-                ) = self.value_head(x_fp32, input_global[:, -1:].float())
-            return (
-                out_policy, out_value, out_misc, out_moremisc,
-                out_ownership, out_scoring, out_futurepos, out_seki,
-                out_scorebelief,
-            )
-        elif self.fp32_head == "value":
-            out_policy = self.policy_head(x)
-            with torch.amp.autocast(x.device.type, enabled=False):
-                x_fp32 = x.float()
-                (
-                    out_value, out_misc, out_moremisc,
-                    out_ownership, out_scoring, out_futurepos, out_seki,
-                    out_scorebelief,
-                ) = self.value_head(x_fp32, input_global[:, -1:].float())
-            return (
-                out_policy.float(), out_value, out_misc, out_moremisc,
-                out_ownership, out_scoring, out_futurepos, out_seki,
-                out_scorebelief,
-            )
-        else:
-            out_policy = self.policy_head(x)
+        # Output heads (fp32, autocast disabled)
+        with torch.amp.autocast(x.device.type, enabled=False):
+            x_fp32 = x.float()
+            out_policy = self.policy_head(x_fp32)
             (
                 out_value, out_misc, out_moremisc,
                 out_ownership, out_scoring, out_futurepos, out_seki,
                 out_scorebelief,
-            ) = self.value_head(x, input_global[:, -1:])
-            return (
-                out_policy.float(), out_value.float(), out_misc.float(), out_moremisc.float(),
-                out_ownership.float(), out_scoring.float(), out_futurepos.float(), out_seki.float(),
-                out_scorebelief.float(),
-            )
+            ) = self.value_head(x_fp32, input_global[:, -1:].float())
+
+        return (
+            out_policy, out_value, out_misc, out_moremisc,
+            out_ownership, out_scoring, out_futurepos, out_seki,
+            out_scorebelief,
+        )
 
     def forward(self, input_spatial, input_global):
         return self._forward_impl(input_spatial, input_global, for_onnx_export=False)
