@@ -163,10 +163,10 @@ def main(rank, world_size, args, gpu_id):
     # Conditional model import
     if args.use_te:
         from model_te import Model, detect_checkpoint_format, convert_checkpoint_model_to_te
-        model_extra_kwargs = {"use_fp8": args.use_fp8}
+        model_extra_kwargs = {"use_fp8": args.use_fp8, "fp32_head": args.fp32_head}
     else:
         from model import Model
-        model_extra_kwargs = {}
+        model_extra_kwargs = {"fp32_head": args.fp32_head}
 
     # Parse td_value_loss_scales
     td_value_loss_scales = [float(x) for x in args.td_value_loss_scales.split(",")]
@@ -236,9 +236,9 @@ def main(rank, world_size, args, gpu_id):
     # AMP setup
     grad_scaler = None
     if device.type == "cuda":
-        torch.set_float32_matmul_precision("high")
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
         amp_device = "cuda"
         if args.amp_dtype == "fp16":
             amp_dtype = torch.float16
@@ -881,8 +881,8 @@ def main(rank, world_size, args, gpu_id):
                 # Unscale gradients (FP16 only) and check for inf/nan
                 skip_step = False
                 if grad_scaler is not None:
-                    inv_scale = 1.0 / grad_scaler.get_scale()
-                    found_inf = torch.zeros(1, device=device)
+                    inv_scale = torch.tensor(1.0 / grad_scaler.get_scale(), dtype=torch.float32, device=device)
+                    found_inf = torch.zeros(1, dtype=torch.float32, device=device)
                     if dp_zero:
                         params_to_check = [
                             p for opt in [zero_adam, muon_opt, shampoo_opt]
@@ -891,11 +891,8 @@ def main(rank, world_size, args, gpu_id):
                         ]
                     else:
                         params_to_check = list(model.parameters())
-                    for p in params_to_check:
-                        if p.grad is not None:
-                            p.grad.mul_(inv_scale)
-                            if not torch.isfinite(p.grad).all():
-                                found_inf.fill_(1.0)
+                    grads = [p.grad for p in params_to_check if p.grad is not None]
+                    torch._amp_foreach_non_finite_check_and_unscale_(grads, found_inf, inv_scale)
                     if world_size > 1:
                         torch.distributed.all_reduce(found_inf, op=torch.distributed.ReduceOp.MAX)
                     skip_step = found_inf.item() > 0.0
@@ -1149,6 +1146,8 @@ if __name__ == "__main__":
     parser.add_argument("--use-fp8", action="store_true", help="Enable FP8 training (requires --use-te and Hopper/Ada GPU)")
     parser.add_argument("--amp-dtype", type=str, default="bf16", choices=["bf16", "fp16", "none"],
                         help="AMP dtype: bf16 (default), fp16 (with loss scaling), none (disable AMP)")
+    parser.add_argument("--fp32-head", type=str, default="none", choices=["none", "value", "all"],
+                        help="Run head in fp32: none (default), value (value head only), all (all heads)")
     parser.add_argument("--profile", action="store_true",
                         help="Enable per-stage CUDA-synced profiling (adds sync overhead)")
     parser.add_argument("--ema-decay", type=float, default=0.0,

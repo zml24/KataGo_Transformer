@@ -3,8 +3,6 @@
 import torch
 import torch.nn.functional as F
 
-# Enable TF32 for fp32 matmuls (inv_quarter_sandwich)
-torch.backends.cuda.matmul.allow_tf32 = True
 
 # ---------------------------------------------------------------------------
 # Newton-Schulz coefficients for matrix orthogonalization (polar_express)
@@ -235,35 +233,40 @@ class ShampooOptimizer:
         bias_corr2 = 1 - self.beta2 ** self.step_count
         rms_sum = torch.tensor(0.0, device=self._device)
         rms_cnt = 0
-        with torch.no_grad():
-            for name, p in self.named_params.items():
-                if p.grad is None:
-                    continue
-                assert p.grad.ndim in (2, 4), f"Shampoo only supports 2D/4D params, got ndim={p.grad.ndim}"
-                state = self.states[name]
-                grad = p.grad
-                original_shape = grad.shape
-                split_info = self._split_info[name]
+        old_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        try:
+            with torch.no_grad():
+                for name, p in self.named_params.items():
+                    if p.grad is None:
+                        continue
+                    assert p.grad.ndim in (2, 4), f"Shampoo only supports 2D/4D params, got ndim={p.grad.ndim}"
+                    state = self.states[name]
+                    grad = p.grad
+                    original_shape = grad.shape
+                    split_info = self._split_info[name]
 
-                state["momentum"].lerp_(grad, 1 - self.momentum)
-                grad_2d = flatten_and_split(grad, split_info)
-                momentum_2d_hat = flatten_and_split(state["momentum"], split_info) / bias_corr1
+                    state["momentum"].lerp_(grad, 1 - self.momentum)
+                    grad_2d = flatten_and_split(grad, split_info)
+                    momentum_2d_hat = flatten_and_split(state["momentum"], split_info) / bias_corr1
 
-                state["L"].lerp_(grad_2d @ grad_2d.mT, 1 - self.beta2)
-                state["R"].lerp_(grad_2d.mT @ grad_2d, 1 - self.beta2)
+                    state["L"].lerp_(grad_2d @ grad_2d.mT, 1 - self.beta2)
+                    state["R"].lerp_(grad_2d.mT @ grad_2d, 1 - self.beta2)
 
-                precond = inv_quarter_sandwich(
-                    state["L"] / bias_corr2, momentum_2d_hat, state["R"] / bias_corr2,
-                )
-                precond = precond * max(precond.size(-2), precond.size(-1)) ** 0.5
+                    precond = inv_quarter_sandwich(
+                        state["L"] / bias_corr2, momentum_2d_hat, state["R"] / bias_corr2,
+                    )
+                    precond = precond * max(precond.size(-2), precond.size(-1)) ** 0.5
 
-                rms_sum += precond.norm() * self.lr_multiplier / precond.numel() ** 0.5
-                rms_cnt += 1
+                    rms_sum += precond.norm() * self.lr_multiplier / precond.numel() ** 0.5
+                    rms_cnt += 1
 
-                precond = undo_split(precond, original_shape, split_info[3])
+                    precond = undo_split(precond, original_shape, split_info[3])
 
-                p.mul_(1 - base_lr * self.wd)
-                p.add_(precond.to(p.dtype), alpha=-shampoo_lr)
+                    p.mul_(1 - base_lr * self.wd)
+                    p.add_(precond.to(p.dtype), alpha=-shampoo_lr)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = old_tf32
 
         self.last_precond_rms = (rms_sum / rms_cnt).item() if rms_cnt > 0 else 0.0
 
