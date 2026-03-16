@@ -6,8 +6,10 @@ each stack implementation (no_mask → mask delta), NOT cross-stack absolute
 comparisons (which also reflect norm/FFN differences).
 
 Stacks tested:
-  - TE TransformerLayer (fused block, TE attention)
-  - TE Decomposed (TE norm/FFN, TE DotProductAttention)
+  - TE TransformerLayer (fused block, TE attention, arbitrary mask)
+  - TE Decomposed (TE norm/FFN, TE DotProductAttention, arbitrary mask)
+  - TE TransformerLayer + post_scale_bias (additive bias instead of arbitrary mask)
+  - TE Decomposed + post_scale_bias (additive bias instead of arbitrary mask)
   - Pure SDPA (RMSNormFP32/nn.Linear, F.scaled_dot_product_attention)
   - Hybrid (TE norm/FFN, SDPA attention)
 
@@ -122,6 +124,76 @@ class TEDecomposedStack(nn.Module):
             if attn_mask is not None:
                 attn_kwargs["attention_mask"] = attn_mask
                 attn_kwargs["attn_mask_type"] = "arbitrary"
+            x = residual + block['proj'](block['attn'](q, k, v, **attn_kwargs))
+            x = x + block['ln_mlp'](x)
+        return x
+
+
+class TETransformerBiasStack(nn.Module):
+    """Stack of te.TransformerLayer using core_attention_bias (additive, post-scale)."""
+    def __init__(self, hidden, heads, ffn_dim, num_layers, pos_len):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            te.TransformerLayer(
+                hidden, ffn_dim, heads,
+                layernorm_epsilon=1e-6,
+                hidden_dropout=0, attention_dropout=0,
+                self_attn_mask_type="no_mask",
+                normalization="RMSNorm",
+                bias=False, activation="swiglu",
+                attn_input_format="bshd",
+            )
+            for _ in range(num_layers)
+        ])
+        head_dim = hidden // heads
+        emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)
+        emb_full = torch.cat([emb, emb], dim=-1)
+        self.register_buffer("rope", emb_full, persistent=False)
+
+    def forward(self, x, attn_mask=None):
+        for block in self.blocks:
+            if attn_mask is not None:
+                x = block(x, rotary_pos_emb=self.rope,
+                          core_attention_bias_type="post_scale_bias",
+                          core_attention_bias=attn_mask)
+            else:
+                x = block(x, rotary_pos_emb=self.rope)
+        return x
+
+
+class TEDecomposedBiasStack(nn.Module):
+    """Stack of TE decomposed blocks using core_attention_bias (additive, post-scale)."""
+    def __init__(self, hidden, heads, ffn_dim, num_layers, pos_len):
+        super().__init__()
+        self.num_heads = heads
+        self.head_dim = hidden // heads
+        self.blocks = nn.ModuleList()
+        for _ in range(num_layers):
+            self.blocks.append(nn.ModuleDict({
+                'ln_qkv': te.LayerNormLinear(hidden, 3 * hidden, eps=1e-6, bias=False, normalization="RMSNorm"),
+                'attn': te.DotProductAttention(num_attention_heads=heads, kv_channels=self.head_dim,
+                                                attention_dropout=0.0, attn_mask_type="no_mask", qkv_format="bshd"),
+                'proj': te.Linear(hidden, hidden, bias=False),
+                'ln_mlp': te.LayerNormMLP(hidden, ffn_dim, eps=1e-6, bias=False,
+                                           normalization="RMSNorm", activation="swiglu"),
+            }))
+        head_dim = hidden // heads
+        emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)
+        emb_full = torch.cat([emb, emb], dim=-1)
+        self.register_buffer("rope_cos", emb_full.cos(), persistent=False)
+        self.register_buffer("rope_sin", emb_full.sin(), persistent=False)
+
+    def forward(self, x, attn_mask=None):
+        B, L, _ = x.shape
+        for block in self.blocks:
+            residual = x
+            qkv = block['ln_qkv'](x).view(B, L, 3, self.num_heads, self.head_dim)
+            q, k, v = qkv.unbind(dim=2)
+            q, k = apply_rotary_emb(q, k, self.rope_cos, self.rope_sin)
+            attn_kwargs = {}
+            if attn_mask is not None:
+                attn_kwargs["core_attention_bias_type"] = "post_scale_bias"
+                attn_kwargs["core_attention_bias"] = attn_mask
             x = residual + block['proj'](block['attn'](q, k, v, **attn_kwargs))
             x = x + block['ln_mlp'](x)
         return x
@@ -307,29 +379,57 @@ def main():
     groups.append(("TE Decomposed (compile-wrapped)", t_no, t_mk))
     del model, compiled
 
-    # --- 3. Pure SDPA ---
-    print("\n[5] Pure PyTorch SDPA (eager)")
+    # --- 3. TE TransformerLayer + post_scale_bias ---
+    print("\n[5] TE TransformerLayer + post_scale_bias (eager)")
+    model = TETransformerBiasStack(D, H, FFN, NL, PL).to(device).eval()
+    t_no = bench("no_mask", model, x, None, args.warmup, args.iters)
+    t_mk = bench("post_scale_bias", model, x, sdpa_mask, args.warmup, args.iters)
+    groups.append(("TE TransformerLayer + bias", t_no, t_mk))
+
+    print("\n[6] TE TransformerLayer + post_scale_bias (compile-wrapped)")
+    compiled = torch.compile(model, mode="default")
+    t_no = bench("no_mask (compile-wrapped)", compiled, x, None, args.warmup, args.iters)
+    t_mk = bench("post_scale_bias (compile-wrapped)", compiled, x, sdpa_mask, args.warmup, args.iters)
+    groups.append(("TE TransformerLayer + bias (compile)", t_no, t_mk))
+    del model, compiled
+
+    # --- 4. TE Decomposed + post_scale_bias ---
+    print("\n[7] TE Decomposed + post_scale_bias (eager)")
+    model = TEDecomposedBiasStack(D, H, FFN, NL, PL).to(device).eval()
+    t_no = bench("no_mask", model, x, None, args.warmup, args.iters)
+    t_mk = bench("post_scale_bias", model, x, sdpa_mask, args.warmup, args.iters)
+    groups.append(("TE Decomposed + bias", t_no, t_mk))
+
+    print("\n[8] TE Decomposed + post_scale_bias (compile-wrapped)")
+    compiled = torch.compile(model, mode="default")
+    t_no = bench("no_mask (compile-wrapped)", compiled, x, None, args.warmup, args.iters)
+    t_mk = bench("post_scale_bias (compile-wrapped)", compiled, x, sdpa_mask, args.warmup, args.iters)
+    groups.append(("TE Decomposed + bias (compile)", t_no, t_mk))
+    del model, compiled
+
+    # --- 5. Pure SDPA ---
+    print("\n[9] Pure PyTorch SDPA (eager)")
     model = SDPAStack(D, H, FFN, NL, PL).to(device).eval()
     t_no = bench("no_mask", model, x, None, args.warmup, args.iters)
     t_mk = bench("additive mask", model, x, sdpa_mask, args.warmup, args.iters)
     groups.append(("Pure SDPA", t_no, t_mk))
 
-    print("\n[6] Pure PyTorch SDPA + torch.compile")
+    print("\n[10] Pure PyTorch SDPA + torch.compile")
     compiled = torch.compile(model, mode="default")
     t_no = bench("no_mask + compile", compiled, x, None, args.warmup, args.iters)
     t_mk = bench("additive mask + compile", compiled, x, sdpa_mask, args.warmup, args.iters)
     groups.append(("Pure SDPA + compile", t_no, t_mk))
     del model, compiled
 
-    # --- 4. Hybrid: TE norm/FFN + SDPA attention ---
+    # --- 6. Hybrid: TE norm/FFN + SDPA attention ---
     # Uses precomputed SDPA additive mask — no per-iter mask conversion.
-    print("\n[7] Hybrid: TE norm/FFN + SDPA attention (eager)")
+    print("\n[11] Hybrid: TE norm/FFN + SDPA attention (eager)")
     model = TEHybridStack(D, H, FFN, NL, PL).to(device).eval()
     t_no = bench("no_mask", model, x, None, args.warmup, args.iters)
     t_mk = bench("SDPA additive mask (precomputed)", model, x, sdpa_mask, args.warmup, args.iters)
     groups.append(("Hybrid TE+SDPA", t_no, t_mk))
 
-    print("\n[8] Hybrid: TE norm/FFN + SDPA attention (wrapped by torch.compile)")
+    print("\n[12] Hybrid: TE norm/FFN + SDPA attention (wrapped by torch.compile)")
     compiled = torch.compile(model, mode="default")
     t_no = bench("no_mask (compile-wrapped)", compiled, x, None, args.warmup, args.iters)
     t_mk = bench("SDPA mask (compile-wrapped)", compiled, x, sdpa_mask, args.warmup, args.iters)
