@@ -73,7 +73,8 @@ def load_model_from_checkpoint(checkpoint_path, pos_len, score_mode, use_ema=Fal
         print(f"  Auto-detected score_mode='{detected_score_mode}' from checkpoint (overriding '{score_mode}')")
         score_mode = detected_score_mode
 
-    model = Model(model_config, pos_len, score_mode=score_mode)
+    varlen = state.get("varlen", False)
+    model = Model(model_config, pos_len, score_mode=score_mode, varlen=varlen)
 
     # Choose weights: EMA shadow or regular model
     if use_ema and "ema_shadow" in state:
@@ -102,12 +103,13 @@ def load_model_from_checkpoint(checkpoint_path, pos_len, score_mode, use_ema=Fal
         "config": model_config,
         "global_step": state.get("global_step", "?"),
         "total_samples_trained": state.get("total_samples_trained", "?"),
+        "varlen": varlen,
     }
     return model, model_config, info
 
 
 @torch.no_grad()
-def evaluate(model, model_config, npz_files, batch_size, pos_len, device, use_amp=True):
+def evaluate(model, model_config, npz_files, batch_size, pos_len, device, use_amp=True, varlen=False):
     """Run evaluation and return metrics dict."""
     model.eval()
     model.to(device)
@@ -146,6 +148,7 @@ def evaluate(model, model_config, npz_files, batch_size, pos_len, device, use_am
         include_meta=False,
         enable_history_matrices=False,
         model_config=model_config,
+        varlen=varlen,
     )
 
     for batch in data_gen:
@@ -154,6 +157,7 @@ def evaluate(model, model_config, npz_files, batch_size, pos_len, device, use_am
         with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
             outputs = model(batch["binaryInputNCHW"], batch["globalInputNC"])
 
+        eval_mask = batch["binaryInputNCHW"][:, 0:1, :, :].contiguous() if varlen else None
         _, metrics_stack, _, _ = postprocess_and_loss_core(
             outputs,
             model.value_head.score_belief_offset_vector,
@@ -165,6 +169,7 @@ def evaluate(model, model_config, npz_files, batch_size, pos_len, device, use_am
             moving_sum_t,
             moving_weight_t,
             is_training=False,
+            mask=eval_mask,
         )
 
         batch_metrics = dict(zip(_METRIC_KEYS, metrics_stack.tolist()))
@@ -241,7 +246,7 @@ def main():
     # Run evaluation
     use_amp = not args.no_amp
     print(f"\nEvaluating with batch_size={args.batch_size}, amp={'on' if use_amp else 'off'}...")
-    metrics = evaluate(model, model_config, npz_files, args.batch_size, args.pos_len, device, use_amp=use_amp)
+    metrics = evaluate(model, model_config, npz_files, args.batch_size, args.pos_len, device, use_amp=use_amp, varlen=info["varlen"])
 
     if not metrics:
         return

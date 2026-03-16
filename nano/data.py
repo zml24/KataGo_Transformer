@@ -59,6 +59,7 @@ def read_npz_training_data(
     model_config: configs.ModelConfig,
     use_pin_memory: bool = False,
     seed=None,
+    varlen: bool = False,
 ):
     if seed is not None:
         rand = np.random.default_rng(seed=seed)
@@ -111,10 +112,10 @@ def read_npz_training_data(
 
         assert binaryInputNCHW.shape[1] == num_bin_features
         assert globalInputNC.shape[1] == num_global_features
-        # Channel 0 is the on-board mask and must be all-ones for full-resolution input.
-        # Non-full-board data with padding would silently corrupt spatial losses.
-        assert np.all(binaryInputNCHW[:, 0, :, :] == 1), \
-            f"Channel 0 (on-board mask) must be all 1 for full-resolution input in {npz_file}"
+        # Channel 0 is the on-board mask. When varlen is disabled, it must be all-ones.
+        if not varlen:
+            assert np.all(binaryInputNCHW[:, 0, :, :] == 1), \
+                f"Channel 0 (on-board mask) must be all 1 for full-resolution input in {npz_file}"
         return (npz_file, binaryInputNCHW, globalInputNC, policyTargetsNCMove, globalTargetsNC, scoreDistrN, valueTargetsNCHW, metadataInputNC, qValueTargetsNCMove)
 
     if not npz_files:

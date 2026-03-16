@@ -13,7 +13,7 @@ from model import Model
 
 
 MAGIC = b"KGTRN001"
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 POLICY_CHANNELS = (0, 5)
 
 
@@ -107,14 +107,15 @@ def _make_model(checkpoint_path, pos_len, score_mode, use_ema):
         raise RuntimeError("原生 CUDA 导出当前只支持 version=15")
     if config.get("stem", "cnn3") not in {"cnn1", "cnn3", "cnn5"}:
         raise RuntimeError("原生 CUDA 导出当前只支持 stem=cnn1/cnn3/cnn5")
-    model = Model(config, pos_len=pos_len, score_mode=score_mode)
+    varlen = state.get("varlen", False)
+    model = Model(config, pos_len=pos_len, score_mode=score_mode, varlen=varlen)
     model_state = _resolve_model_state(state, use_ema)
     if _looks_like_te_checkpoint(model_state):
         print("检测到 TransformerEngine checkpoint，先转换为 model.py 权重命名")
         model_state = _convert_checkpoint_te_to_model_standalone(model_state)
     model.load_state_dict(model_state, strict=True)
     model.eval()
-    return model, config
+    return model, config, varlen
 
 
 def _transpose_linear(weight):
@@ -234,7 +235,7 @@ def _open_output(path):
 
 
 def export_checkpoint(checkpoint, output, pos_len, score_mode, use_ema):
-    model, config = _make_model(checkpoint, pos_len, score_mode, use_ema)
+    model, config, varlen = _make_model(checkpoint, pos_len, score_mode, use_ema)
     tensors = _collect_tensors(model)
 
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
@@ -255,6 +256,7 @@ def export_checkpoint(checkpoint, output, pos_len, score_mode, use_ema):
         _write_i32(out, _score_mode_id(model.value_head.score_mode))
         _write_i32(out, model.value_head.num_scorebeliefs)
         _write_i32(out, model.value_head.scorebelief_len)
+        _write_i32(out, 1 if varlen else 0)  # varlen flag
 
         _write_f32(out, 20.0)
         _write_f32(out, 20.0)

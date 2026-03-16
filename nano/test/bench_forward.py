@@ -44,6 +44,8 @@ def main():
     parser.add_argument("--score-mode", type=str, default="simple",
                         choices=["mixop", "mix", "simple"],
                         help="Score head mode (default: simple)")
+    parser.add_argument("--varlen", action="store_true",
+                        help="Enable variable-length board input with masking")
     args = parser.parse_args()
 
     assert torch.cuda.is_available(), "CUDA is required for this benchmark"
@@ -53,6 +55,8 @@ def main():
 
     if args.use_fp8:
         assert args.use_te, "--use-fp8 requires --use-te"
+    if args.varlen:
+        assert not args.use_te, "--varlen is not compatible with --use-te"
 
     # Model setup
     if args.use_te:
@@ -62,7 +66,7 @@ def main():
     else:
         from model import Model
         model = Model(configs.config_of_name[args.model_kind], args.pos_len,
-                      score_mode=args.score_mode)
+                      score_mode=args.score_mode, varlen=args.varlen)
 
     model_config = configs.config_of_name[args.model_kind]
     model.initialize()

@@ -105,10 +105,11 @@ class TransformerBlock(nn.Module):
         self.norm1 = RMSNormFP32(c_main, eps=1e-6)
         self.norm2 = RMSNormFP32(c_main, eps=1e-6)
 
-    def forward(self, x, rope_cos, rope_sin):
+    def forward(self, x, rope_cos, rope_sin, attn_mask=None):
         """
         x: (N, L, C)
         rope_cos, rope_sin: (L, 1, 1, head_dim) precomputed RoPE embeddings
+        attn_mask: optional (N, 1, 1, L) additive mask, 0 for valid, -inf for padding
         """
         B, L, C = x.shape
         x_normed = self.norm1(x)
@@ -123,7 +124,9 @@ class TransformerBlock(nn.Module):
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(dtype=q.dtype)
+        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
         attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, C)
         x = x + self.out_proj(attn_out)
 
@@ -149,10 +152,21 @@ class PolicyHead(nn.Module):
         self.linear_board = nn.Linear(c_in, self.num_policy_outputs, bias=False)
         self.linear_pass = nn.Linear(c_in, self.num_policy_outputs, bias=False)
 
-    def forward(self, x_nlc):
+    def forward(self, x_nlc, mask=None):
+        """
+        x_nlc: (N, L, C)
+        mask: optional (N, L) float, 1=valid, 0=padding
+        """
         N, L, _ = x_nlc.shape
         board = self.linear_board(x_nlc).permute(0, 2, 1)  # (N, 6, L)
-        pooled = x_nlc.mean(dim=1)
+        if mask is not None:
+            # Mask-aware global average pooling for pass logits
+            mask_expanded = mask.unsqueeze(-1)  # (N, L, 1)
+            pooled = (x_nlc * mask_expanded).sum(dim=1) / mask.sum(dim=1, keepdim=True)
+            # Mask out invalid board positions with large negative number
+            board = board - (1.0 - mask.unsqueeze(1)) * 1e9  # (N, 6, L)
+        else:
+            pooled = x_nlc.mean(dim=1)
         pass_logits = self.linear_pass(pooled)  # (N, 6)
         return torch.cat([board, pass_logits.unsqueeze(-1)], dim=2)  # (N, 6, L+1)
 
@@ -199,7 +213,12 @@ class ValueHead(nn.Module):
                 dtype=torch.float32,
             ), persistent=False)
 
-    def forward(self, x_nlc, score_parity):
+    def forward(self, x_nlc, score_parity, mask=None):
+        """
+        x_nlc: (N, L, C)
+        score_parity: (N, 1)
+        mask: optional (N, L) float, 1=valid, 0=padding
+        """
         N, L, _ = x_nlc.shape
         H = W = self.pos_len
 
@@ -209,11 +228,19 @@ class ValueHead(nn.Module):
         spatial = spatial.permute(0, 2, 1).view(N, self.n_spatial, H, W)
         out_ownership, out_scoring, out_futurepos, out_seki = spatial.split([1, 1, 2, 4], dim=1)
 
-        global_feats = global_feats.mean(dim=1)
+        if mask is not None:
+            mask_expanded = mask.unsqueeze(-1)  # (N, L, 1)
+            mask_sum = mask.sum(dim=1, keepdim=True)  # (N, 1)
+            global_feats = (global_feats * mask_expanded).sum(dim=1) / mask_sum
+        else:
+            global_feats = global_feats.mean(dim=1)
         out_value, out_misc, out_moremisc = global_feats.split([3, 10, 8], dim=-1)
 
-        # Score belief: mean-pool then project
-        pooled_s = x_nlc.mean(dim=1)
+        # Score belief: mask-aware mean-pool then project
+        if mask is not None:
+            pooled_s = (x_nlc * mask_expanded).sum(dim=1) / mask_sum
+        else:
+            pooled_s = x_nlc.mean(dim=1)
         if self.score_mode == "simple":
             out_scorebelief_logprobs = F.log_softmax(self.linear_s_simple(pooled_s), dim=1)
         elif self.score_mode in ("mix", "mixop"):
@@ -249,10 +276,11 @@ class ValueHead(nn.Module):
 # Model
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
-    def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop"):
+    def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop", varlen: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
+        self.varlen = varlen
         self.c_trunk = config["hidden_size"]
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
@@ -315,12 +343,13 @@ class Model(nn.Module):
                 nn.init.normal_(p, mean=0.0, std=std)
 
     def _forward_trunk_impl(self, input_spatial, input_global):
-        x = self._forward_stem_impl(input_spatial, input_global)
-        return self._forward_blocks_impl(x)
+        x, attn_mask, mask_flat = self._forward_stem_impl(input_spatial, input_global)
+        x = self._forward_blocks_impl(x, attn_mask=attn_mask)
+        return x, mask_flat
 
-    def _forward_blocks_impl(self, x):
+    def _forward_blocks_impl(self, x, attn_mask=None):
         for block in self.blocks:
-            x = block(x, self.rope_cos, self.rope_sin)
+            x = block(x, self.rope_cos, self.rope_sin, attn_mask=attn_mask)
         return self.norm_final(x)
 
     def _forward_stem_impl(self, input_spatial, input_global):
@@ -328,38 +357,60 @@ class Model(nn.Module):
         H = W = self.pos_len
         L = H * W
 
+        # Extract mask from channel 0 when varlen is enabled
+        if self.varlen:
+            mask = input_spatial[:, 0:1, :, :].contiguous()  # (N, 1, H, W)
+            mask_flat = mask.view(N, L)  # (N, L)
+            # Additive attention mask: 0 for valid, -inf for padding
+            attn_mask = torch.zeros(N, 1, 1, L, device=input_spatial.device, dtype=input_spatial.dtype)
+            attn_mask.masked_fill_(mask_flat.view(N, 1, 1, L) == 0, float('-inf'))
+        else:
+            attn_mask = None
+            mask_flat = None
+
         # Stem: NCHW -> NLC
         x_global = self.linear_global(input_global)
         x_spatial = self.conv_spatial(input_spatial)
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
         x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
-        return x
+        return x, attn_mask, mask_flat
 
     def forward_stem_for_onnx_export(self, input_spatial, input_global):
-        return self._forward_stem_impl(input_spatial, input_global).float()
+        x, attn_mask, mask_flat = self._forward_stem_impl(input_spatial, input_global)
+        if self.varlen:
+            return x.float(), mask_flat.float()
+        return x.float()
 
-    def forward_blocks_for_onnx_export(self, input_stem):
+    def forward_blocks_for_onnx_export(self, input_stem, mask_flat=None):
+        if self.varlen and mask_flat is not None:
+            N, L = mask_flat.shape
+            attn_mask = torch.zeros(N, 1, 1, L, device=mask_flat.device, dtype=input_stem.dtype)
+            attn_mask.masked_fill_(mask_flat.view(N, 1, 1, L) == 0, float('-inf'))
+            return self._forward_blocks_impl(input_stem, attn_mask=attn_mask).float()
         return self._forward_blocks_impl(input_stem).float()
 
     def forward_trunk_for_onnx_export(self, input_spatial, input_global):
-        return self._forward_trunk_impl(input_spatial, input_global).float()
+        x, mask_flat = self._forward_trunk_impl(input_spatial, input_global)
+        if self.varlen:
+            return x.float(), mask_flat.float()
+        return x.float()
 
     def forward(self, input_spatial, input_global):
         """
         input_spatial: (N, C_bin, H, W)
         input_global:  (N, C_global)
         """
-        x = self._forward_trunk_impl(input_spatial, input_global)
+        x, mask_flat = self._forward_trunk_impl(input_spatial, input_global)
 
         # Output heads (fp32, autocast disabled)
         with torch.amp.autocast(x.device.type, enabled=False):
             x_fp32 = x.float()
-            out_policy = self.policy_head(x_fp32)
+            out_policy = self.policy_head(x_fp32, mask=mask_flat)
             (
                 out_value, out_misc, out_moremisc,
                 out_ownership, out_scoring, out_futurepos, out_seki,
                 out_scorebelief,
-            ) = self.value_head(x_fp32, input_global[:, -1:].float())
+            ) = self.value_head(x_fp32, input_global[:, -1:].float(), mask=mask_flat)
 
         return (
             out_policy, out_value, out_misc, out_moremisc,

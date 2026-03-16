@@ -166,11 +166,20 @@ def main(rank, world_size, args, gpu_id):
         model_extra_kwargs = {"use_fp8": args.use_fp8}
     else:
         from model import Model
-        model_extra_kwargs = {}
+        model_extra_kwargs = {"varlen": args.varlen}
 
     # Parse td_value_loss_scales
     td_value_loss_scales = [float(x) for x in args.td_value_loss_scales.split(",")]
     assert len(td_value_loss_scales) == 3
+
+    def apply_varlen_mode(varlen_value, source_name):
+        args.varlen = varlen_value
+        if args.varlen and args.use_te:
+            raise RuntimeError(
+                f"{source_name} requires --varlen, but --use-te is not compatible with varlen checkpoints"
+            )
+        if not args.use_te:
+            model_extra_kwargs["varlen"] = args.varlen
 
     # FP8 setup
     fp8_ctx_fn = contextlib.nullcontext
@@ -287,6 +296,11 @@ def main(rank, world_size, args, gpu_id):
             logging.warning(f"  checkpoint: {ckpt_config}")
             logging.warning(f"  command-line: {model_config}")
         model_config = ckpt_config
+        # Restore varlen flag from checkpoint
+        ckpt_varlen = state.get("varlen", False)
+        if ckpt_varlen != args.varlen:
+            logging.warning(f"Checkpoint varlen={ckpt_varlen} differs from command-line --varlen={args.varlen}, using checkpoint value")
+        apply_varlen_mode(ckpt_varlen, "Checkpoint")
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
@@ -319,6 +333,15 @@ def main(rank, world_size, args, gpu_id):
         logging.info(f"Loading initial checkpoint: {args.initial_checkpoint}")
         state = torch.load(args.initial_checkpoint, map_location="cpu", weights_only=False)
         model_config = configs.migrate_config(state.get("config", model_config))
+        ckpt_has_varlen = "varlen" in state
+        ckpt_varlen = state.get("varlen", False)
+        if ckpt_has_varlen and ckpt_varlen != args.varlen:
+            raise RuntimeError(
+                f"Initial checkpoint varlen={ckpt_varlen} differs from --varlen={args.varlen}; "
+                "rerun with a matching flag"
+            )
+        if ckpt_has_varlen:
+            apply_varlen_mode(ckpt_varlen, "Initial checkpoint")
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
@@ -632,6 +655,7 @@ def main(rank, world_size, args, gpu_id):
                 "samples_per_step": samples_per_step,
                 "moving_unowned_proportion_sum": model.moving_unowned_proportion_sum,
                 "moving_unowned_proportion_weight": model.moving_unowned_proportion_weight,
+                "varlen": args.varlen,
                 "training_mode": {
                     "zero": zero_adam is not None,
                     "has_muon": muon_opt is not None,
@@ -792,6 +816,7 @@ def main(rank, world_size, args, gpu_id):
             model_config=model_config,
             use_pin_memory=use_pin_memory,
             seed=args.seed + rank if args.seed is not None else None,
+            varlen=args.varlen,
         )
         profiler.tick()
         for batch in data_processing.prefetch_generator(train_gen, args.prefetch_batches):
@@ -822,6 +847,7 @@ def main(rank, world_size, args, gpu_id):
                 # Compiled postprocess + loss (seki moving average computed inside as tensor ops)
                 moving_sum_t = torch.tensor(model.moving_unowned_proportion_sum, device=device)
                 moving_weight_t = torch.tensor(model.moving_unowned_proportion_weight, device=device)
+                train_mask = batch["binaryInputNCHW"][:, 0:1, :, :].contiguous() if args.varlen else None
                 loss, metrics_stack, new_moving_sum, new_moving_weight = compiled_loss_fn(
                     outputs, model.value_head.score_belief_offset_vector,
                     batch["policyTargetsNCMove"],
@@ -833,6 +859,7 @@ def main(rank, world_size, args, gpu_id):
                     seki_loss_scale=args.seki_loss_scale,
                     variance_time_loss_scale=args.variance_time_loss_scale,
                     disable_optimistic_policy=args.disable_optimistic_policy,
+                    mask=train_mask,
                 )
                 profiler.tick("loss")
 
@@ -1033,10 +1060,12 @@ def main(rank, world_size, args, gpu_id):
                                 enable_history_matrices=args.enable_history_matrices,
                                 model_config=model_config,
                                 use_pin_memory=use_pin_memory,
+                                varlen=args.varlen,
                             )
                             for val_batch in data_processing.prefetch_generator(val_gen, args.prefetch_batches):
                                 with torch.amp.autocast(amp_device, dtype=amp_dtype, enabled=use_amp):
                                     outputs = model(val_batch["binaryInputNCHW"], val_batch["globalInputNC"])
+                                val_mask = val_batch["binaryInputNCHW"][:, 0:1, :, :].contiguous() if args.varlen else None
                                 _, batch_metrics = compute_loss(
                                     model, outputs, val_batch, pos_len,
                                     is_training=False,
@@ -1046,6 +1075,7 @@ def main(rank, world_size, args, gpu_id):
                                     seki_loss_scale=args.seki_loss_scale,
                                     variance_time_loss_scale=args.variance_time_loss_scale,
                                     disable_optimistic_policy=args.disable_optimistic_policy,
+                                    mask=val_mask,
                                 )
                                 for k in batch_metrics:
                                     val_metrics[k] += batch_metrics[k]
@@ -1152,6 +1182,8 @@ if __name__ == "__main__":
                         help="EMA decay rate for model params (0=disabled, typical: 0.999 or 0.9999)")
     parser.add_argument("--stem", type=str, default="cnn3", choices=["cnn1", "cnn3", "cnn5"],
                         help="Stem conv kernel: cnn1 (1x1), cnn3 (3x3), cnn5 (5x5)")
+    parser.add_argument("--varlen", action="store_true",
+                        help="Enable variable-length board input with masking (native PyTorch only)")
     args = parser.parse_args()
 
     # Validation
@@ -1163,6 +1195,8 @@ if __name__ == "__main__":
         parser.error("--batch-size must be divisible by 8 when --symmetry-type is 'all'")
     if args.amp_dtype == "fp16" and not torch.cuda.is_available():
         parser.error("--amp-dtype fp16 requires CUDA")
+    if args.varlen and args.use_te:
+        parser.error("--varlen is not compatible with --use-te; use native PyTorch model only")
 
     # Detect torchrun launch (torchrun sets RANK, LOCAL_RANK, WORLD_SIZE env vars)
     torchrun_rank = os.environ.get("RANK")

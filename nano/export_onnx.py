@@ -54,29 +54,38 @@ FULL_OUTPUT_NAMES = [
 STEM_OUTPUT_NAMES = [
     "out_stem",         # (N, L, C)
 ]
+STEM_OUTPUT_NAMES_VARLEN = [
+    "out_stem",         # (N, L, C)
+    "out_mask",         # (N, L)
+]
 BLOCKS_OUTPUT_NAMES = [
     "out_blocks",       # (N, L, C)
 ]
+BLOCKS_INPUT_NAMES_VARLEN = ["input_stem", "input_mask"]
 TRUNK_OUTPUT_NAMES = [
     "out_trunk",        # (N, L, C)
 ]
+TRUNK_OUTPUT_NAMES_VARLEN = [
+    "out_trunk",        # (N, L, C)
+    "out_mask",         # (N, L)
+]
 
 
-def _input_names(export_scope):
+def _input_names(export_scope, varlen=False):
     if export_scope == "blocks":
-        return BLOCKS_INPUT_NAMES
+        return BLOCKS_INPUT_NAMES_VARLEN if varlen else BLOCKS_INPUT_NAMES
     return INPUT_NAMES
 
 
-def _output_names(export_scope):
+def _output_names(export_scope, varlen=False):
     if export_scope == "full":
         return FULL_OUTPUT_NAMES
     if export_scope == "stem":
-        return STEM_OUTPUT_NAMES
+        return STEM_OUTPUT_NAMES_VARLEN if varlen else STEM_OUTPUT_NAMES
     if export_scope == "blocks":
         return BLOCKS_OUTPUT_NAMES
     if export_scope == "trunk":
-        return TRUNK_OUTPUT_NAMES
+        return TRUNK_OUTPUT_NAMES_VARLEN if varlen else TRUNK_OUTPUT_NAMES
     raise ValueError(f"Unsupported export scope: {export_scope}")
 
 
@@ -88,17 +97,24 @@ class SingleBlockExportWrapper(nn.Module):
     final RMSNorm so the full ``blocks`` computation is covered.
     """
 
-    def __init__(self, block, rope_cos, rope_sin, norm_final=None):
+    def __init__(self, block, rope_cos, rope_sin, norm_final=None, varlen=False):
         super().__init__()
         self.block = block
         self.register_buffer("rope_cos", rope_cos)
         self.register_buffer("rope_sin", rope_sin)
         self.norm_final = norm_final
-        self._export_input_names = BLOCKS_INPUT_NAMES
+        self.varlen = varlen
+        self._export_input_names = BLOCKS_INPUT_NAMES_VARLEN if varlen else BLOCKS_INPUT_NAMES
         self._export_output_names = BLOCKS_OUTPUT_NAMES
 
-    def forward(self, x):
-        x = self.block(x, self.rope_cos, self.rope_sin)
+    def forward(self, x, mask_flat=None):
+        if self.varlen and mask_flat is not None:
+            N, L = mask_flat.shape
+            attn_mask = torch.zeros(N, 1, 1, L, device=mask_flat.device, dtype=x.dtype)
+            attn_mask.masked_fill_(mask_flat.view(N, 1, 1, L) == 0, float('-inf'))
+            x = self.block(x, self.rope_cos, self.rope_sin, attn_mask=attn_mask)
+        else:
+            x = self.block(x, self.rope_cos, self.rope_sin)
         if self.norm_final is not None:
             x = self.norm_final(x)
         return (x.float(),)
@@ -106,13 +122,14 @@ class SingleBlockExportWrapper(nn.Module):
 
 
 class ExportWrapper(nn.Module):
-    def __init__(self, model, export_scope="full"):
+    def __init__(self, model, export_scope="full", varlen=False):
         super().__init__()
         self.model = model
         self.export_scope = export_scope
+        self.varlen = varlen
         self._export_scope = export_scope
-        self._export_input_names = _input_names(export_scope)
-        self._export_output_names = _output_names(export_scope)
+        self._export_input_names = _input_names(export_scope, varlen=varlen)
+        self._export_output_names = _output_names(export_scope, varlen=varlen)
 
     def forward(self, input0, input1=None):
         if self.export_scope == "stem":
@@ -121,13 +138,17 @@ class ExportWrapper(nn.Module):
                 raise RuntimeError(
                     f"Model {type(self.model).__name__} does not implement forward_stem_for_onnx_export()"
                 )
-            return (export_stem(input0, input1),)
+            result = export_stem(input0, input1)
+            # varlen stem returns (x, mask_flat) tuple; non-varlen returns tensor
+            return result if isinstance(result, tuple) else (result,)
         if self.export_scope == "blocks":
             export_blocks = getattr(self.model, "forward_blocks_for_onnx_export", None)
             if export_blocks is None:
                 raise RuntimeError(
                     f"Model {type(self.model).__name__} does not implement forward_blocks_for_onnx_export()"
                 )
+            if self.varlen and input1 is not None:
+                return (export_blocks(input0, input1),)
             return (export_blocks(input0),)
         if self.export_scope == "trunk":
             export_trunk = getattr(self.model, "forward_trunk_for_onnx_export", None)
@@ -135,7 +156,8 @@ class ExportWrapper(nn.Module):
                 raise RuntimeError(
                     f"Model {type(self.model).__name__} does not implement forward_trunk_for_onnx_export()"
                 )
-            return (export_trunk(input0, input1),)
+            result = export_trunk(input0, input1)
+            return result if isinstance(result, tuple) else (result,)
         export_forward = getattr(self.model, "forward_for_onnx_export", None)
         if export_forward is None:
             return self.model(input0, input1)
@@ -146,9 +168,12 @@ def _load_checkpoint(args):
     print(f"Loading checkpoint: {args.checkpoint}")
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = migrate_config(state["config"])
+    varlen = state.get("varlen", False)
+    if varlen:
+        print(f"Checkpoint was trained with --varlen; mask logic will be included in the exported model")
     print(f"Model config: {config}")
     print(f"pos_len={args.pos_len}, score_mode={args.score_mode}, method={args.method}")
-    return state, config
+    return state, config, varlen
 
 
 def _resolve_output_path(args):
@@ -232,23 +257,32 @@ def _convert_checkpoint_te_to_model_standalone(state_dict):
     return new_sd
 
 
-def _make_dummy_inputs(config, pos_len, device, batch_size=1):
+def _make_dummy_inputs(config, pos_len, device, batch_size=1, varlen=False):
     num_bin = get_num_bin_input_features(config)
     num_global = get_num_global_input_features(config)
     input_spatial = torch.randn(batch_size, num_bin, pos_len, pos_len, device=device)
+    if varlen:
+        # Channel 0 is the on-board mask; set to all-ones for full-board tracing
+        input_spatial[:, 0, :, :] = 1.0
     input_global = torch.randn(batch_size, num_global, device=device)
     return input_spatial, input_global
 
 
 def _make_blocks_input(model, input_spatial, input_global):
     with torch.inference_mode():
-        return model.forward_stem_for_onnx_export(input_spatial, input_global)
+        result = model.forward_stem_for_onnx_export(input_spatial, input_global)
+        if isinstance(result, tuple):
+            return result  # (x, mask_flat) for varlen
+        return result
 
 
-def _resolve_export_inputs(model, export_scope, input_spatial, input_global):
+def _resolve_export_inputs(model, export_scope, input_spatial, input_global, varlen=False):
     if export_scope == "blocks":
-        input_stem = _make_blocks_input(model, input_spatial, input_global)
-        return (input_stem,), input_stem, None
+        result = _make_blocks_input(model, input_spatial, input_global)
+        if varlen and isinstance(result, tuple):
+            input_stem, mask_flat = result
+            return (input_stem, mask_flat), input_stem, mask_flat
+        return (result,), result, None
     return (input_spatial, input_global), input_spatial, input_global
 
 
@@ -259,11 +293,13 @@ def _legacy_dynamic_axes():
     return dynamic_axes
 
 
-def _dynamic_axes_for_scope(export_scope):
+def _dynamic_axes_for_scope(export_scope, varlen=False):
     if export_scope == "full":
         return _legacy_dynamic_axes()
-    dynamic_axes = {_output_names(export_scope)[0]: {0: "batch"}}
-    for name in _input_names(export_scope):
+    dynamic_axes = {}
+    for name in _output_names(export_scope, varlen=varlen):
+        dynamic_axes[name] = {0: "batch"}
+    for name in _input_names(export_scope, varlen=varlen):
         dynamic_axes[name] = {0: "batch"}
     return dynamic_axes
 
@@ -368,7 +404,7 @@ def _save_summary(output_path):
         print(f"  External data: {path} ({size_mb:.1f} MB)")
 
 
-def _add_metadata(output_path, config, args):
+def _add_metadata(output_path, config, args, varlen=False):
     """Add KataGo-required metadata to the exported ONNX model."""
     try:
         import onnx
@@ -395,7 +431,7 @@ def _add_metadata(output_path, config, args):
         "pos_len": str(args.pos_len),
         "pos_len_x": str(args.pos_len),
         "pos_len_y": str(args.pos_len),
-        "has_mask": "false",
+        "has_mask": "true" if varlen else "false",
         "model_config": str(config),
         "author": "unknown",
         "comment": "",
@@ -553,7 +589,7 @@ def _make_te_decomposed_fallback_args(args):
     return fallback_args
 
 
-def _export_legacy(args, state, config):
+def _export_legacy(args, state, config, varlen=False):
     model_state = _resolve_model_state(state, args.use_ema)
     should_try_te_conversion = args.use_te or _looks_like_te_checkpoint(model_state)
     if should_try_te_conversion:
@@ -567,19 +603,19 @@ def _export_legacy(args, state, config):
             print("Converting TE checkpoint to model.py format for legacy ONNX export")
             model_state = convert_checkpoint_te_to_model(model_state)
 
-    model = Model(config, args.pos_len, score_mode=args.score_mode)
+    model = Model(config, args.pos_len, score_mode=args.score_mode, varlen=varlen)
     model.load_state_dict(model_state)
     model.eval()
     _print_param_count(model)
 
-    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device="cpu")
+    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device="cpu", varlen=varlen)
     output_path = _resolve_output_path(args)
     opset_version = DEFAULT_ONNX_OPSET if args.opset is None else args.opset
-    output_names = _output_names(args.export_scope)
-    wrapper = ExportWrapper(model, args.export_scope).eval()
+    output_names = _output_names(args.export_scope, varlen=varlen)
+    wrapper = ExportWrapper(model, args.export_scope, varlen=varlen).eval()
 
     export_inputs, verify_input0, verify_input1 = _resolve_export_inputs(
-        model, args.export_scope, input_spatial, input_global
+        model, args.export_scope, input_spatial, input_global, varlen=varlen
     )
 
     print(f"Exporting ONNX with legacy exporter (opset {opset_version}) ...")
@@ -588,20 +624,22 @@ def _export_legacy(args, state, config):
             wrapper,
             export_inputs,
             output_path,
-            input_names=_input_names(args.export_scope),
+            input_names=_input_names(args.export_scope, varlen=varlen),
             output_names=output_names,
-            dynamic_axes=_dynamic_axes_for_scope(args.export_scope),
+            dynamic_axes=_dynamic_axes_for_scope(args.export_scope, varlen=varlen),
             opset_version=opset_version,
             do_constant_folding=True,
             dynamo=False,
         )
 
     _save_summary(output_path)
-    _add_metadata(output_path, config, args)
+    _add_metadata(output_path, config, args, varlen=varlen)
     return output_path, wrapper, verify_input0, verify_input1
 
 
-def _export_te_official(args, state, config):
+def _export_te_official(args, state, config, varlen=False):
+    if varlen:
+        raise RuntimeError("--varlen checkpoints cannot be exported with TE methods; use --method legacy")
     te, te_onnx_export, te_translation_table = _resolve_te_support()
     from model_te import Model as TEModel, convert_checkpoint_model_to_te, detect_checkpoint_format
 
@@ -677,7 +715,9 @@ def _export_te_official(args, state, config):
     return output_path, wrapper, verify_input0, verify_input1
 
 
-def _export_te_decomposed(args, state, config):
+def _export_te_decomposed(args, state, config, varlen=False):
+    if varlen:
+        raise RuntimeError("--varlen checkpoints cannot be exported with TE methods; use --method legacy")
     te, te_onnx_export, te_translation_table = _resolve_te_support()
     from model_te import (
         ModelDecomposedExport,
@@ -776,7 +816,9 @@ def export_per_block(args):
         detect_checkpoint_format,
     )
 
-    state, config = _load_checkpoint(args)
+    state, config, varlen = _load_checkpoint(args)
+    if varlen:
+        raise RuntimeError("--varlen checkpoints cannot be exported with TE per-block method; use --method legacy")
     device = _resolve_te_device(args.device)
     autocast_config = _resolve_te_autocast_config(args)
     model_state = _resolve_model_state(state, args.use_ema)
@@ -872,7 +914,7 @@ def export_per_block(args):
     return block_paths
 
 
-def _export_fp8_manual(args, state, config):
+def _export_fp8_manual(args, state, config, varlen=False):
     """Export with manually inserted FP8 Q/DQ nodes (no Transformer Engine dependency).
 
     Uses the pure PyTorch model (model.py) with nn.Linear layers replaced by
@@ -894,7 +936,7 @@ def _export_fp8_manual(args, state, config):
             print("Converting TE checkpoint to model.py format for FP8 manual export")
             model_state = convert_checkpoint_te_to_model(model_state)
 
-    model = Model(config, args.pos_len, score_mode=args.score_mode)
+    model = Model(config, args.pos_len, score_mode=args.score_mode, varlen=varlen)
     model.load_state_dict(model_state)
     model.eval()
 
@@ -905,7 +947,7 @@ def _export_fp8_manual(args, state, config):
     refresh_all_weight_scales(model)
     _print_param_count(model)
 
-    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device="cpu")
+    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device="cpu", varlen=varlen)
 
     # Calibrate activation scales so they become ONNX constant initialisers.
     print("Calibrating FP8 activation scales ...")
@@ -916,10 +958,10 @@ def _export_fp8_manual(args, state, config):
         print(f"WARNING: FP8 Q/DQ requires opset >= 21, got {opset_version}. Forcing opset 21.")
         opset_version = max(opset_version, 21)
 
-    output_names = _output_names(args.export_scope)
-    wrapper = ExportWrapper(model, args.export_scope).eval()
+    output_names = _output_names(args.export_scope, varlen=varlen)
+    wrapper = ExportWrapper(model, args.export_scope, varlen=varlen).eval()
     export_inputs, verify_input0, verify_input1 = _resolve_export_inputs(
-        model, args.export_scope, input_spatial, input_global
+        model, args.export_scope, input_spatial, input_global, varlen=varlen
     )
 
     print(f"Exporting ONNX with manual FP8 Q/DQ (opset {opset_version}) ...")
@@ -928,9 +970,9 @@ def _export_fp8_manual(args, state, config):
             wrapper,
             export_inputs,
             output_path,
-            input_names=_input_names(args.export_scope),
+            input_names=_input_names(args.export_scope, varlen=varlen),
             output_names=output_names,
-            dynamic_axes=_dynamic_axes_for_scope(args.export_scope),
+            dynamic_axes=_dynamic_axes_for_scope(args.export_scope, varlen=varlen),
             opset_version=opset_version,
             do_constant_folding=True,
             dynamo=False,
@@ -944,39 +986,39 @@ def _export_fp8_manual(args, state, config):
     verify_fp8_qdq_structure(output_path, num_blocks)
 
     _save_summary(output_path)
-    _add_metadata(output_path, config, args)
+    _add_metadata(output_path, config, args, varlen=varlen)
     return output_path, wrapper, verify_input0, verify_input1
 
 
 def export(args):
-    state, config = _load_checkpoint(args)
+    state, config, varlen = _load_checkpoint(args)
     if args.method == "fp8-manual":
-        return _export_fp8_manual(args, state, config)
+        return _export_fp8_manual(args, state, config, varlen=varlen)
     if args.method == "legacy":
-        return _export_legacy(args, state, config)
+        return _export_legacy(args, state, config, varlen=varlen)
     if args.method == "te-decomposed":
         try:
-            return _export_te_decomposed(args, state, config)
+            return _export_te_decomposed(args, state, config, varlen=varlen)
         except RuntimeError as exc:
             if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                 print("\nWARNING: te-decomposed export failed, falling back to legacy export.")
                 print(f"  original error: {exc}")
-                return _export_legacy(_make_legacy_fallback_args(args), state, config)
+                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen)
             raise
     if args.method == "te-official":
         try:
-            return _export_te_official(args, state, config)
+            return _export_te_official(args, state, config, varlen=varlen)
         except RuntimeError as exc:
             if getattr(args, "fallback_to_te_decomposed_on_te_export_error", False):
                 print("\nWARNING: te-official export failed, falling back to decomposed TE export.")
                 print(f"  original error: {exc}")
                 try:
-                    return _export_te_decomposed(_make_te_decomposed_fallback_args(args), state, config)
+                    return _export_te_decomposed(_make_te_decomposed_fallback_args(args), state, config, varlen=varlen)
                 except RuntimeError as decomposed_exc:
                     if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                         print("\nWARNING: te-decomposed export failed, falling back to legacy export.")
                         print(f"  original error: {decomposed_exc}")
-                        return _export_legacy(_make_legacy_fallback_args(args), state, config)
+                        return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen)
                     raise RuntimeError(
                         "Both te-official and te-decomposed exports failed.\n"
                         f"te-official error: {exc}\n"
@@ -985,7 +1027,7 @@ def export(args):
             if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                 print("\nWARNING: te-official export failed, falling back to legacy export.")
                 print(f"  original error: {exc}")
-                return _export_legacy(_make_legacy_fallback_args(args), state, config)
+                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen)
             raise
     raise ValueError(f"Unsupported export method: {args.method}")
 

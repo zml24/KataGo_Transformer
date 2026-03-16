@@ -32,6 +32,7 @@ def postprocess_and_loss_core(
     seki_loss_scale=1.0,
     variance_time_loss_scale=1.0,
     disable_optimistic_policy=False,
+    mask=None,
 ):
     """Postprocess model outputs and compute loss. torch.compile friendly.
 
@@ -66,6 +67,17 @@ def postprocess_and_loss_core(
     # --- Loss computation ---
     N = policy_logits.shape[0]
     pos_area = pos_len * pos_len
+
+    # Mask setup for variable-length board inputs
+    if mask is not None:
+        # mask: (N, 1, H, W) float, 1=valid, 0=padding
+        mask_hw = mask.view(N, pos_area)  # (N, L)
+        mask_n1hw = mask.view(N, 1, pos_len, pos_len)  # (N, 1, H, W)
+        pos_area_per_sample = mask_hw.sum(dim=1)  # (N,)
+    else:
+        mask_hw = None
+        mask_n1hw = None
+        pos_area_per_sample = None
 
     # Target distributions
     target_policy_player = target_policy_ncmove[:, 0, :]
@@ -196,29 +208,50 @@ def postprocess_and_loss_core(
     # Ownership
     pred_own_logits = torch.cat([ownership_pretanh, -ownership_pretanh], dim=1).view(N, 2, pos_area)
     target_own_probs = torch.stack([(1.0 + target_ownership) / 2.0, (1.0 - target_ownership) / 2.0], dim=1).view(N, 2, pos_area)
-    loss_ownership = 1.5 * (global_weight * target_weight_ownership * (
-        torch.sum(cross_entropy(pred_own_logits, target_own_probs, dim=1), dim=1) / pos_area
-    )).sum()
+    own_ce = cross_entropy(pred_own_logits, target_own_probs, dim=1)  # (N, L)
+    if mask_hw is not None:
+        loss_ownership = 1.5 * (global_weight * target_weight_ownership * (
+            torch.sum(own_ce * mask_hw, dim=1) / pos_area_per_sample
+        )).sum()
+    else:
+        loss_ownership = 1.5 * (global_weight * target_weight_ownership * (
+            torch.sum(own_ce, dim=1) / pos_area
+        )).sum()
 
     # Scoring
-    loss_scoring_raw = torch.sum(torch.square(pred_scoring.squeeze(1) - target_scoring), dim=(1, 2)) / pos_area
+    scoring_sq = torch.square(pred_scoring.squeeze(1) - target_scoring)  # (N, H, W)
+    if mask_n1hw is not None:
+        loss_scoring_raw = torch.sum(scoring_sq * mask_n1hw.squeeze(1), dim=(1, 2)) / pos_area_per_sample
+    else:
+        loss_scoring_raw = torch.sum(scoring_sq, dim=(1, 2)) / pos_area
     loss_scoring = (global_weight * target_weight_scoring * 4.0 * (torch.sqrt(loss_scoring_raw * 0.5 + 1.0) - 1.0)).sum()
 
     # Future position
     fp_loss = torch.square(torch.tanh(futurepos_pretanh) - target_futurepos)
     fp_weight = torch.tensor([1.0, 0.25], device=fp_loss.device).view(1, 2, 1, 1)
-    loss_futurepos = 0.25 * (global_weight * target_weight_futurepos * (
-        torch.sum(fp_loss * fp_weight, dim=(1, 2, 3)) / math.sqrt(pos_area)
-    )).sum()
+    if mask_n1hw is not None:
+        loss_futurepos = 0.25 * (global_weight * target_weight_futurepos * (
+            torch.sum(fp_loss * fp_weight * mask_n1hw, dim=(1, 2, 3)) / torch.sqrt(pos_area_per_sample)
+        )).sum()
+    else:
+        loss_futurepos = 0.25 * (global_weight * target_weight_futurepos * (
+            torch.sum(fp_loss * fp_weight, dim=(1, 2, 3)) / math.sqrt(pos_area)
+        )).sum()
 
     # Seki (dynamic weight)
     owned_target = torch.square(target_ownership)
     unowned_target = 1.0 - owned_target
 
     # Seki dynamic weight: compute moving average and seki_weight_scale as tensors
-    unowned_proportion = torch.mean(
-        torch.sum(unowned_target, dim=(1, 2)) / (1.0 + pos_area) * target_weight_ownership
-    )
+    if mask_n1hw is not None:
+        mask_hw_2d = mask_n1hw.squeeze(1)  # (N, H, W)
+        unowned_proportion = torch.mean(
+            torch.sum(unowned_target * mask_hw_2d, dim=(1, 2)) / (1.0 + pos_area_per_sample) * target_weight_ownership
+        )
+    else:
+        unowned_proportion = torch.mean(
+            torch.sum(unowned_target, dim=(1, 2)) / (1.0 + pos_area) * target_weight_ownership
+        )
 
     if is_training:
         new_moving_sum = moving_unowned_proportion_sum * 0.998 + unowned_proportion
@@ -236,11 +269,18 @@ def postprocess_and_loss_core(
         F.relu(target_seki),
         F.relu(-target_seki),
     ], dim=1)
-    loss_sign = torch.sum(cross_entropy(sign_pred, sign_target, dim=1), dim=(1, 2))
+    seki_sign_ce = cross_entropy(sign_pred, sign_target, dim=1)  # (N, H, W)
     neutral_pred = torch.stack([seki_logits[:, 3, :, :], torch.zeros_like(target_ownership)], dim=1)
     neutral_target = torch.stack([unowned_target, owned_target], dim=1)
-    loss_neutral = torch.sum(cross_entropy(neutral_pred, neutral_target, dim=1), dim=(1, 2))
-    loss_seki = (global_weight * seki_weight_scale * target_weight_ownership * (loss_sign + 0.5 * loss_neutral) / pos_area).sum()
+    seki_neutral_ce = cross_entropy(neutral_pred, neutral_target, dim=1)  # (N, H, W)
+    if mask_n1hw is not None:
+        loss_sign = torch.sum(seki_sign_ce * mask_hw_2d, dim=(1, 2))
+        loss_neutral = torch.sum(seki_neutral_ce * mask_hw_2d, dim=(1, 2))
+        loss_seki = (global_weight * seki_weight_scale * target_weight_ownership * (loss_sign + 0.5 * loss_neutral) / pos_area_per_sample).sum()
+    else:
+        loss_sign = torch.sum(seki_sign_ce, dim=(1, 2))
+        loss_neutral = torch.sum(seki_neutral_ce, dim=(1, 2))
+        loss_seki = (global_weight * seki_weight_scale * target_weight_ownership * (loss_sign + 0.5 * loss_neutral) / pos_area).sum()
 
     # --- Score belief loss ---
     loss_scoremean = 0.0015 * (global_weight * target_weight_ownership * F.huber_loss(
@@ -344,6 +384,7 @@ def compute_loss(
     seki_loss_scale=1.0,
     variance_time_loss_scale=1.0,
     disable_optimistic_policy=False,
+    mask=None,
 ):
     """Wrapper around postprocess_and_loss_core for backward compatibility.
 
@@ -365,6 +406,7 @@ def compute_loss(
         seki_loss_scale=seki_loss_scale,
         variance_time_loss_scale=variance_time_loss_scale,
         disable_optimistic_policy=disable_optimistic_policy,
+        mask=mask,
     )
 
     # Write back seki moving average state
