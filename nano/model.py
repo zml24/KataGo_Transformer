@@ -344,26 +344,9 @@ class Model(nn.Module):
                     std = std / math.sqrt(2.0 * num_blocks)
                 nn.init.normal_(p, mean=0.0, std=std)
 
-    def _run_trunk_impl(self, x, attn_mask=None):
-        return self._forward_blocks_impl(x, attn_mask=attn_mask)
-
-    @torch._dynamo.disable
-    def _run_trunk_no_compile(self, x, attn_mask=None):
-        return self._run_trunk_impl(x, attn_mask=attn_mask)
-
-    def _forward_trunk_impl(self, input_spatial, input_global, allow_no_compile=False):
+    def _forward_trunk_impl(self, input_spatial, input_global):
         x, attn_mask, mask_flat = self._forward_stem_impl(input_spatial, input_global)
-        if (
-            allow_no_compile
-            and self.training
-            and x.is_cuda
-            and x.dtype in (torch.float16, torch.bfloat16)
-        ):
-            # Inductor compiled autograd has hit unstable low-precision GEMM
-            # backward paths in the transformer trunk on some CUDA stacks.
-            x = self._run_trunk_no_compile(x, attn_mask=attn_mask)
-        else:
-            x = self._run_trunk_impl(x, attn_mask=attn_mask)
+        x = self._forward_blocks_impl(x, attn_mask=attn_mask)
         return x, mask_flat
 
     def _forward_blocks_impl(self, x, attn_mask=None):
@@ -423,7 +406,7 @@ class Model(nn.Module):
         input_spatial: (N, C_bin, H, W)
         input_global:  (N, C_global)
         """
-        x, mask_flat = self._forward_trunk_impl(input_spatial, input_global, allow_no_compile=True)
+        x, mask_flat = self._forward_trunk_impl(input_spatial, input_global)
 
         # Output heads (fp32, autocast disabled)
         with torch.amp.autocast(x.device.type, enabled=False):
