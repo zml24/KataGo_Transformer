@@ -8,7 +8,7 @@ comparisons (which also reflect norm/FFN differences).
 Stacks tested:
   - TE TransformerLayer (fused block, TE attention)
   - TE Decomposed (TE norm/FFN, TE DotProductAttention)
-  - Pure SDPA (nn.RMSNorm/nn.Linear, F.scaled_dot_product_attention)
+  - Pure SDPA (RMSNormFP32/nn.Linear, F.scaled_dot_product_attention)
   - Hybrid (TE norm/FFN, SDPA attention)
 
 Usage:
@@ -28,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
 
-from model import apply_rotary_emb, precompute_freqs_cos_sin_2d
+from model import apply_rotary_emb, precompute_freqs_cos_sin_2d, RMSNormFP32
 
 
 def build_varlen_masks(batch_size, pos_len, device):
@@ -136,12 +136,12 @@ class SDPAStack(nn.Module):
         self.blocks = nn.ModuleList()
         for _ in range(num_layers):
             self.blocks.append(nn.ModuleDict({
-                'norm1': nn.RMSNorm(hidden, eps=1e-6),
+                'norm1': RMSNormFP32(hidden, eps=1e-6),
                 'q_proj': nn.Linear(hidden, hidden, bias=False),
                 'k_proj': nn.Linear(hidden, hidden, bias=False),
                 'v_proj': nn.Linear(hidden, hidden, bias=False),
                 'out_proj': nn.Linear(hidden, hidden, bias=False),
-                'norm2': nn.RMSNorm(hidden, eps=1e-6),
+                'norm2': RMSNormFP32(hidden, eps=1e-6),
                 'ffn_w1': nn.Linear(hidden, ffn_dim, bias=False),
                 'ffn_wgate': nn.Linear(hidden, ffn_dim, bias=False),
                 'ffn_w2': nn.Linear(ffn_dim, hidden, bias=False),
