@@ -124,8 +124,6 @@ class TransformerBlock(nn.Module):
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
-        if attn_mask is not None:
-            attn_mask = attn_mask.to(dtype=q.dtype)
         attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
         attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, C)
         x = x + self.out_proj(attn_out)
@@ -361,11 +359,7 @@ class Model(nn.Module):
         if self.varlen:
             mask = input_spatial[:, 0:1, :, :].contiguous()  # (N, 1, H, W)
             mask_flat = mask.view(N, L)  # (N, L)
-            # Additive attention mask: 0 for valid, -inf for padding
-            attn_mask = torch.zeros(N, 1, 1, L, device=input_spatial.device, dtype=input_spatial.dtype)
-            attn_mask.masked_fill_(mask_flat.view(N, 1, 1, L) == 0, float('-inf'))
         else:
-            attn_mask = None
             mask_flat = None
 
         # Stem: NCHW -> NLC
@@ -373,6 +367,14 @@ class Model(nn.Module):
         x_spatial = self.conv_spatial(input_spatial)
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
         x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
+
+        # Additive attention mask in x.dtype (fp16/bf16 under autocast)
+        if self.varlen:
+            attn_mask = torch.zeros(N, 1, 1, L, device=x.device, dtype=x.dtype)
+            attn_mask.masked_fill_(mask_flat.view(N, 1, 1, L) == 0, float('-inf'))
+        else:
+            attn_mask = None
+
         return x, attn_mask, mask_flat
 
     def forward_stem_for_onnx_export(self, input_spatial, input_global):
