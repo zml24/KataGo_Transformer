@@ -163,7 +163,7 @@ def main(rank, world_size, args, gpu_id):
     # Conditional model import
     if args.use_te:
         from model_te import Model, detect_checkpoint_format, convert_checkpoint_model_to_te
-        model_extra_kwargs = {"use_fp8": args.use_fp8}
+        model_extra_kwargs = {"use_fp8": args.use_fp8, "varlen": args.varlen}
     else:
         from model import Model
         model_extra_kwargs = {"varlen": args.varlen}
@@ -174,12 +174,7 @@ def main(rank, world_size, args, gpu_id):
 
     def apply_varlen_mode(varlen_value, source_name):
         args.varlen = varlen_value
-        if args.varlen and args.use_te:
-            raise RuntimeError(
-                f"{source_name} requires --varlen, but --use-te is not compatible with varlen checkpoints"
-            )
-        if not args.use_te:
-            model_extra_kwargs["varlen"] = args.varlen
+        model_extra_kwargs["varlen"] = args.varlen
 
     # FP8 setup
     fp8_ctx_fn = contextlib.nullcontext
@@ -1183,7 +1178,7 @@ if __name__ == "__main__":
     parser.add_argument("--stem", type=str, default="cnn3", choices=["cnn1", "cnn3", "cnn5"],
                         help="Stem conv kernel: cnn1 (1x1), cnn3 (3x3), cnn5 (5x5)")
     parser.add_argument("--varlen", action="store_true",
-                        help="Enable variable-length board input with masking (native PyTorch only)")
+                        help="Enable variable-length board input with masking")
     args = parser.parse_args()
 
     # Validation
@@ -1195,8 +1190,6 @@ if __name__ == "__main__":
         parser.error("--batch-size must be divisible by 8 when --symmetry-type is 'all'")
     if args.amp_dtype == "fp16" and not torch.cuda.is_available():
         parser.error("--amp-dtype fp16 requires CUDA")
-    if args.varlen and args.use_te:
-        parser.error("--varlen is not compatible with --use-te; use native PyTorch model only")
 
     # Detect torchrun launch (torchrun sets RANK, LOCAL_RANK, WORLD_SIZE env vars)
     torchrun_rank = os.environ.get("RANK")

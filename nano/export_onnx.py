@@ -110,8 +110,8 @@ class SingleBlockExportWrapper(nn.Module):
     def forward(self, x, mask_flat=None):
         if self.varlen and mask_flat is not None:
             N, L = mask_flat.shape
-            attn_mask = torch.zeros(N, 1, 1, L, device=mask_flat.device, dtype=x.dtype)
-            attn_mask.masked_fill_(mask_flat.view(N, 1, 1, L) == 0, float('-inf'))
+            # TE boolean mask: True = masked
+            attn_mask = (mask_flat == 0).view(N, 1, 1, L)
             x = self.block(x, self.rope_cos, self.rope_sin, attn_mask=attn_mask)
         else:
             x = self.block(x, self.rope_cos, self.rope_sin)
@@ -279,10 +279,10 @@ def _make_blocks_input(model, input_spatial, input_global):
 def _resolve_export_inputs(model, export_scope, input_spatial, input_global, varlen=False):
     if export_scope == "blocks":
         result = _make_blocks_input(model, input_spatial, input_global)
-        if varlen and isinstance(result, tuple):
-            input_stem, mask_flat = result
+        input_stem, mask_flat = _split_blocks_input(result, varlen=varlen)
+        if mask_flat is not None:
             return (input_stem, mask_flat), input_stem, mask_flat
-        return (result,), result, None
+        return (input_stem,), input_stem, None
     return (input_spatial, input_global), input_spatial, input_global
 
 
@@ -304,9 +304,24 @@ def _dynamic_axes_for_scope(export_scope, varlen=False):
     return dynamic_axes
 
 
-def _te_dynamic_shapes(export_scope):
+def _split_blocks_input(result, varlen=False):
+    if varlen:
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise RuntimeError("varlen blocks export expects forward_stem_for_onnx_export() to return (input_stem, mask_flat)")
+        return result
+    if isinstance(result, tuple):
+        raise RuntimeError("non-varlen blocks export expects forward_stem_for_onnx_export() to return a tensor")
+    return result, None
+
+
+def _te_dynamic_shapes(export_scope, varlen=False):
     batch = torch.export.Dim("batch")
     if export_scope == "blocks":
+        if varlen:
+            return (
+                {0: batch},
+                {0: batch},
+            )
         return ({0: batch},)
     return (
         {0: batch},
@@ -638,8 +653,6 @@ def _export_legacy(args, state, config, varlen=False):
 
 
 def _export_te_official(args, state, config, varlen=False):
-    if varlen:
-        raise RuntimeError("--varlen checkpoints cannot be exported with TE methods; use --method legacy")
     te, te_onnx_export, te_translation_table = _resolve_te_support()
     from model_te import Model as TEModel, convert_checkpoint_model_to_te, detect_checkpoint_format
 
@@ -650,7 +663,7 @@ def _export_te_official(args, state, config, varlen=False):
         print("Converting model.py checkpoint to TE format for official TE ONNX export")
         model_state = convert_checkpoint_model_to_te(model_state)
 
-    model = TEModel(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8)
+    model = TEModel(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8, varlen=varlen)
     load_result = model.load_state_dict(model_state, strict=False)
     _validate_te_load_result(load_result)
     model.eval()
@@ -666,7 +679,9 @@ def _export_te_official(args, state, config, varlen=False):
                 f"Using batch_size={batch_size} for FP8-aligned export trace "
                 f"(batch * pos_len^2 = {batch_size * args.pos_len * args.pos_len}, divisible by 8)"
             )
-    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device=device, batch_size=batch_size)
+    input_spatial, input_global = _make_dummy_inputs(
+        config, args.pos_len, device=device, batch_size=batch_size, varlen=varlen
+    )
     autocast_config = _maybe_disable_te_fp8_for_export(
         autocast_config,
         batch_size=input_spatial.shape[0],
@@ -674,23 +689,23 @@ def _export_te_official(args, state, config, varlen=False):
         hidden_size=config["hidden_size"],
         export_label="official TE export",
     )
-    output_names = _output_names(args.export_scope)
-    wrapper = ExportWrapper(model, args.export_scope).eval()
+    output_names = _output_names(args.export_scope, varlen=varlen)
+    wrapper = ExportWrapper(model, args.export_scope, varlen=varlen).eval()
 
     output_path = _resolve_output_path(args)
     export_inputs, verify_input0, verify_input1 = _resolve_export_inputs(
-        model, args.export_scope, input_spatial, input_global
+        model, args.export_scope, input_spatial, input_global, varlen=varlen
     )
 
     export_kwargs = {
-        "input_names": _input_names(args.export_scope),
+        "input_names": _input_names(args.export_scope, varlen=varlen),
         "output_names": output_names,
         "dynamo": True,
         "fallback": False,
         "custom_translation_table": te_translation_table,
     }
     if args.dynamic_batch:
-        export_kwargs["dynamic_shapes"] = _te_dynamic_shapes(args.export_scope)
+        export_kwargs["dynamic_shapes"] = _te_dynamic_shapes(args.export_scope, varlen=varlen)
     if args.opset is not None:
         export_kwargs["opset_version"] = args.opset
 
@@ -711,13 +726,11 @@ def _export_te_official(args, state, config, varlen=False):
             )
 
     _save_summary(output_path)
-    _add_metadata(output_path, config, args)
+    _add_metadata(output_path, config, args, varlen=varlen)
     return output_path, wrapper, verify_input0, verify_input1
 
 
 def _export_te_decomposed(args, state, config, varlen=False):
-    if varlen:
-        raise RuntimeError("--varlen checkpoints cannot be exported with TE methods; use --method legacy")
     te, te_onnx_export, te_translation_table = _resolve_te_support()
     from model_te import (
         ModelDecomposedExport,
@@ -734,7 +747,7 @@ def _export_te_decomposed(args, state, config, varlen=False):
         model_state = convert_checkpoint_te_to_model(model_state)
 
     model_state = convert_checkpoint_model_to_te_decomposed(model_state)
-    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8)
+    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8, varlen=varlen)
     load_result = model.load_state_dict(model_state, strict=False)
     _validate_te_load_result(load_result)
     model.eval()
@@ -750,7 +763,9 @@ def _export_te_decomposed(args, state, config, varlen=False):
                 f"Using batch_size={batch_size} for FP8-aligned export trace "
                 f"(batch * pos_len^2 = {batch_size * args.pos_len * args.pos_len}, divisible by 8)"
             )
-    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device=device, batch_size=batch_size)
+    input_spatial, input_global = _make_dummy_inputs(
+        config, args.pos_len, device=device, batch_size=batch_size, varlen=varlen
+    )
     autocast_config = _maybe_disable_te_fp8_for_export(
         autocast_config,
         batch_size=input_spatial.shape[0],
@@ -758,23 +773,23 @@ def _export_te_decomposed(args, state, config, varlen=False):
         hidden_size=config["hidden_size"],
         export_label="decomposed TE export",
     )
-    output_names = _output_names(args.export_scope)
-    wrapper = ExportWrapper(model, args.export_scope).eval()
+    output_names = _output_names(args.export_scope, varlen=varlen)
+    wrapper = ExportWrapper(model, args.export_scope, varlen=varlen).eval()
 
     output_path = _resolve_output_path(args)
     export_inputs, verify_input0, verify_input1 = _resolve_export_inputs(
-        model, args.export_scope, input_spatial, input_global
+        model, args.export_scope, input_spatial, input_global, varlen=varlen
     )
 
     export_kwargs = {
-        "input_names": _input_names(args.export_scope),
+        "input_names": _input_names(args.export_scope, varlen=varlen),
         "output_names": output_names,
         "dynamo": True,
         "fallback": False,
         "custom_translation_table": te_translation_table,
     }
     if args.dynamic_batch:
-        export_kwargs["dynamic_shapes"] = _te_dynamic_shapes(args.export_scope)
+        export_kwargs["dynamic_shapes"] = _te_dynamic_shapes(args.export_scope, varlen=varlen)
     if args.opset is not None:
         export_kwargs["opset_version"] = args.opset
 
@@ -795,7 +810,7 @@ def _export_te_decomposed(args, state, config, varlen=False):
             )
 
     _save_summary(output_path)
-    _add_metadata(output_path, config, args)
+    _add_metadata(output_path, config, args, varlen=varlen)
     return output_path, wrapper, verify_input0, verify_input1
 
 
@@ -817,8 +832,6 @@ def export_per_block(args):
     )
 
     state, config, varlen = _load_checkpoint(args)
-    if varlen:
-        raise RuntimeError("--varlen checkpoints cannot be exported with TE per-block method; use --method legacy")
     device = _resolve_te_device(args.device)
     autocast_config = _resolve_te_autocast_config(args)
     model_state = _resolve_model_state(state, args.use_ema)
@@ -827,7 +840,7 @@ def export_per_block(args):
         model_state = convert_checkpoint_te_to_model(model_state)
 
     model_state = convert_checkpoint_model_to_te_decomposed(model_state)
-    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8)
+    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8, varlen=varlen)
     load_result = model.load_state_dict(model_state, strict=False)
     _validate_te_load_result(load_result)
     model.eval()
@@ -844,7 +857,9 @@ def export_per_block(args):
                 f"Using batch_size={batch_size} for FP8-aligned per-block export trace "
                 f"(batch * pos_len^2 = {batch_size * args.pos_len * args.pos_len}, divisible by 8)"
             )
-    input_spatial, input_global = _make_dummy_inputs(config, args.pos_len, device=device, batch_size=batch_size)
+    input_spatial, input_global = _make_dummy_inputs(
+        config, args.pos_len, device=device, batch_size=batch_size, varlen=varlen
+    )
     autocast_config = _maybe_disable_te_fp8_for_export(
         autocast_config,
         batch_size=input_spatial.shape[0],
@@ -853,20 +868,25 @@ def export_per_block(args):
         export_label="per-block decomposed TE export",
     )
 
-    input_stem = _make_blocks_input(model, input_spatial, input_global)
+    input_stem_result = _make_blocks_input(model, input_spatial, input_global)
+    x, mask_flat = _split_blocks_input(input_stem_result, varlen=varlen)
+    attn_mask = None
+    if mask_flat is not None:
+        N, L = mask_flat.shape
+        attn_mask = (mask_flat == 0).view(N, 1, 1, L)
     output_path = _resolve_output_path(args)
     base_name, ext = os.path.splitext(output_path)
     num_blocks = len(model.blocks)
 
     export_kwargs_base = {
-        "input_names": BLOCKS_INPUT_NAMES,
+        "input_names": _input_names("blocks", varlen=varlen),
         "output_names": BLOCKS_OUTPUT_NAMES,
         "dynamo": True,
         "fallback": False,
         "custom_translation_table": te_translation_table,
     }
     if args.dynamic_batch:
-        export_kwargs_base["dynamic_shapes"] = _te_dynamic_shapes("blocks")
+        export_kwargs_base["dynamic_shapes"] = _te_dynamic_shapes("blocks", varlen=varlen)
     if args.opset is not None:
         export_kwargs_base["opset_version"] = args.opset
 
@@ -874,7 +894,6 @@ def export_per_block(args):
     print(f"Using TE autocast for per-block export: {autocast_config['description']}")
     print(f"Exporting {num_blocks} blocks individually ({opset_desc}) ...")
 
-    x = input_stem
     block_paths = []
     for i in range(num_blocks):
         is_last = (i == num_blocks - 1)
@@ -884,19 +903,21 @@ def export_per_block(args):
             rope_cos=model.rope_cos,
             rope_sin=model.rope_sin,
             norm_final=model.norm_final if is_last else None,
+            varlen=varlen,
         )
         wrapper.eval()
 
         block_path = f"{base_name}_block{i}{ext}"
+        export_inputs = (x, mask_flat) if mask_flat is not None else (x,)
 
         with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
-            wrapper(x)  # warmup
+            wrapper(*export_inputs)  # warmup
 
         with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
             with te_onnx_export(enabled=True):
                 torch.onnx.export(
                     wrapper,
-                    (x,),
+                    export_inputs,
                     block_path,
                     **export_kwargs_base,
                 )
@@ -906,7 +927,7 @@ def export_per_block(args):
         # Compute this block's output (raw, without norm_final / .float())
         # to use as the next block's input.
         with torch.no_grad(), _te_autocast_ctx(te, autocast_config):
-            x = model.blocks[i](x, model.rope_cos, model.rope_sin)
+            x = model.blocks[i](x, model.rope_cos, model.rope_sin, attn_mask=attn_mask)
 
         block_paths.append(block_path)
 

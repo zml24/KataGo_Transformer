@@ -62,11 +62,16 @@ class TransformerBlockTE(nn.Module):
             attn_input_format="bshd",
         )
 
-    def forward(self, x, rope):
+    def forward(self, x, rope, attn_mask=None):
         """
         x: (N, L, C)
         rope: (L, 1, 1, dim_half) raw RoPE embeddings for TE
+        attn_mask: optional (N, 1, 1, L) bool, True=masked
         """
+        if attn_mask is not None:
+            return self.layer(x, rotary_pos_emb=rope,
+                              attention_mask=attn_mask,
+                              self_attn_mask_type="arbitrary")
         return self.layer(x, rotary_pos_emb=rope)
 
 
@@ -101,13 +106,17 @@ class TransformerBlockTEDecomposed(nn.Module):
             activation="swiglu",
         )
 
-    def forward(self, x, rope_cos, rope_sin):
+    def forward(self, x, rope_cos, rope_sin, attn_mask=None):
         batch_size, seq_len, _ = x.shape
         residual = x
         qkv = self.ln_qkv(x).view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
         q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
-        x = residual + self.proj(self.attention(q, k, v))
+        attn_kwargs = {}
+        if attn_mask is not None:
+            attn_kwargs["attention_mask"] = attn_mask
+            attn_kwargs["attn_mask_type"] = "arbitrary"
+        x = residual + self.proj(self.attention(q, k, v, **attn_kwargs))
         return x + self.ln_mlp(x)
 
 
@@ -127,10 +136,11 @@ def _replace_nn_linear_with_te(module):
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
-                 use_fp8: bool = False):
+                 use_fp8: bool = False, varlen: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
+        self.varlen = varlen
         self.c_trunk = config["hidden_size"]
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
@@ -178,14 +188,14 @@ class Model(nn.Module):
         self.moving_unowned_proportion_sum = 0.0
         self.moving_unowned_proportion_weight = 0.0
 
-    def _run_trunk_impl(self, x):
+    def _run_trunk_impl(self, x, attn_mask=None):
         for block in self.blocks:
-            x = block(x, rope=self.rope)
+            x = block(x, rope=self.rope, attn_mask=attn_mask)
         return self.norm_final(x)
 
     @torch._dynamo.disable
-    def _run_trunk_no_compile(self, x):
-        return self._run_trunk_impl(x)
+    def _run_trunk_no_compile(self, x, attn_mask=None):
+        return self._run_trunk_impl(x, attn_mask=attn_mask)
 
     def initialize(self, init_std=0.02):
         """Weight initialization using TE-native init_method.
@@ -225,25 +235,44 @@ class Model(nn.Module):
                     init_fn(p)
 
     def forward_trunk_for_onnx_export(self, input_spatial, input_global):
-        x = self._forward_stem_impl(input_spatial, input_global)
-        return self._forward_blocks_impl(x).float()
+        x, attn_mask, mask_flat = self._forward_stem_impl(input_spatial, input_global)
+        x = self._forward_blocks_impl(x, attn_mask=attn_mask)
+        if self.varlen:
+            return x.float(), mask_flat.float()
+        return x.float()
 
     def _forward_stem_impl(self, input_spatial, input_global):
         N = input_spatial.shape[0]
         L = self.pos_len * self.pos_len
+
+        if self.varlen:
+            mask_flat = input_spatial[:, 0, :, :].contiguous().view(N, L)  # (N, L) float
+            # TE boolean mask: True = masked (opposite of PyTorch additive mask)
+            attn_mask = (mask_flat == 0).view(N, 1, 1, L)  # (N, 1, 1, L) bool
+        else:
+            attn_mask = None
+            mask_flat = None
+
         x_global = self.linear_global(input_global)
         x_spatial = self.conv_spatial(input_spatial)
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
         x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
-        return x
+        return x, attn_mask, mask_flat
 
     def forward_stem_for_onnx_export(self, input_spatial, input_global):
-        return self._forward_stem_impl(input_spatial, input_global).float()
+        x, attn_mask, mask_flat = self._forward_stem_impl(input_spatial, input_global)
+        if self.varlen:
+            return x.float(), mask_flat.float()
+        return x.float()
 
-    def _forward_blocks_impl(self, x):
-        return self._run_trunk_impl(x)
+    def _forward_blocks_impl(self, x, attn_mask=None):
+        return self._run_trunk_impl(x, attn_mask=attn_mask)
 
-    def forward_blocks_for_onnx_export(self, input_stem):
+    def forward_blocks_for_onnx_export(self, input_stem, mask_flat=None):
+        if self.varlen and mask_flat is not None:
+            N, L = mask_flat.shape
+            attn_mask = (mask_flat == 0).view(N, 1, 1, L)
+            return self._forward_blocks_impl(input_stem, attn_mask=attn_mask).float()
         return self._forward_blocks_impl(input_stem).float()
 
     def _forward_impl(self, input_spatial, input_global, for_onnx_export: bool):
@@ -252,24 +281,24 @@ class Model(nn.Module):
         input_global:  (N, C_global)
         """
         # Stem: NCHW -> NLC
-        x = self._forward_stem_impl(input_spatial, input_global)
+        x, attn_mask, mask_flat = self._forward_stem_impl(input_spatial, input_global)
 
         # ONNX export needs the full TE graph visible to torch.export / torch.onnx.
         if for_onnx_export:
-            x = self._forward_blocks_impl(x)
+            x = self._forward_blocks_impl(x, attn_mask=attn_mask)
         else:
             # Trunk is isolated from torch.compile for TE compatibility during training/inference.
-            x = self._run_trunk_no_compile(x)
+            x = self._run_trunk_no_compile(x, attn_mask=attn_mask)
 
         # Output heads (fp32, autocast disabled)
         with torch.amp.autocast(x.device.type, enabled=False):
             x_fp32 = x.float()
-            out_policy = self.policy_head(x_fp32)
+            out_policy = self.policy_head(x_fp32, mask=mask_flat)
             (
                 out_value, out_misc, out_moremisc,
                 out_ownership, out_scoring, out_futurepos, out_seki,
                 out_scorebelief,
-            ) = self.value_head(x_fp32, input_global[:, -1:].float())
+            ) = self.value_head(x_fp32, input_global[:, -1:].float(), mask=mask_flat)
 
         return (
             out_policy, out_value, out_misc, out_moremisc,
@@ -331,10 +360,11 @@ class ModelDecomposedExport(nn.Module):
     """Export-only TE model that keeps TE modules but applies RoPE via plain PyTorch ops."""
 
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
-                 use_fp8: bool = False):
+                 use_fp8: bool = False, varlen: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
+        self.varlen = varlen
         self.c_trunk = config["hidden_size"]
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
@@ -376,43 +406,61 @@ class ModelDecomposedExport(nn.Module):
         self.moving_unowned_proportion_sum = 0.0
         self.moving_unowned_proportion_weight = 0.0
 
-    def _run_trunk_impl(self, x):
+    def _run_trunk_impl(self, x, attn_mask=None):
         for block in self.blocks:
-            x = block(x, self.rope_cos, self.rope_sin)
+            x = block(x, self.rope_cos, self.rope_sin, attn_mask=attn_mask)
         return self.norm_final(x)
 
     def _forward_stem_impl(self, input_spatial, input_global):
         batch_size = input_spatial.shape[0]
         seq_len = self.pos_len * self.pos_len
+
+        if self.varlen:
+            mask_flat = input_spatial[:, 0, :, :].contiguous().view(batch_size, seq_len)
+            attn_mask = (mask_flat == 0).view(batch_size, 1, 1, seq_len)
+        else:
+            attn_mask = None
+            mask_flat = None
+
         x_global = self.linear_global(input_global)
         x_spatial = self.conv_spatial(input_spatial)
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
         x = x.view(batch_size, self.c_trunk, seq_len).permute(0, 2, 1)
-        return x
+        return x, attn_mask, mask_flat
 
     def forward_stem_for_onnx_export(self, input_spatial, input_global):
-        return self._forward_stem_impl(input_spatial, input_global).float()
+        x, attn_mask, mask_flat = self._forward_stem_impl(input_spatial, input_global)
+        if self.varlen:
+            return x.float(), mask_flat.float()
+        return x.float()
 
-    def _forward_blocks_impl(self, x):
-        return self._run_trunk_impl(x)
+    def _forward_blocks_impl(self, x, attn_mask=None):
+        return self._run_trunk_impl(x, attn_mask=attn_mask)
 
-    def forward_blocks_for_onnx_export(self, input_stem):
+    def forward_blocks_for_onnx_export(self, input_stem, mask_flat=None):
+        if self.varlen and mask_flat is not None:
+            N, L = mask_flat.shape
+            attn_mask = (mask_flat == 0).view(N, 1, 1, L)
+            return self._forward_blocks_impl(input_stem, attn_mask=attn_mask).float()
         return self._forward_blocks_impl(input_stem).float()
 
     def forward_trunk_for_onnx_export(self, input_spatial, input_global):
-        x = self._forward_stem_impl(input_spatial, input_global)
-        return self._forward_blocks_impl(x).float()
+        x, attn_mask, mask_flat = self._forward_stem_impl(input_spatial, input_global)
+        x = self._forward_blocks_impl(x, attn_mask=attn_mask)
+        if self.varlen:
+            return x.float(), mask_flat.float()
+        return x.float()
 
     def forward(self, input_spatial, input_global):
-        x = self._forward_stem_impl(input_spatial, input_global)
-        x = self._forward_blocks_impl(x)
+        x, attn_mask, mask_flat = self._forward_stem_impl(input_spatial, input_global)
+        x = self._forward_blocks_impl(x, attn_mask=attn_mask)
 
-        out_policy = self.policy_head(x)
+        out_policy = self.policy_head(x, mask=mask_flat)
         (
             out_value, out_misc, out_moremisc,
             out_ownership, out_scoring, out_futurepos, out_seki,
             out_scorebelief,
-        ) = self.value_head(x, input_global[:, -1:])
+        ) = self.value_head(x, input_global[:, -1:], mask=mask_flat)
 
         return (
             out_policy.float(), out_value.float(), out_misc.float(), out_moremisc.float(),

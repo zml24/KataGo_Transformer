@@ -55,14 +55,12 @@ def main():
 
     if args.use_fp8:
         assert args.use_te, "--use-fp8 requires --use-te"
-    if args.varlen:
-        assert not args.use_te, "--varlen is not compatible with --use-te"
-
     # Model setup
     if args.use_te:
         from model_te import Model
         model = Model(configs.config_of_name[args.model_kind], args.pos_len,
-                      score_mode=args.score_mode, use_fp8=args.use_fp8)
+                      score_mode=args.score_mode, use_fp8=args.use_fp8,
+                      varlen=args.varlen)
     else:
         from model import Model
         model = Model(configs.config_of_name[args.model_kind], args.pos_len,
@@ -112,8 +110,15 @@ def main():
 
     input_spatial = torch.zeros(args.batch_size, num_bin_features, args.pos_len, args.pos_len,
                                 dtype=torch.float32, device=device)
-    # Channel 0 is the on-board mask: all 1 for full-board positions
-    input_spatial[:, 0, :, :] = 1.0
+    # Channel 0 is the on-board mask
+    if args.varlen:
+        # Simulate mixed board sizes in the batch
+        board_sizes = [9, 13, 14, 15, 16, 17, 18, 19]
+        for i in range(args.batch_size):
+            bs = board_sizes[i % len(board_sizes)]
+            input_spatial[i, 0, :bs, :bs] = 1.0
+    else:
+        input_spatial[:, 0, :, :] = 1.0
     input_spatial[:, 1:9, :, :] = torch.randint(0, 2, (args.batch_size, 8, args.pos_len, args.pos_len),
                                                   dtype=torch.float32, device=device)
     input_global = torch.randn(args.batch_size, num_global_features, dtype=torch.float32, device=device)
