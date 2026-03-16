@@ -942,9 +942,6 @@ def main(rank, world_size, args, gpu_id):
                         p.grad = None
                     grad_norm = 0.0
                     grad_scaler.update(found_inf=True)
-                    if scheduler is not None:
-                        scheduler.step()
-                        base_lr = scheduler.get_last_lr()[0]
                 else:
                     # Gradient clipping + optimizer step
                     if dp_zero:

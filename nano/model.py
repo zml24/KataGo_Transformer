@@ -128,13 +128,17 @@ class TransformerBlock(nn.Module):
         attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, C)
         x = x + self.out_proj(attn_out)
 
-        # SwiGLU FFN (gate multiplication in FP32 for numerical stability)
+        # SwiGLU FFN:
+        # keep the gate product and W2 projection in FP32, then cast back to the
+        # trunk dtype. This avoids re-quantizing the intermediate into fp16/bf16
+        # right before the second GEMM.
         x_normed = self.norm2(x)
         w1_out = F.silu(self.ffn_w1(x_normed))
         wgate_out = self.ffn_wgate(x_normed)
         with torch.amp.autocast(x.device.type, enabled=False):
             ffn_hidden = w1_out.float() * wgate_out.float()
-        x = x + self.ffn_w2(ffn_hidden.to(x.dtype))
+            ffn_out = F.linear(ffn_hidden, self.ffn_w2.weight.float(), None)
+        x = x + ffn_out.to(x.dtype)
         return x
 
 
