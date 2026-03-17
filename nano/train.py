@@ -166,7 +166,7 @@ def main(rank, world_size, args, gpu_id):
         model_extra_kwargs = {"use_fp8": args.use_fp8, "varlen": args.varlen}
     else:
         from model import Model
-        model_extra_kwargs = {"varlen": args.varlen}
+        model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res}
 
     # Parse td_value_loss_scales
     td_value_loss_scales = [float(x) for x in args.td_value_loss_scales.split(",")]
@@ -296,6 +296,13 @@ def main(rank, world_size, args, gpu_id):
         if ckpt_varlen != args.varlen:
             logging.warning(f"Checkpoint varlen={ckpt_varlen} differs from command-line --varlen={args.varlen}, using checkpoint value")
         apply_varlen_mode(ckpt_varlen, "Checkpoint")
+        # Verify attn_res flag matches checkpoint
+        ckpt_attn_res = state.get("attn_res", False)
+        if ckpt_attn_res != args.attn_res:
+            raise RuntimeError(
+                f"Checkpoint attn_res={ckpt_attn_res} differs from --attn-res={args.attn_res}; "
+                "rerun with a matching flag"
+            )
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
@@ -337,6 +344,14 @@ def main(rank, world_size, args, gpu_id):
             )
         if ckpt_has_varlen:
             apply_varlen_mode(ckpt_varlen, "Initial checkpoint")
+        # Verify attn_res flag matches initial checkpoint
+        ckpt_has_attn_res = "attn_res" in state
+        ckpt_attn_res = state.get("attn_res", False)
+        if ckpt_has_attn_res and ckpt_attn_res != args.attn_res:
+            raise RuntimeError(
+                f"Initial checkpoint attn_res={ckpt_attn_res} differs from --attn-res={args.attn_res}; "
+                "rerun with a matching flag"
+            )
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
@@ -352,7 +367,11 @@ def main(rank, world_size, args, gpu_id):
                     model_state = _convert(model_state)
             except ImportError:
                 pass
-            model.load_state_dict(model_state)
+            result = model.load_state_dict(model_state, strict=False)
+            if result.unexpected_keys:
+                logging.warning(f"Unexpected keys in initial checkpoint (ignored): {result.unexpected_keys}")
+            if result.missing_keys:
+                logging.warning(f"Missing keys in initial checkpoint: {result.missing_keys}")
         global_step = 0
         total_samples_trained = 0
     else:
@@ -400,6 +419,8 @@ def main(rank, world_size, args, gpu_id):
             continue
         if p.dim() < 2 or name.endswith("layer_norm_weight") or name.endswith("layer_norm_bias"):
             no_decay_params[name] = p
+        elif "attn_res_proj" in name or "mlp_res_proj" in name:
+            adam_params[name] = p
         elif args.optimizer == "muon" and "blocks." in name:
             muon_params[name] = p
         elif args.optimizer == "shampoo" and "blocks." in name:
@@ -651,6 +672,7 @@ def main(rank, world_size, args, gpu_id):
                 "moving_unowned_proportion_sum": model.moving_unowned_proportion_sum,
                 "moving_unowned_proportion_weight": model.moving_unowned_proportion_weight,
                 "varlen": args.varlen,
+                "attn_res": args.attn_res,
                 "training_mode": {
                     "zero": zero_adam is not None,
                     "has_muon": muon_opt is not None,
@@ -1176,6 +1198,8 @@ if __name__ == "__main__":
                         help="Stem conv kernel: cnn1 (1x1), cnn3 (3x3), cnn5 (5x5)")
     parser.add_argument("--varlen", action="store_true",
                         help="Enable variable-length board input with masking")
+    parser.add_argument("--attn-res", action="store_true",
+                        help="Enable Attention Residuals (full depth attention replacing standard residuals)")
     args = parser.parse_args()
 
     # Validation
@@ -1187,6 +1211,8 @@ if __name__ == "__main__":
         parser.error("--batch-size must be divisible by 8 when --symmetry-type is 'all'")
     if args.amp_dtype == "fp16" and not torch.cuda.is_available():
         parser.error("--amp-dtype fp16 requires CUDA")
+    if args.attn_res and args.use_te:
+        parser.error("--attn-res and --use-te cannot be used together")
 
     # Detect torchrun launch (torchrun sets RANK, LOCAL_RANK, WORLD_SIZE env vars)
     torchrun_rank = os.environ.get("RANK")

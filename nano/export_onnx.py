@@ -171,9 +171,12 @@ def _load_checkpoint(args):
     varlen = state.get("varlen", False)
     if varlen:
         print(f"Checkpoint was trained with --varlen; mask logic will be included in the exported model")
+    attn_res = state.get("attn_res", False)
+    if attn_res:
+        print(f"Checkpoint was trained with --attn-res; depth attention residuals will be included in the exported model")
     print(f"Model config: {config}")
     print(f"pos_len={args.pos_len}, score_mode={args.score_mode}, method={args.method}")
-    return state, config, varlen
+    return state, config, varlen, attn_res
 
 
 def _resolve_output_path(args):
@@ -604,7 +607,7 @@ def _make_te_decomposed_fallback_args(args):
     return fallback_args
 
 
-def _export_legacy(args, state, config, varlen=False):
+def _export_legacy(args, state, config, varlen=False, attn_res=False):
     model_state = _resolve_model_state(state, args.use_ema)
     should_try_te_conversion = args.use_te or _looks_like_te_checkpoint(model_state)
     if should_try_te_conversion:
@@ -618,7 +621,7 @@ def _export_legacy(args, state, config, varlen=False):
             print("Converting TE checkpoint to model.py format for legacy ONNX export")
             model_state = convert_checkpoint_te_to_model(model_state)
 
-    model = Model(config, args.pos_len, score_mode=args.score_mode, varlen=varlen)
+    model = Model(config, args.pos_len, score_mode=args.score_mode, varlen=varlen, attn_res=attn_res)
     model.load_state_dict(model_state)
     model.eval()
     _print_param_count(model)
@@ -1012,11 +1015,13 @@ def _export_fp8_manual(args, state, config, varlen=False):
 
 
 def export(args):
-    state, config, varlen = _load_checkpoint(args)
+    state, config, varlen, attn_res = _load_checkpoint(args)
+    if attn_res and args.method != "legacy":
+        raise ValueError(f"--attn-res checkpoints only support legacy export method, got: {args.method}")
     if args.method == "fp8-manual":
         return _export_fp8_manual(args, state, config, varlen=varlen)
     if args.method == "legacy":
-        return _export_legacy(args, state, config, varlen=varlen)
+        return _export_legacy(args, state, config, varlen=varlen, attn_res=attn_res)
     if args.method == "te-decomposed":
         try:
             return _export_te_decomposed(args, state, config, varlen=varlen)
@@ -1024,7 +1029,7 @@ def export(args):
             if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                 print("\nWARNING: te-decomposed export failed, falling back to legacy export.")
                 print(f"  original error: {exc}")
-                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen)
+                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res)
             raise
     if args.method == "te-official":
         try:
@@ -1039,7 +1044,7 @@ def export(args):
                     if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                         print("\nWARNING: te-decomposed export failed, falling back to legacy export.")
                         print(f"  original error: {decomposed_exc}")
-                        return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen)
+                        return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res)
                     raise RuntimeError(
                         "Both te-official and te-decomposed exports failed.\n"
                         f"te-official error: {exc}\n"
@@ -1048,7 +1053,7 @@ def export(args):
             if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                 print("\nWARNING: te-official export failed, falling back to legacy export.")
                 print(f"  original error: {exc}")
-                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen)
+                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res)
             raise
     raise ValueError(f"Unsupported export method: {args.method}")
 

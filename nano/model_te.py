@@ -164,10 +164,9 @@ class Model(nn.Module):
         self.register_buffer("rope", emb_full, persistent=False)
 
         # Transformer blocks
-        BlockClass = TransformerBlockTE
         self.blocks = nn.ModuleList()
         for _ in range(config["num_layers"]):
-            self.blocks.append(BlockClass(
+            self.blocks.append(TransformerBlockTE(
                 c_main=self.c_trunk,
                 num_heads=num_heads,
                 ffn_dim=ffn_dim,
@@ -213,11 +212,10 @@ class Model(nn.Module):
             nn.init.normal_(tensor, mean=0.0, std=std)
 
         # Rebuild blocks with TE-native init methods
-        BlockClass = TransformerBlockTE
         num_heads = self.config["num_heads"]
         ffn_dim = self.config["ffn_dim"]
         self.blocks = nn.ModuleList([
-            BlockClass(
+            TransformerBlockTE(
                 c_main=self.c_trunk, num_heads=num_heads, ffn_dim=ffn_dim,
                 init_method=init_fn, output_layer_init_method=output_init_fn,
             )

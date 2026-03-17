@@ -83,10 +83,29 @@ class RMSNormFP32(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Attention Residuals (Full depth attention)
+# ---------------------------------------------------------------------------
+def attn_res(states, proj, norm):
+    """Full depth attention over all previous layer outputs.
+    states: list of N tensors, each [B, T, D]
+    proj: Linear(D, 1, bias=False) — learnable pseudo-query vector
+    norm: RMSNormFP32(D) — key normalization
+    """
+    V = torch.stack(states)  # [N, B, T, D]
+    K = norm(V)
+    logits = torch.einsum('d, n b t d -> n b t', proj.weight.squeeze(), K)
+    with torch.amp.autocast(V.device.type, enabled=False):
+        weights = logits.float().softmax(0)
+        h = torch.einsum('n b t, n b t d -> b t d', weights, V.float()).to(V.dtype)
+    return h
+
+
+# ---------------------------------------------------------------------------
 # Transformer Block (NLC format, RoPE + MHA + SwiGLU + RMSNorm)
 # ---------------------------------------------------------------------------
 class TransformerBlock(nn.Module):
-    def __init__(self, c_main: int, num_heads: int, ffn_dim: int):
+    def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
+                 use_attn_res: bool = False, is_first_block: bool = False):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c_main // num_heads
@@ -104,6 +123,16 @@ class TransformerBlock(nn.Module):
 
         self.norm1 = RMSNormFP32(c_main, eps=1e-6)
         self.norm2 = RMSNormFP32(c_main, eps=1e-6)
+
+        self.use_attn_res = use_attn_res
+        # First block: only stem in history, pre-attention depth attention is a no-op
+        self.skip_first_attn_res = is_first_block and use_attn_res
+        if use_attn_res:
+            if not is_first_block:
+                self.attn_res_proj = nn.Linear(c_main, 1, bias=False)
+                self.attn_res_norm = RMSNormFP32(c_main)
+            self.mlp_res_proj = nn.Linear(c_main, 1, bias=False)
+            self.mlp_res_norm = RMSNormFP32(c_main)
 
     def forward(self, x, rope_cos, rope_sin, attn_mask=None):
         """
@@ -138,6 +167,53 @@ class TransformerBlock(nn.Module):
             ffn_hidden = (w1_out.float() * wgate_out.float()).to(x.dtype)
         x = x + self.ffn_w2(ffn_hidden)
         return x
+
+    def forward_attn_res(self, states, hidden_states, rope_cos, rope_sin, attn_mask=None):
+        """Forward with Attention Residuals: depth attention replaces standard residual.
+
+        states: mutable list of all previous layer outputs. states[-1] == hidden_states
+                on entry. This method appends the post-attention state; the caller
+                appends the post-MLP state (the return value).
+        hidden_states: current layer input [B, L, C]
+        """
+        B, L, C = hidden_states.shape
+
+        # 1. Depth attention before self-attention
+        # states[-1] == hidden_states, so states already includes current input.
+        # First block: only stem in history, depth attention is a no-op → skip.
+        if not self.skip_first_attn_res:
+            h = attn_res(states, self.attn_res_proj, self.attn_res_norm)
+        else:
+            h = hidden_states
+
+        # 2. Self-attention (input is h, residual added to hidden_states)
+        h_normed = self.norm1(h)
+        q = self.q_proj(h_normed).view(B, L, self.num_heads, self.head_dim)
+        k = self.k_proj(h_normed).view(B, L, self.num_heads, self.head_dim)
+        v = self.v_proj(h_normed).view(B, L, self.num_heads, self.head_dim)
+        q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
+        attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, C)
+        hidden_states = hidden_states + self.out_proj(attn_out)
+
+        # 3. Record post-attention state in history for MLP depth attention
+        states.append(hidden_states)
+
+        # 4. Depth attention before FFN (now sees post-attention state)
+        h = attn_res(states, self.mlp_res_proj, self.mlp_res_norm)
+
+        # 5. FFN (input is h, residual added to hidden_states)
+        h_normed = self.norm2(h)
+        w1_out = F.silu(self.ffn_w1(h_normed))
+        wgate_out = self.ffn_wgate(h_normed)
+        with torch.amp.autocast(hidden_states.device.type, enabled=False):
+            ffn_hidden = (w1_out.float() * wgate_out.float()).to(hidden_states.dtype)
+        hidden_states = hidden_states + self.ffn_w2(ffn_hidden)
+
+        return hidden_states
 
 
 # ---------------------------------------------------------------------------
@@ -277,11 +353,13 @@ class ValueHead(nn.Module):
 # Model
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
-    def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop", varlen: bool = False):
+    def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop", varlen: bool = False,
+                 attn_res: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
         self.varlen = varlen
+        self.attn_res = attn_res
         self.c_trunk = config["hidden_size"]
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
@@ -305,11 +383,13 @@ class Model(nn.Module):
 
         # Transformer blocks
         self.blocks = nn.ModuleList()
-        for _ in range(config["num_layers"]):
+        for i in range(config["num_layers"]):
             self.blocks.append(TransformerBlock(
                 c_main=self.c_trunk,
                 num_heads=num_heads,
                 ffn_dim=ffn_dim,
+                use_attn_res=attn_res,
+                is_first_block=(i == 0),
             ))
 
         # Final normalization
@@ -338,10 +418,13 @@ class Model(nn.Module):
                 if "norm" not in name:
                     nn.init.zeros_(p)
             else:
-                std = init_std
-                if ".out_proj." in name or ".ffn_w2." in name:
-                    std = std / math.sqrt(2.0 * num_blocks)
-                nn.init.normal_(p, mean=0.0, std=std)
+                if "attn_res_proj" in name or "mlp_res_proj" in name:
+                    nn.init.zeros_(p)
+                else:
+                    std = init_std
+                    if ".out_proj." in name or ".ffn_w2." in name:
+                        std = std / math.sqrt(2.0 * num_blocks)
+                    nn.init.normal_(p, mean=0.0, std=std)
 
     def _forward_trunk_impl(self, input_spatial, input_global):
         x, attn_mask, mask_flat = self._forward_stem_impl(input_spatial, input_global)
@@ -349,9 +432,21 @@ class Model(nn.Module):
         return x, mask_flat
 
     def _forward_blocks_impl(self, x, attn_mask=None):
+        if self.attn_res:
+            return self._forward_blocks_attn_res_impl(x, attn_mask=attn_mask)
         for block in self.blocks:
             x = block(x, self.rope_cos, self.rope_sin, attn_mask=attn_mask)
         return self.norm_final(x)
+
+    def _forward_blocks_attn_res_impl(self, x, attn_mask=None):
+        states = [x]  # stem output as first state
+        hidden_states = x
+        for block in self.blocks:
+            hidden_states = block.forward_attn_res(
+                states, hidden_states, self.rope_cos, self.rope_sin, attn_mask=attn_mask
+            )
+            states.append(hidden_states)
+        return self.norm_final(hidden_states)
 
     def _forward_stem_impl(self, input_spatial, input_global):
         N = input_spatial.shape[0]
