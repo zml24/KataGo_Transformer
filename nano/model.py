@@ -95,8 +95,8 @@ def attn_res(states, proj, norm):
     K = norm(V)
     logits = torch.einsum('d, n b t d -> n b t', proj.weight.squeeze(), K)
     with torch.amp.autocast(V.device.type, enabled=False):
-        weights = logits.float().softmax(0)
-        h = torch.einsum('n b t, n b t d -> b t d', weights, V.float()).to(V.dtype)
+        weights = logits.float().softmax(0).to(logits.dtype)
+    h = torch.einsum('n b t, n b t d -> b t d', weights, V)
     return h
 
 
