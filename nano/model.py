@@ -129,16 +129,14 @@ class TransformerBlock(nn.Module):
         x = x + self.out_proj(attn_out)
 
         # SwiGLU FFN:
-        # keep the gate product and W2 projection in FP32, then cast back to the
-        # trunk dtype. This avoids re-quantizing the intermediate into fp16/bf16
-        # right before the second GEMM.
+        # keep the gate product in FP32 for numerical stability, but let W2
+        # follow the ambient autocast / AMP precision.
         x_normed = self.norm2(x)
         w1_out = F.silu(self.ffn_w1(x_normed))
         wgate_out = self.ffn_wgate(x_normed)
         with torch.amp.autocast(x.device.type, enabled=False):
-            ffn_hidden = w1_out.float() * wgate_out.float()
-            ffn_out = F.linear(ffn_hidden, self.ffn_w2.weight.float(), None)
-        x = x + ffn_out.to(x.dtype)
+            ffn_hidden = (w1_out.float() * wgate_out.float()).to(x.dtype)
+        x = x + self.ffn_w2(ffn_hidden)
         return x
 
 
@@ -166,7 +164,7 @@ class PolicyHead(nn.Module):
             mask_expanded = mask.unsqueeze(-1)  # (N, L, 1)
             pooled = (x_nlc * mask_expanded).sum(dim=1) / mask.sum(dim=1, keepdim=True)
             # Mask out invalid board positions with large negative number
-            board = board - (1.0 - mask.unsqueeze(1)) * 1e9  # (N, 6, L)
+            board = board - (1.0 - mask.unsqueeze(1)) * 5000.0  # (N, 6, L)
         else:
             pooled = x_nlc.mean(dim=1)
         pass_logits = self.linear_pass(pooled)  # (N, 6)
@@ -408,15 +406,13 @@ class Model(nn.Module):
         """
         x, mask_flat = self._forward_trunk_impl(input_spatial, input_global)
 
-        # Output heads (fp32, autocast disabled)
-        with torch.amp.autocast(x.device.type, enabled=False):
-            x_fp32 = x.float()
-            out_policy = self.policy_head(x_fp32, mask=mask_flat)
-            (
-                out_value, out_misc, out_moremisc,
-                out_ownership, out_scoring, out_futurepos, out_seki,
-                out_scorebelief,
-            ) = self.value_head(x_fp32, input_global[:, -1:].float(), mask=mask_flat)
+        # Output heads follow the ambient autocast / AMP precision for non-TE training.
+        out_policy = self.policy_head(x, mask=mask_flat)
+        (
+            out_value, out_misc, out_moremisc,
+            out_ownership, out_scoring, out_futurepos, out_seki,
+            out_scorebelief,
+        ) = self.value_head(x, input_global[:, -1:], mask=mask_flat)
 
         return (
             out_policy, out_value, out_misc, out_moremisc,

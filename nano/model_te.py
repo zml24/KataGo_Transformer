@@ -290,7 +290,7 @@ class Model(nn.Module):
             # Trunk is isolated from torch.compile for TE compatibility during training/inference.
             x = self._run_trunk_no_compile(x, attn_mask=attn_mask)
 
-        # Output heads (fp32, autocast disabled)
+        # TE path keeps output heads in fp32.
         with torch.amp.autocast(x.device.type, enabled=False):
             x_fp32 = x.float()
             out_policy = self.policy_head(x_fp32, mask=mask_flat)
