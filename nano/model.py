@@ -226,6 +226,8 @@ class ValueHead(nn.Module):
         spatial, global_feats = spatial_global.split([self.n_spatial, self.n_global], dim=-1)
 
         spatial = spatial.permute(0, 2, 1).view(N, self.n_spatial, H, W)
+        if mask is not None:
+            spatial = spatial * mask.view(N, 1, H, W)
         out_ownership, out_scoring, out_futurepos, out_seki = spatial.split([1, 1, 2, 4], dim=1)
 
         if mask is not None:

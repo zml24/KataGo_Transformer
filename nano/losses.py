@@ -86,10 +86,16 @@ def postprocess_and_loss_core(
     target_policy_opponent = target_policy_opponent / torch.sum(target_policy_opponent, dim=1, keepdim=True)
 
     # Soft policy targets (0.25 power smoothing)
-    target_policy_player_soft = (target_policy_player + 1e-7)
+    # policymask: zero out padding positions so that (0+1e-7)^0.25 doesn't
+    # leak probability mass onto board positions masked to -5000 logits.
+    if mask_hw is not None:
+        policymask = torch.cat([mask_hw, mask_hw.new_ones(N, 1)], dim=1)  # (N, L+1)
+    else:
+        policymask = 1.0
+    target_policy_player_soft = (target_policy_player + 1e-7) * policymask
     target_policy_player_soft = torch.pow(target_policy_player_soft, 0.25)
     target_policy_player_soft = target_policy_player_soft / torch.sum(target_policy_player_soft, dim=1, keepdim=True)
-    target_policy_opponent_soft = (target_policy_opponent + 1e-7)
+    target_policy_opponent_soft = (target_policy_opponent + 1e-7) * policymask
     target_policy_opponent_soft = torch.pow(target_policy_opponent_soft, 0.25)
     target_policy_opponent_soft = target_policy_opponent_soft / torch.sum(target_policy_opponent_soft, dim=1, keepdim=True)
 
