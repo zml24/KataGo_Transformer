@@ -262,10 +262,9 @@ class ValueHead(nn.Module):
                 )
             mix_log_weights = F.log_softmax(mix_logits, dim=1)
             out_scorebelief_logprobs = F.log_softmax(belief_logits, dim=1)
-            with torch.amp.autocast(out_scorebelief_logprobs.device.type, enabled=False):
-                out_scorebelief_logprobs = torch.logsumexp(
-                    out_scorebelief_logprobs.float() + mix_log_weights.float().view(-1, 1, self.num_scorebeliefs), dim=2
-                )
+            out_scorebelief_logprobs = torch.logsumexp(
+                out_scorebelief_logprobs + mix_log_weights.view(-1, 1, self.num_scorebeliefs), dim=2
+            )
 
         return (
             out_value, out_misc, out_moremisc,
@@ -408,13 +407,15 @@ class Model(nn.Module):
         """
         x, mask_flat = self._forward_trunk_impl(input_spatial, input_global)
 
-        # Output heads follow the ambient autocast / AMP precision for non-TE training.
-        out_policy = self.policy_head(x, mask=mask_flat)
-        (
-            out_value, out_misc, out_moremisc,
-            out_ownership, out_scoring, out_futurepos, out_seki,
-            out_scorebelief,
-        ) = self.value_head(x, input_global[:, -1:], mask=mask_flat)
+        # Output heads in fp32.
+        with torch.amp.autocast(x.device.type, enabled=False):
+            x_fp32 = x.float()
+            out_policy = self.policy_head(x_fp32, mask=mask_flat)
+            (
+                out_value, out_misc, out_moremisc,
+                out_ownership, out_scoring, out_futurepos, out_seki,
+                out_scorebelief,
+            ) = self.value_head(x_fp32, input_global[:, -1:].float(), mask=mask_flat)
 
         return (
             out_policy, out_value, out_misc, out_moremisc,
