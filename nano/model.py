@@ -91,13 +91,13 @@ def attn_res(states, proj, norm):
     proj: Linear(D, 1, bias=False) — learnable pseudo-query vector
     norm: RMSNormFP32(D) — key normalization
     """
-    V = torch.stack(states)  # [N, B, T, D]
-    K = norm(V)
-    logits = torch.einsum('d, n b t d -> n b t', proj.weight.squeeze(), K)
-    with torch.amp.autocast(V.device.type, enabled=False):
-        weights = logits.float().softmax(0).to(logits.dtype)
-    h = torch.einsum('n b t, n b t d -> b t d', weights, V)
-    return h
+    V = torch.stack(states, dim=2)                         # [B, T, N, D]
+    K = norm(V)                                             # [B, T, N, D]
+    B, T, N, D = V.shape
+    q = proj.weight.view(1, 1, 1, D).expand(B, T, 1, D)   # [B, T, 1, D]
+    # Treat T as num_heads, N (depth) as seq_len; SDPA fuses QK^T + softmax + @V
+    h = F.scaled_dot_product_attention(q, K, V, scale=1.0, dropout_p=0.0)
+    return h.squeeze(2)                                     # [B, T, D]
 
 
 # ---------------------------------------------------------------------------
