@@ -105,7 +105,8 @@ def attn_res(states, proj, norm):
 # ---------------------------------------------------------------------------
 class TransformerBlock(nn.Module):
     def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
-                 use_attn_res: bool = False, is_first_block: bool = False):
+                 use_attn_res: bool = False, is_first_block: bool = False,
+                 use_gated_attn: bool = False):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c_main // num_heads
@@ -123,6 +124,10 @@ class TransformerBlock(nn.Module):
 
         self.norm1 = RMSNormFP32(c_main, eps=1e-6)
         self.norm2 = RMSNormFP32(c_main, eps=1e-6)
+
+        self.use_gated_attn = use_gated_attn
+        if use_gated_attn:
+            self.attn_gate_proj = nn.Linear(c_main, c_main, bias=False)
 
         self.use_attn_res = use_attn_res
         # First block: only stem in history, pre-attention depth attention is a no-op
@@ -155,6 +160,8 @@ class TransformerBlock(nn.Module):
         v = v.permute(0, 2, 1, 3)
         attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
         attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, C)
+        if self.use_gated_attn:
+            attn_out = torch.sigmoid(self.attn_gate_proj(x_normed)) * attn_out
         x = x + self.out_proj(attn_out)
 
         # SwiGLU FFN:
@@ -197,6 +204,8 @@ class TransformerBlock(nn.Module):
         v = v.permute(0, 2, 1, 3)
         attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
         attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, C)
+        if self.use_gated_attn:
+            attn_out = torch.sigmoid(self.attn_gate_proj(h_normed)) * attn_out
         hidden_states = hidden_states + self.out_proj(attn_out)
 
         # 3. Record post-attention state in history for MLP depth attention
@@ -354,12 +363,13 @@ class ValueHead(nn.Module):
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop", varlen: bool = False,
-                 attn_res: bool = False):
+                 attn_res: bool = False, gated_attn: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
         self.varlen = varlen
         self.attn_res = attn_res
+        self.gated_attn = gated_attn
         self.c_trunk = config["hidden_size"]
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
@@ -390,6 +400,7 @@ class Model(nn.Module):
                 ffn_dim=ffn_dim,
                 use_attn_res=attn_res,
                 is_first_block=(i == 0),
+                use_gated_attn=gated_attn,
             ))
 
         # Final normalization

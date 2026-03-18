@@ -174,9 +174,12 @@ def _load_checkpoint(args):
     attn_res = state.get("attn_res", False)
     if attn_res:
         print(f"Checkpoint was trained with --attn-res; depth attention residuals will be included in the exported model")
+    gated_attn = state.get("gated_attn", False)
+    if gated_attn:
+        print(f"Checkpoint was trained with --gated-attn; elementwise attention gating will be included in the exported model")
     print(f"Model config: {config}")
     print(f"pos_len={args.pos_len}, score_mode={args.score_mode}, method={args.method}")
-    return state, config, varlen, attn_res
+    return state, config, varlen, attn_res, gated_attn
 
 
 def _resolve_output_path(args):
@@ -607,7 +610,7 @@ def _make_te_decomposed_fallback_args(args):
     return fallback_args
 
 
-def _export_legacy(args, state, config, varlen=False, attn_res=False):
+def _export_legacy(args, state, config, varlen=False, attn_res=False, gated_attn=False):
     model_state = _resolve_model_state(state, args.use_ema)
     should_try_te_conversion = args.use_te or _looks_like_te_checkpoint(model_state)
     if should_try_te_conversion:
@@ -621,7 +624,7 @@ def _export_legacy(args, state, config, varlen=False, attn_res=False):
             print("Converting TE checkpoint to model.py format for legacy ONNX export")
             model_state = convert_checkpoint_te_to_model(model_state)
 
-    model = Model(config, args.pos_len, score_mode=args.score_mode, varlen=varlen, attn_res=attn_res)
+    model = Model(config, args.pos_len, score_mode=args.score_mode, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn)
     model.load_state_dict(model_state)
     model.eval()
     _print_param_count(model)
@@ -834,7 +837,11 @@ def export_per_block(args):
         detect_checkpoint_format,
     )
 
-    state, config, varlen = _load_checkpoint(args)
+    state, config, varlen, attn_res, gated_attn = _load_checkpoint(args)
+    if attn_res:
+        raise RuntimeError("--attn-res checkpoints do not support per-block TE export; use legacy export instead")
+    if gated_attn:
+        raise RuntimeError("--gated-attn checkpoints do not support per-block TE export; use legacy export instead")
     device = _resolve_te_device(args.device)
     autocast_config = _resolve_te_autocast_config(args)
     model_state = _resolve_model_state(state, args.use_ema)
@@ -1015,13 +1022,15 @@ def _export_fp8_manual(args, state, config, varlen=False):
 
 
 def export(args):
-    state, config, varlen, attn_res = _load_checkpoint(args)
+    state, config, varlen, attn_res, gated_attn = _load_checkpoint(args)
     if attn_res and args.method != "legacy":
-        raise ValueError(f"--attn-res checkpoints only support legacy export method, got: {args.method}")
+        raise RuntimeError(f"--attn-res checkpoints only support legacy export method, got: {args.method}")
+    if gated_attn and args.method != "legacy":
+        raise RuntimeError(f"--gated-attn checkpoints only support legacy export method, got: {args.method}")
     if args.method == "fp8-manual":
         return _export_fp8_manual(args, state, config, varlen=varlen)
     if args.method == "legacy":
-        return _export_legacy(args, state, config, varlen=varlen, attn_res=attn_res)
+        return _export_legacy(args, state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn)
     if args.method == "te-decomposed":
         try:
             return _export_te_decomposed(args, state, config, varlen=varlen)
@@ -1029,7 +1038,7 @@ def export(args):
             if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                 print("\nWARNING: te-decomposed export failed, falling back to legacy export.")
                 print(f"  original error: {exc}")
-                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res)
+                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn)
             raise
     if args.method == "te-official":
         try:
@@ -1044,7 +1053,7 @@ def export(args):
                     if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                         print("\nWARNING: te-decomposed export failed, falling back to legacy export.")
                         print(f"  original error: {decomposed_exc}")
-                        return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res)
+                        return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn)
                     raise RuntimeError(
                         "Both te-official and te-decomposed exports failed.\n"
                         f"te-official error: {exc}\n"
@@ -1053,7 +1062,7 @@ def export(args):
             if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                 print("\nWARNING: te-official export failed, falling back to legacy export.")
                 print(f"  original error: {exc}")
-                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res)
+                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn)
             raise
     raise ValueError(f"Unsupported export method: {args.method}")
 

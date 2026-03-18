@@ -166,7 +166,7 @@ def main(rank, world_size, args, gpu_id):
         model_extra_kwargs = {"use_fp8": args.use_fp8, "varlen": args.varlen}
     else:
         from model import Model
-        model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res}
+        model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res, "gated_attn": args.gated_attn}
 
     # Parse td_value_loss_scales
     td_value_loss_scales = [float(x) for x in args.td_value_loss_scales.split(",")]
@@ -303,6 +303,13 @@ def main(rank, world_size, args, gpu_id):
                 f"Checkpoint attn_res={ckpt_attn_res} differs from --attn-res={args.attn_res}; "
                 "rerun with a matching flag"
             )
+        # Verify gated_attn flag matches checkpoint
+        ckpt_gated_attn = state.get("gated_attn", False)
+        if ckpt_gated_attn != args.gated_attn:
+            raise RuntimeError(
+                f"Checkpoint gated_attn={ckpt_gated_attn} differs from --gated-attn={args.gated_attn}; "
+                "rerun with a matching flag"
+            )
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
@@ -345,11 +352,17 @@ def main(rank, world_size, args, gpu_id):
         if ckpt_has_varlen:
             apply_varlen_mode(ckpt_varlen, "Initial checkpoint")
         # Verify attn_res flag matches initial checkpoint
-        ckpt_has_attn_res = "attn_res" in state
         ckpt_attn_res = state.get("attn_res", False)
-        if ckpt_has_attn_res and ckpt_attn_res != args.attn_res:
+        if ckpt_attn_res != args.attn_res:
             raise RuntimeError(
                 f"Initial checkpoint attn_res={ckpt_attn_res} differs from --attn-res={args.attn_res}; "
+                "rerun with a matching flag"
+            )
+        # Verify gated_attn flag matches initial checkpoint
+        ckpt_gated_attn = state.get("gated_attn", False)
+        if ckpt_gated_attn != args.gated_attn:
+            raise RuntimeError(
+                f"Initial checkpoint gated_attn={ckpt_gated_attn} differs from --gated-attn={args.gated_attn}; "
                 "rerun with a matching flag"
             )
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
@@ -419,7 +432,7 @@ def main(rank, world_size, args, gpu_id):
             continue
         if p.dim() < 2 or name.endswith("layer_norm_weight") or name.endswith("layer_norm_bias"):
             no_decay_params[name] = p
-        elif "attn_res_proj" in name or "mlp_res_proj" in name:
+        elif "attn_res_proj" in name or "mlp_res_proj" in name or "attn_gate_proj" in name:
             adam_params[name] = p
         elif args.optimizer == "muon" and "blocks." in name:
             muon_params[name] = p
@@ -673,6 +686,7 @@ def main(rank, world_size, args, gpu_id):
                 "moving_unowned_proportion_weight": model.moving_unowned_proportion_weight,
                 "varlen": args.varlen,
                 "attn_res": args.attn_res,
+                "gated_attn": args.gated_attn,
                 "training_mode": {
                     "zero": zero_adam is not None,
                     "has_muon": muon_opt is not None,
@@ -1200,6 +1214,8 @@ if __name__ == "__main__":
                         help="Enable variable-length board input with masking")
     parser.add_argument("--attn-res", action="store_true",
                         help="Enable Attention Residuals (full depth attention replacing standard residuals)")
+    parser.add_argument("--gated-attn", action="store_true",
+                        help="Enable elementwise gated attention (sigmoid gate on attention output)")
     args = parser.parse_args()
 
     # Validation
@@ -1213,6 +1229,8 @@ if __name__ == "__main__":
         parser.error("--amp-dtype fp16 requires CUDA")
     if args.attn_res and args.use_te:
         parser.error("--attn-res and --use-te cannot be used together")
+    if args.gated_attn and args.use_te:
+        parser.error("--gated-attn and --use-te cannot be used together")
 
     # Detect torchrun launch (torchrun sets RANK, LOCAL_RANK, WORLD_SIZE env vars)
     torchrun_rank = os.environ.get("RANK")
