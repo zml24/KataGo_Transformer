@@ -13,7 +13,7 @@ from model import Model
 
 
 MAGIC = b"KGTRN001"
-FORMAT_VERSION = 3
+FORMAT_VERSION = 2
 POLICY_CHANNELS = (0, 5)
 
 
@@ -256,7 +256,8 @@ def export_checkpoint(checkpoint, output, pos_len, score_mode, use_ema):
         _write_i32(out, _score_mode_id(model.value_head.score_mode))
         _write_i32(out, model.value_head.num_scorebeliefs)
         _write_i32(out, model.value_head.scorebelief_len)
-        _write_i32(out, 1 if varlen else 0)  # varlen flag
+        # varlen flag 仅在 FORMAT_VERSION >= 3 时写入；
+        # version 2 不含此字段，任意一局棋都是 fixlen 推理。
 
         _write_f32(out, 20.0)
         _write_f32(out, 20.0)
