@@ -432,7 +432,7 @@ def main(rank, world_size, args, gpu_id):
             continue
         if p.dim() < 2 or name.endswith("layer_norm_weight") or name.endswith("layer_norm_bias"):
             no_decay_params[name] = p
-        elif "attn_res_proj" in name or "mlp_res_proj" in name or "attn_gate_proj" in name:
+        elif "attn_res_proj" in name or "mlp_res_proj" in name:
             adam_params[name] = p
         elif args.optimizer == "muon" and "blocks." in name:
             muon_params[name] = p
