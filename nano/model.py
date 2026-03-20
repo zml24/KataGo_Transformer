@@ -230,12 +230,12 @@ class TransformerBlock(nn.Module):
 # ---------------------------------------------------------------------------
 class PolicyHead(nn.Module):
     """Per-position projection (board moves) + global pooling projection (pass)."""
-    def __init__(self, c_in, pos_len):
+    def __init__(self, c_in, pos_len, head_bias=False):
         super().__init__()
         self.pos_len = pos_len
         self.num_policy_outputs = 6
-        self.linear_board = nn.Linear(c_in, self.num_policy_outputs, bias=False)
-        self.linear_pass = nn.Linear(c_in, self.num_policy_outputs, bias=False)
+        self.linear_board = nn.Linear(c_in, self.num_policy_outputs, bias=head_bias)
+        self.linear_pass = nn.Linear(c_in, self.num_policy_outputs, bias=head_bias)
 
     def forward(self, x_nlc, mask=None):
         """
@@ -260,7 +260,7 @@ class PolicyHead(nn.Module):
 # ValueHead (NLC input, per-position + mean-pool projection)
 # ---------------------------------------------------------------------------
 class ValueHead(nn.Module):
-    def __init__(self, c_in, num_scorebeliefs, pos_len, score_mode="mixop"):
+    def __init__(self, c_in, num_scorebeliefs, pos_len, score_mode="mixop", head_bias=False):
         super().__init__()
         self.pos_len = pos_len
         self.scorebelief_mid = pos_len * pos_len + EXTRA_SCORE_DISTR_RADIUS
@@ -272,17 +272,17 @@ class ValueHead(nn.Module):
         # Global (mean-pool): value(3) + misc(10) + moremisc(8)
         self.n_spatial = 1 + 1 + 2 + 4  # 8
         self.n_global = 3 + 10 + 8      # 21
-        self.linear_sv = nn.Linear(c_in, self.n_spatial + self.n_global, bias=False)
+        self.linear_sv = nn.Linear(c_in, self.n_spatial + self.n_global, bias=head_bias)
 
         # Score belief head
         if score_mode == "simple":
-            self.linear_s_simple = nn.Linear(c_in, self.scorebelief_len, bias=False)
+            self.linear_s_simple = nn.Linear(c_in, self.scorebelief_len, bias=head_bias)
         elif score_mode == "mix":
-            self.linear_s_mix = nn.Linear(c_in, self.scorebelief_len * num_scorebeliefs + num_scorebeliefs, bias=False)
+            self.linear_s_mix = nn.Linear(c_in, self.scorebelief_len * num_scorebeliefs + num_scorebeliefs, bias=head_bias)
         elif score_mode == "mixop":
-            self.linear_s_mix = nn.Linear(c_in, self.scorebelief_len * num_scorebeliefs + num_scorebeliefs, bias=False)
-            self.linear_s2off = nn.Linear(1, num_scorebeliefs, bias=False)
-            self.linear_s2par = nn.Linear(1, num_scorebeliefs, bias=False)
+            self.linear_s_mix = nn.Linear(c_in, self.scorebelief_len * num_scorebeliefs + num_scorebeliefs, bias=head_bias)
+            self.linear_s2off = nn.Linear(1, num_scorebeliefs, bias=head_bias)
+            self.linear_s2par = nn.Linear(1, num_scorebeliefs, bias=head_bias)
 
         self.register_buffer("score_belief_offset_vector", torch.tensor(
             [(float(i - self.scorebelief_mid) + 0.5) for i in range(self.scorebelief_len)],
@@ -363,7 +363,7 @@ class ValueHead(nn.Module):
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop", varlen: bool = False,
-                 attn_res: bool = False, gated_attn: bool = False):
+                 attn_res: bool = False, gated_attn: bool = False, head_bias: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
@@ -409,8 +409,8 @@ class Model(nn.Module):
         # Output heads
         num_scorebeliefs = config["num_scorebeliefs"]
 
-        self.policy_head = PolicyHead(self.c_trunk, pos_len)
-        self.value_head = ValueHead(self.c_trunk, num_scorebeliefs, pos_len, score_mode=score_mode)
+        self.policy_head = PolicyHead(self.c_trunk, pos_len, head_bias=head_bias)
+        self.value_head = ValueHead(self.c_trunk, num_scorebeliefs, pos_len, score_mode=score_mode, head_bias=head_bias)
 
         # Seki dynamic weight moving average state
         self.moving_unowned_proportion_sum = 0.0

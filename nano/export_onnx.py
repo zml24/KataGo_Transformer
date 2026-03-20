@@ -177,9 +177,12 @@ def _load_checkpoint(args):
     gated_attn = state.get("gated_attn", False)
     if gated_attn:
         print(f"Checkpoint was trained with --gated-attn; elementwise attention gating will be included in the exported model")
+    head_bias = state.get("head_bias", False)
+    if head_bias:
+        print(f"Checkpoint was trained with --head-bias; head linear layers include bias")
     print(f"Model config: {config}")
     print(f"pos_len={args.pos_len}, score_mode={args.score_mode}, method={args.method}")
-    return state, config, varlen, attn_res, gated_attn
+    return state, config, varlen, attn_res, gated_attn, head_bias
 
 
 def _resolve_output_path(args):
@@ -597,6 +600,117 @@ def _validate_te_load_result(load_result):
         sys.exit(1)
 
 
+def _get_fp32_node_names(graph):
+    """Return names of ONNX nodes that must stay in fp32, matching training AMP."""
+    fp32_names = []
+    for node in graph.node:
+        name = node.name
+        keep = False
+        # RMSNorm
+        if '/norm1/' in name or '/norm2/' in name or '/norm_final/' in name:
+            keep = True
+        # Output heads
+        if '/policy_head/' in name or '/value_head/' in name:
+            keep = True
+        # Varlen mask
+        if any(kw in name for kw in ('/Equal', '/Where', '/ConstantOfShape')):
+            keep = True
+        # SwiGLU fp32 casts
+        if node.op_type == 'Cast' and '/blocks.' in name and '/norm' not in name:
+            keep = True
+        # Attention Softmax
+        if node.op_type == 'Softmax' and '/blocks.' in name:
+            keep = True
+        if keep:
+            fp32_names.append(name)
+    return fp32_names
+
+
+def _convert_to_mixed_precision(onnx_path, output_path=None, dtype="fp16"):
+    """Convert ONNX model to mixed precision (fp16 or bf16 trunk, fp32 sensitive ops).
+
+    Keeps RMSNorm, SwiGLU casts, Softmax, output heads, and stem in fp32.
+    Converts all other weights and computation to the target dtype.
+
+    Args:
+        dtype: "fp16" or "bf16"
+    """
+    import onnx as onnx_mod
+    from onnx import TensorProto, numpy_helper
+
+    if output_path is None:
+        output_path = onnx_path
+
+    model = onnx_mod.load(onnx_path)
+    graph = model.graph
+
+    fp32_node_names = set(_get_fp32_node_names(graph))
+    print(f"Mixed precision ({dtype}): {len(fp32_node_names)}/{len(graph.node)} nodes kept in fp32")
+
+    target_dtype = {"fp16": TensorProto.FLOAT16, "bf16": TensorProto.BFLOAT16}[dtype]
+
+    if dtype in ("fp16", "bf16"):
+        # Weight-only conversion: store weights in half precision, insert
+        # Cast(half→fp32) so computation stays fp32.  TensorRT with kFP16/kBF16
+        # can further fuse the casts and run computation in half precision.
+        import torch as _torch
+
+        dtype_label = dtype
+        torch_dtype = _torch.float16 if dtype == "fp16" else _torch.bfloat16
+
+        # Collect tensors consumed/produced by fp32 nodes — keep those in fp32
+        fp32_tensors = set()
+        for node in graph.node:
+            if node.name in fp32_node_names:
+                fp32_tensors.update(node.input)
+                fp32_tensors.update(node.output)
+
+        cast_nodes_to_add = []
+        converted = 0
+        kept = 0
+        for init in graph.initializer:
+            if init.data_type != TensorProto.FLOAT:
+                continue
+            if init.name in fp32_tensors:
+                kept += 1
+                continue
+
+            # Convert weight to target half dtype
+            arr = numpy_helper.to_array(init)
+            half_tensor = _torch.from_numpy(arr.copy()).to(torch_dtype)
+            raw = half_tensor.view(_torch.int16).contiguous().numpy().tobytes()
+            new_init = TensorProto()
+            new_init.name = init.name
+            new_init.data_type = target_dtype
+            new_init.dims.extend(init.dims)
+            new_init.raw_data = raw
+            init.CopyFrom(new_init)
+
+            # Rename weight and insert Cast(half→fp32) so graph stays type-consistent
+            original_name = init.name
+            half_name = original_name + f"__{dtype_label}"
+            init.name = half_name
+            cast_node = onnx_mod.helper.make_node(
+                "Cast", inputs=[half_name], outputs=[original_name],
+                to=TensorProto.FLOAT,
+                name=f"Cast_{dtype_label}_to_fp32_{converted}",
+            )
+            cast_nodes_to_add.append(cast_node)
+            converted += 1
+
+        for cn in reversed(cast_nodes_to_add):
+            graph.node.insert(0, cn)
+
+        print(f"  Weights: {converted} converted to {dtype_label}, {kept} kept fp32")
+        model_out = model
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype}, use 'fp16' or 'bf16'")
+
+    onnx_mod.save(model_out, output_path)
+    size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    print(f"Saved: {output_path} ({size_mb:.1f} MB)")
+
+
 def _make_legacy_fallback_args(args):
     fallback_args = argparse.Namespace(**vars(args))
     fallback_args.method = "legacy"
@@ -610,7 +724,7 @@ def _make_te_decomposed_fallback_args(args):
     return fallback_args
 
 
-def _export_legacy(args, state, config, varlen=False, attn_res=False, gated_attn=False):
+def _export_legacy(args, state, config, varlen=False, attn_res=False, gated_attn=False, head_bias=False):
     model_state = _resolve_model_state(state, args.use_ema)
     should_try_te_conversion = args.use_te or _looks_like_te_checkpoint(model_state)
     if should_try_te_conversion:
@@ -624,7 +738,7 @@ def _export_legacy(args, state, config, varlen=False, attn_res=False, gated_attn
             print("Converting TE checkpoint to model.py format for legacy ONNX export")
             model_state = convert_checkpoint_te_to_model(model_state)
 
-    model = Model(config, args.pos_len, score_mode=args.score_mode, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn)
+    model = Model(config, args.pos_len, score_mode=args.score_mode, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn, head_bias=head_bias)
     model.load_state_dict(model_state)
     model.eval()
     _print_param_count(model)
@@ -658,7 +772,7 @@ def _export_legacy(args, state, config, varlen=False, attn_res=False, gated_attn
     return output_path, wrapper, verify_input0, verify_input1
 
 
-def _export_te_official(args, state, config, varlen=False):
+def _export_te_official(args, state, config, varlen=False, head_bias=False):
     te, te_onnx_export, te_translation_table = _resolve_te_support()
     from model_te import Model as TEModel, convert_checkpoint_model_to_te, detect_checkpoint_format
 
@@ -669,7 +783,7 @@ def _export_te_official(args, state, config, varlen=False):
         print("Converting model.py checkpoint to TE format for official TE ONNX export")
         model_state = convert_checkpoint_model_to_te(model_state)
 
-    model = TEModel(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8, varlen=varlen)
+    model = TEModel(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8, varlen=varlen, head_bias=head_bias)
     load_result = model.load_state_dict(model_state, strict=False)
     _validate_te_load_result(load_result)
     model.eval()
@@ -736,7 +850,7 @@ def _export_te_official(args, state, config, varlen=False):
     return output_path, wrapper, verify_input0, verify_input1
 
 
-def _export_te_decomposed(args, state, config, varlen=False):
+def _export_te_decomposed(args, state, config, varlen=False, head_bias=False):
     te, te_onnx_export, te_translation_table = _resolve_te_support()
     from model_te import (
         ModelDecomposedExport,
@@ -753,7 +867,7 @@ def _export_te_decomposed(args, state, config, varlen=False):
         model_state = convert_checkpoint_te_to_model(model_state)
 
     model_state = convert_checkpoint_model_to_te_decomposed(model_state)
-    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8, varlen=varlen)
+    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8, varlen=varlen, head_bias=head_bias)
     load_result = model.load_state_dict(model_state, strict=False)
     _validate_te_load_result(load_result)
     model.eval()
@@ -837,7 +951,7 @@ def export_per_block(args):
         detect_checkpoint_format,
     )
 
-    state, config, varlen, attn_res, gated_attn = _load_checkpoint(args)
+    state, config, varlen, attn_res, gated_attn, head_bias = _load_checkpoint(args)
     if attn_res:
         raise RuntimeError("--attn-res checkpoints do not support per-block TE export; use legacy export instead")
     if gated_attn:
@@ -850,7 +964,7 @@ def export_per_block(args):
         model_state = convert_checkpoint_te_to_model(model_state)
 
     model_state = convert_checkpoint_model_to_te_decomposed(model_state)
-    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8, varlen=varlen)
+    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8, varlen=varlen, head_bias=head_bias)
     load_result = model.load_state_dict(model_state, strict=False)
     _validate_te_load_result(load_result)
     model.eval()
@@ -945,7 +1059,7 @@ def export_per_block(args):
     return block_paths
 
 
-def _export_fp8_manual(args, state, config, varlen=False):
+def _export_fp8_manual(args, state, config, varlen=False, head_bias=False):
     """Export with manually inserted FP8 Q/DQ nodes (no Transformer Engine dependency).
 
     Uses the pure PyTorch model (model.py) with nn.Linear layers replaced by
@@ -967,7 +1081,7 @@ def _export_fp8_manual(args, state, config, varlen=False):
             print("Converting TE checkpoint to model.py format for FP8 manual export")
             model_state = convert_checkpoint_te_to_model(model_state)
 
-    model = Model(config, args.pos_len, score_mode=args.score_mode, varlen=varlen)
+    model = Model(config, args.pos_len, score_mode=args.score_mode, varlen=varlen, head_bias=head_bias)
     model.load_state_dict(model_state)
     model.eval()
 
@@ -1022,38 +1136,38 @@ def _export_fp8_manual(args, state, config, varlen=False):
 
 
 def export(args):
-    state, config, varlen, attn_res, gated_attn = _load_checkpoint(args)
+    state, config, varlen, attn_res, gated_attn, head_bias = _load_checkpoint(args)
     if attn_res and args.method != "legacy":
         raise RuntimeError(f"--attn-res checkpoints only support legacy export method, got: {args.method}")
     if gated_attn and args.method != "legacy":
         raise RuntimeError(f"--gated-attn checkpoints only support legacy export method, got: {args.method}")
     if args.method == "fp8-manual":
-        return _export_fp8_manual(args, state, config, varlen=varlen)
+        return _export_fp8_manual(args, state, config, varlen=varlen, head_bias=head_bias)
     if args.method == "legacy":
-        return _export_legacy(args, state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn)
+        return _export_legacy(args, state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn, head_bias=head_bias)
     if args.method == "te-decomposed":
         try:
-            return _export_te_decomposed(args, state, config, varlen=varlen)
+            return _export_te_decomposed(args, state, config, varlen=varlen, head_bias=head_bias)
         except RuntimeError as exc:
             if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                 print("\nWARNING: te-decomposed export failed, falling back to legacy export.")
                 print(f"  original error: {exc}")
-                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn)
+                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn, head_bias=head_bias)
             raise
     if args.method == "te-official":
         try:
-            return _export_te_official(args, state, config, varlen=varlen)
+            return _export_te_official(args, state, config, varlen=varlen, head_bias=head_bias)
         except RuntimeError as exc:
             if getattr(args, "fallback_to_te_decomposed_on_te_export_error", False):
                 print("\nWARNING: te-official export failed, falling back to decomposed TE export.")
                 print(f"  original error: {exc}")
                 try:
-                    return _export_te_decomposed(_make_te_decomposed_fallback_args(args), state, config, varlen=varlen)
+                    return _export_te_decomposed(_make_te_decomposed_fallback_args(args), state, config, varlen=varlen, head_bias=head_bias)
                 except RuntimeError as decomposed_exc:
                     if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                         print("\nWARNING: te-decomposed export failed, falling back to legacy export.")
                         print(f"  original error: {decomposed_exc}")
-                        return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn)
+                        return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn, head_bias=head_bias)
                     raise RuntimeError(
                         "Both te-official and te-decomposed exports failed.\n"
                         f"te-official error: {exc}\n"
@@ -1062,7 +1176,7 @@ def export(args):
             if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                 print("\nWARNING: te-official export failed, falling back to legacy export.")
                 print(f"  original error: {exc}")
-                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn)
+                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn, head_bias=head_bias)
             raise
     raise ValueError(f"Unsupported export method: {args.method}")
 
@@ -1143,6 +1257,10 @@ def main():
                         help="Legacy exporter only: force conversion of a TE checkpoint before export (normally auto-detected)")
     parser.add_argument("--use-ema", action="store_true",
                         help="Export EMA shadow weights instead of training weights")
+    parser.add_argument("--fp16", action="store_true",
+                        help="Convert exported model to mixed precision fp16 (fp16 trunk, fp32 sensitive ops)")
+    parser.add_argument("--bf16", action="store_true",
+                        help="Convert exported model to mixed precision bf16 (bf16 weights, fp32 sensitive ops)")
     args = parser.parse_args()
 
     try:
@@ -1150,6 +1268,11 @@ def main():
     except RuntimeError as exc:
         print(f"ERROR: {exc}")
         sys.exit(1)
+
+    if args.fp16 or args.bf16:
+        half_dtype = "bf16" if args.bf16 else "fp16"
+        print(f"\nConverting to mixed precision ({half_dtype}) ...")
+        _convert_to_mixed_precision(onnx_path, dtype=half_dtype)
 
     if args.verify:
         if args.method == "fp8-manual":

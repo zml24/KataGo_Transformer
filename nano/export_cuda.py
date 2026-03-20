@@ -13,7 +13,7 @@ from model import Model
 
 
 MAGIC = b"KGTRN001"
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 POLICY_CHANNELS = (0, 5)
 
 
@@ -108,12 +108,17 @@ def _make_model(checkpoint_path, pos_len, score_mode, use_ema):
     if config.get("stem", "cnn3") not in {"cnn1", "cnn3", "cnn5"}:
         raise RuntimeError("原生 CUDA 导出当前只支持 stem=cnn1/cnn3/cnn5")
     varlen = state.get("varlen", False)
-    model = Model(config, pos_len=pos_len, score_mode=score_mode, varlen=varlen)
+    head_bias = state.get("head_bias", False)
+    model = Model(config, pos_len=pos_len, score_mode=score_mode, varlen=varlen, head_bias=head_bias)
     model_state = _resolve_model_state(state, use_ema)
     if _looks_like_te_checkpoint(model_state):
         print("检测到 TransformerEngine checkpoint，先转换为 model.py 权重命名")
         model_state = _convert_checkpoint_te_to_model_standalone(model_state)
-    model.load_state_dict(model_state, strict=True)
+    result = model.load_state_dict(model_state, strict=False)
+    if result.missing_keys:
+        print(f"Missing keys (will use default init): {result.missing_keys}")
+    if result.unexpected_keys:
+        print(f"Unexpected keys (ignored): {result.unexpected_keys}")
     model.eval()
     return model, config, varlen
 
@@ -172,6 +177,45 @@ def _full_value_weights(model):
     )
 
 
+def _get_bias(linear):
+    """Get bias from a linear layer, or zeros if no bias."""
+    if linear.bias is not None:
+        return linear.bias.detach().cpu().float().contiguous()
+    return torch.zeros(linear.out_features, dtype=torch.float32)
+
+
+def _selected_value_biases(model):
+    """Bias counterpart of _selected_value_weights."""
+    bias = _get_bias(model.value_head.linear_sv)
+    spatial = bias[: model.value_head.n_spatial]
+    global_part = bias[model.value_head.n_spatial :]
+
+    value = global_part[0:3].contiguous()
+    misc = global_part[3:7]
+    moremisc = global_part[13:15]
+    score = torch.cat([misc, moremisc]).contiguous()
+    ownership = spatial[0:1].contiguous()
+
+    return value, score, ownership
+
+
+def _full_value_biases(model):
+    """Bias counterpart of _full_value_weights."""
+    bias = _get_bias(model.value_head.linear_sv)
+    spatial = bias[: model.value_head.n_spatial]
+    global_part = bias[model.value_head.n_spatial :]
+
+    value = global_part[0:3].contiguous()
+    misc = global_part[3:13].contiguous()
+    moremisc = global_part[13:21].contiguous()
+    ownership = spatial[0:1].contiguous()
+    scoring = spatial[1:2].contiguous()
+    futurepos = spatial[2:4].contiguous()
+    seki = spatial[4:8].contiguous()
+
+    return value, misc, moremisc, ownership, scoring, futurepos, seki
+
+
 def _score_mode_id(score_mode):
     return {"simple": 0, "mix": 1, "mixop": 2}[score_mode]
 
@@ -201,30 +245,54 @@ def _collect_tensors(model):
         ])
 
     tensors.append(("final_norm.weight", model.norm_final.norm.weight.detach().cpu().float().contiguous()))
+
+    # Policy head
     tensors.append(("policy.board_full.weight", _full_policy_weight(model.policy_head.linear_board.weight)))
+    tensors.append(("policy.board_full.bias", _get_bias(model.policy_head.linear_board)))
     tensors.append(("policy.pass_full.weight", _full_policy_weight(model.policy_head.linear_pass.weight)))
+    tensors.append(("policy.pass_full.bias", _get_bias(model.policy_head.linear_pass)))
     tensors.append(("policy.board.weight", _selected_policy_weight(model.policy_head.linear_board.weight)))
+    tensors.append(("policy.board.bias", _get_bias(model.policy_head.linear_board)[list(POLICY_CHANNELS)].contiguous()))
     tensors.append(("policy.pass.weight", _selected_policy_weight(model.policy_head.linear_pass.weight)))
+    tensors.append(("policy.pass.bias", _get_bias(model.policy_head.linear_pass)[list(POLICY_CHANNELS)].contiguous()))
 
+    # Value head (selected)
     value_w, score_w, ownership_w = _selected_value_weights(model)
+    value_b, score_b, ownership_b = _selected_value_biases(model)
     tensors.append(("value.value.weight", value_w))
+    tensors.append(("value.value.bias", value_b))
     tensors.append(("value.score.weight", score_w))
+    tensors.append(("value.score.bias", score_b))
     tensors.append(("value.ownership.weight", ownership_w))
-    _unused_value_w, misc_w, moremisc_w, _unused_ownership_w, scoring_w, futurepos_w, seki_w = _full_value_weights(model)
-    tensors.append(("value.misc.weight", misc_w))
-    tensors.append(("value.moremisc.weight", moremisc_w))
-    tensors.append(("value.scoring.weight", scoring_w))
-    tensors.append(("value.futurepos.weight", futurepos_w))
-    tensors.append(("value.seki.weight", seki_w))
+    tensors.append(("value.ownership.bias", ownership_b))
 
+    # Value head (full)
+    _unused_value_w, misc_w, moremisc_w, _unused_ownership_w, scoring_w, futurepos_w, seki_w = _full_value_weights(model)
+    _unused_value_b, misc_b, moremisc_b, _unused_ownership_b, scoring_b, futurepos_b, seki_b = _full_value_biases(model)
+    tensors.append(("value.misc.weight", misc_w))
+    tensors.append(("value.misc.bias", misc_b))
+    tensors.append(("value.moremisc.weight", moremisc_w))
+    tensors.append(("value.moremisc.bias", moremisc_b))
+    tensors.append(("value.scoring.weight", scoring_w))
+    tensors.append(("value.scoring.bias", scoring_b))
+    tensors.append(("value.futurepos.weight", futurepos_w))
+    tensors.append(("value.futurepos.bias", futurepos_b))
+    tensors.append(("value.seki.weight", seki_w))
+    tensors.append(("value.seki.bias", seki_b))
+
+    # Score belief head
     score_mode = model.value_head.score_mode
     if score_mode == "simple":
         tensors.append(("scorebelief.simple.weight", _transpose_linear(model.value_head.linear_s_simple.weight)))
+        tensors.append(("scorebelief.simple.bias", _get_bias(model.value_head.linear_s_simple)))
     else:
         tensors.append(("scorebelief.mix.weight", _transpose_linear(model.value_head.linear_s_mix.weight)))
+        tensors.append(("scorebelief.mix.bias", _get_bias(model.value_head.linear_s_mix)))
         if score_mode == "mixop":
             tensors.append(("scorebelief.s2off.weight", _transpose_linear(model.value_head.linear_s2off.weight)))
+            tensors.append(("scorebelief.s2off.bias", _get_bias(model.value_head.linear_s2off)))
             tensors.append(("scorebelief.s2par.weight", _transpose_linear(model.value_head.linear_s2par.weight)))
+            tensors.append(("scorebelief.s2par.bias", _get_bias(model.value_head.linear_s2par)))
     return tensors
 
 

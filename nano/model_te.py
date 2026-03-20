@@ -136,7 +136,7 @@ def _replace_nn_linear_with_te(module):
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
-                 use_fp8: bool = False, varlen: bool = False):
+                 use_fp8: bool = False, varlen: bool = False, head_bias: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
@@ -177,8 +177,8 @@ class Model(nn.Module):
 
         # Output heads: non-FP8 uses te.Linear for fused kernels; FP8 keeps nn.Linear (dims not FP8-aligned)
         num_scorebeliefs = config["num_scorebeliefs"]
-        self.policy_head = PolicyHead(self.c_trunk, pos_len)
-        self.value_head = ValueHead(self.c_trunk, num_scorebeliefs, pos_len, score_mode=score_mode)
+        self.policy_head = PolicyHead(self.c_trunk, pos_len, head_bias=head_bias)
+        self.value_head = ValueHead(self.c_trunk, num_scorebeliefs, pos_len, score_mode=score_mode, head_bias=head_bias)
         if not use_fp8:
             _replace_nn_linear_with_te(self.policy_head)
             _replace_nn_linear_with_te(self.value_head)
@@ -226,11 +226,13 @@ class Model(nn.Module):
         init_fn(self.conv_spatial.weight)
         init_fn(self.linear_global.weight)
 
-        # Heads (nn.Linear from model.py, all bias=False)
+        # Heads (nn.Linear from model.py)
         for m in (self.policy_head, self.value_head):
             for p in m.parameters():
                 if p.dim() >= 2:
                     init_fn(p)
+                else:
+                    nn.init.zeros_(p)
 
     def forward_trunk_for_onnx_export(self, input_spatial, input_global):
         x, attn_mask, mask_flat = self._forward_stem_impl(input_spatial, input_global)
@@ -358,7 +360,7 @@ class ModelDecomposedExport(nn.Module):
     """Export-only TE model that keeps TE modules but applies RoPE via plain PyTorch ops."""
 
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
-                 use_fp8: bool = False, varlen: bool = False):
+                 use_fp8: bool = False, varlen: bool = False, head_bias: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
@@ -395,8 +397,8 @@ class ModelDecomposedExport(nn.Module):
         self.norm_final = te.RMSNorm(self.c_trunk, eps=1e-6)
 
         num_scorebeliefs = config["num_scorebeliefs"]
-        self.policy_head = PolicyHead(self.c_trunk, pos_len)
-        self.value_head = ValueHead(self.c_trunk, num_scorebeliefs, pos_len, score_mode=score_mode)
+        self.policy_head = PolicyHead(self.c_trunk, pos_len, head_bias=head_bias)
+        self.value_head = ValueHead(self.c_trunk, num_scorebeliefs, pos_len, score_mode=score_mode, head_bias=head_bias)
         if not use_fp8:
             _replace_nn_linear_with_te(self.policy_head)
             _replace_nn_linear_with_te(self.value_head)

@@ -163,10 +163,10 @@ def main(rank, world_size, args, gpu_id):
     # Conditional model import
     if args.use_te:
         from model_te import Model, detect_checkpoint_format, convert_checkpoint_model_to_te
-        model_extra_kwargs = {"use_fp8": args.use_fp8, "varlen": args.varlen}
+        model_extra_kwargs = {"use_fp8": args.use_fp8, "varlen": args.varlen, "head_bias": args.head_bias}
     else:
         from model import Model
-        model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res, "gated_attn": args.gated_attn}
+        model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res, "gated_attn": args.gated_attn, "head_bias": args.head_bias}
 
     # Parse td_value_loss_scales
     td_value_loss_scales = [float(x) for x in args.td_value_loss_scales.split(",")]
@@ -310,6 +310,13 @@ def main(rank, world_size, args, gpu_id):
                 f"Checkpoint gated_attn={ckpt_gated_attn} differs from --gated-attn={args.gated_attn}; "
                 "rerun with a matching flag"
             )
+        # Verify head_bias flag matches checkpoint
+        ckpt_head_bias = state.get("head_bias", False)
+        if ckpt_head_bias != args.head_bias:
+            raise RuntimeError(
+                f"Checkpoint head_bias={ckpt_head_bias} differs from --head-bias={args.head_bias}; "
+                "rerun with a matching flag"
+            )
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
@@ -363,6 +370,13 @@ def main(rank, world_size, args, gpu_id):
         if ckpt_gated_attn != args.gated_attn:
             raise RuntimeError(
                 f"Initial checkpoint gated_attn={ckpt_gated_attn} differs from --gated-attn={args.gated_attn}; "
+                "rerun with a matching flag"
+            )
+        # Verify head_bias flag matches initial checkpoint
+        ckpt_head_bias = state.get("head_bias", False)
+        if ckpt_head_bias != args.head_bias:
+            raise RuntimeError(
+                f"Initial checkpoint head_bias={ckpt_head_bias} differs from --head-bias={args.head_bias}; "
                 "rerun with a matching flag"
             )
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
@@ -687,6 +701,7 @@ def main(rank, world_size, args, gpu_id):
                 "varlen": args.varlen,
                 "attn_res": args.attn_res,
                 "gated_attn": args.gated_attn,
+                "head_bias": args.head_bias,
                 "training_mode": {
                     "zero": zero_adam is not None,
                     "has_muon": muon_opt is not None,
@@ -1216,6 +1231,8 @@ if __name__ == "__main__":
                         help="Enable Attention Residuals (full depth attention replacing standard residuals)")
     parser.add_argument("--gated-attn", action="store_true",
                         help="Enable elementwise gated attention (sigmoid gate on attention output)")
+    parser.add_argument("--head-bias", action="store_true",
+                        help="Add bias (zero-init, no weight decay) to policy/value head linear layers")
     args = parser.parse_args()
 
     # Validation
