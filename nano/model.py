@@ -106,7 +106,7 @@ def attn_res(states, proj, norm):
 class TransformerBlock(nn.Module):
     def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
                  use_attn_res: bool = False, is_first_block: bool = False,
-                 use_gated_attn: bool = False):
+                 use_gated_attn: bool = False, norm_fp32: bool = True):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c_main // num_heads
@@ -122,8 +122,9 @@ class TransformerBlock(nn.Module):
         self.ffn_wgate = nn.Linear(c_main, ffn_dim, bias=False)
         self.ffn_w2 = nn.Linear(ffn_dim, c_main, bias=False)
 
-        self.norm1 = RMSNormFP32(c_main, eps=1e-6)
-        self.norm2 = RMSNormFP32(c_main, eps=1e-6)
+        NormClass = RMSNormFP32 if norm_fp32 else nn.RMSNorm
+        self.norm1 = NormClass(c_main, eps=1e-6)
+        self.norm2 = NormClass(c_main, eps=1e-6)
 
         self.use_gated_attn = use_gated_attn
         if use_gated_attn:
@@ -135,9 +136,9 @@ class TransformerBlock(nn.Module):
         if use_attn_res:
             if not is_first_block:
                 self.attn_res_proj = nn.Linear(c_main, 1, bias=False)
-                self.attn_res_norm = RMSNormFP32(c_main)
+                self.attn_res_norm = NormClass(c_main)
             self.mlp_res_proj = nn.Linear(c_main, 1, bias=False)
-            self.mlp_res_norm = RMSNormFP32(c_main)
+            self.mlp_res_norm = NormClass(c_main)
 
     def forward(self, x, rope_cos, rope_sin, attn_mask=None):
         """
@@ -363,7 +364,8 @@ class ValueHead(nn.Module):
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop", varlen: bool = False,
-                 attn_res: bool = False, gated_attn: bool = False, head_bias: bool = False):
+                 attn_res: bool = False, gated_attn: bool = False, head_bias: bool = False,
+                 norm_fp32: bool = True):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
@@ -401,10 +403,11 @@ class Model(nn.Module):
                 use_attn_res=attn_res,
                 is_first_block=(i == 0),
                 use_gated_attn=gated_attn,
+                norm_fp32=norm_fp32,
             ))
 
         # Final normalization
-        self.norm_final = RMSNormFP32(self.c_trunk, eps=1e-6)
+        self.norm_final = (RMSNormFP32 if norm_fp32 else nn.RMSNorm)(self.c_trunk, eps=1e-6)
 
         # Output heads
         num_scorebeliefs = config["num_scorebeliefs"]

@@ -74,7 +74,8 @@ def load_model_from_checkpoint(checkpoint_path, pos_len, score_mode, use_ema=Fal
         score_mode = detected_score_mode
 
     varlen = state.get("varlen", False)
-    model = Model(model_config, pos_len, score_mode=score_mode, varlen=varlen)
+    norm_fp32 = state.get("norm_fp32", True)
+    model = Model(model_config, pos_len, score_mode=score_mode, varlen=varlen, norm_fp32=norm_fp32)
 
     # Choose weights: EMA shadow or regular model
     if use_ema and "ema_shadow" in state:

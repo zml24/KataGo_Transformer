@@ -166,7 +166,7 @@ def main(rank, world_size, args, gpu_id):
         model_extra_kwargs = {"use_fp8": args.use_fp8, "varlen": args.varlen, "head_bias": args.head_bias}
     else:
         from model import Model
-        model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res, "gated_attn": args.gated_attn, "head_bias": args.head_bias}
+        model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res, "gated_attn": args.gated_attn, "head_bias": args.head_bias, "norm_fp32": not args.no_norm_fp32}
 
     # Parse td_value_loss_scales
     td_value_loss_scales = [float(x) for x in args.td_value_loss_scales.split(",")]
@@ -317,6 +317,13 @@ def main(rank, world_size, args, gpu_id):
                 f"Checkpoint head_bias={ckpt_head_bias} differs from --head-bias={args.head_bias}; "
                 "rerun with a matching flag"
             )
+        # Verify norm_fp32 flag matches checkpoint
+        ckpt_norm_fp32 = state.get("norm_fp32", True)
+        if ckpt_norm_fp32 != (not args.no_norm_fp32):
+            raise RuntimeError(
+                f"Checkpoint norm_fp32={ckpt_norm_fp32} differs from current norm_fp32={not args.no_norm_fp32}; "
+                "rerun with a matching flag"
+            )
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
@@ -377,6 +384,13 @@ def main(rank, world_size, args, gpu_id):
         if ckpt_head_bias != args.head_bias:
             raise RuntimeError(
                 f"Initial checkpoint head_bias={ckpt_head_bias} differs from --head-bias={args.head_bias}; "
+                "rerun with a matching flag"
+            )
+        # Verify norm_fp32 flag matches initial checkpoint
+        ckpt_norm_fp32 = state.get("norm_fp32", True)
+        if ckpt_norm_fp32 != (not args.no_norm_fp32):
+            raise RuntimeError(
+                f"Initial checkpoint norm_fp32={ckpt_norm_fp32} differs from current norm_fp32={not args.no_norm_fp32}; "
                 "rerun with a matching flag"
             )
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
@@ -702,6 +716,7 @@ def main(rank, world_size, args, gpu_id):
                 "attn_res": args.attn_res,
                 "gated_attn": args.gated_attn,
                 "head_bias": args.head_bias,
+                "norm_fp32": not args.no_norm_fp32,
                 "training_mode": {
                     "zero": zero_adam is not None,
                     "has_muon": muon_opt is not None,
@@ -1233,6 +1248,8 @@ if __name__ == "__main__":
                         help="Enable elementwise gated attention (sigmoid gate on attention output)")
     parser.add_argument("--head-bias", action="store_true",
                         help="Add bias (zero-init, no weight decay) to policy/value head linear layers")
+    parser.add_argument("--no-norm-fp32", action="store_true",
+                        help="Use nn.RMSNorm instead of FP32-wrapped RMSNorm (faster, may reduce numerical stability)")
     args = parser.parse_args()
 
     # Validation
