@@ -163,10 +163,10 @@ def main(rank, world_size, args, gpu_id):
     # Conditional model import
     if args.use_te:
         from model_te import Model, detect_checkpoint_format, convert_checkpoint_model_to_te
-        model_extra_kwargs = {"use_fp8": args.use_fp8, "varlen": args.varlen, "head_bias": args.head_bias}
+        model_extra_kwargs = {"use_fp8": args.use_fp8, "varlen": args.varlen, "head_bias": args.head_bias, "zero_centered_norm": args.zero_centered_norm}
     else:
         from model import Model
-        model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res, "gated_attn": args.gated_attn, "head_bias": args.head_bias, "norm_fp32": not args.no_norm_fp32}
+        model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res, "gated_attn": args.gated_attn, "head_bias": args.head_bias, "norm_fp32": not args.no_norm_fp32, "zero_centered_norm": args.zero_centered_norm}
 
     # Parse td_value_loss_scales
     td_value_loss_scales = [float(x) for x in args.td_value_loss_scales.split(",")]
@@ -324,6 +324,13 @@ def main(rank, world_size, args, gpu_id):
                 f"Checkpoint norm_fp32={ckpt_norm_fp32} differs from current norm_fp32={not args.no_norm_fp32}; "
                 "rerun with a matching flag"
             )
+        # Verify zero_centered_norm flag matches checkpoint
+        ckpt_zero_centered_norm = state.get("zero_centered_norm", False)
+        if ckpt_zero_centered_norm != args.zero_centered_norm:
+            raise RuntimeError(
+                f"Checkpoint zero_centered_norm={ckpt_zero_centered_norm} differs from "
+                f"--zero-centered-norm={args.zero_centered_norm}; rerun with a matching flag"
+            )
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
@@ -336,7 +343,7 @@ def main(rank, world_size, args, gpu_id):
                 from model_te import detect_checkpoint_format as _detect, convert_checkpoint_te_to_model as _convert
                 if _detect(model_state) == "te":
                     logging.info("Converting TE checkpoint to model.py format")
-                    model_state = _convert(model_state)
+                    model_state = _convert(model_state, zero_centered_norm=args.zero_centered_norm)
             except ImportError:
                 pass
             model.load_state_dict(model_state)
@@ -393,6 +400,13 @@ def main(rank, world_size, args, gpu_id):
                 f"Initial checkpoint norm_fp32={ckpt_norm_fp32} differs from current norm_fp32={not args.no_norm_fp32}; "
                 "rerun with a matching flag"
             )
+        # Verify zero_centered_norm flag matches initial checkpoint
+        ckpt_zero_centered_norm = state.get("zero_centered_norm", False)
+        if ckpt_zero_centered_norm != args.zero_centered_norm:
+            raise RuntimeError(
+                f"Initial checkpoint zero_centered_norm={ckpt_zero_centered_norm} differs from "
+                f"--zero-centered-norm={args.zero_centered_norm}; rerun with a matching flag"
+            )
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
@@ -405,7 +419,7 @@ def main(rank, world_size, args, gpu_id):
                 from model_te import detect_checkpoint_format as _detect, convert_checkpoint_te_to_model as _convert
                 if _detect(model_state) == "te":
                     logging.info("Converting TE initial checkpoint to model.py format")
-                    model_state = _convert(model_state)
+                    model_state = _convert(model_state, zero_centered_norm=args.zero_centered_norm)
             except ImportError:
                 pass
             result = model.load_state_dict(model_state, strict=False)
@@ -459,7 +473,11 @@ def main(rank, world_size, args, gpu_id):
         if not p.requires_grad:
             continue
         if p.dim() < 2 or name.endswith("layer_norm_weight") or name.endswith("layer_norm_bias"):
-            no_decay_params[name] = p
+            # Zero-centered norm weights need weight decay (pushes weight→0, gamma→1)
+            if args.zero_centered_norm and "norm" in name and "weight" in name:
+                adam_params[name] = p
+            else:
+                no_decay_params[name] = p
         elif "attn_res_proj" in name or "mlp_res_proj" in name:
             adam_params[name] = p
         elif args.optimizer == "muon" and "blocks." in name:
@@ -717,6 +735,7 @@ def main(rank, world_size, args, gpu_id):
                 "gated_attn": args.gated_attn,
                 "head_bias": args.head_bias,
                 "norm_fp32": not args.no_norm_fp32,
+                "zero_centered_norm": args.zero_centered_norm,
                 "training_mode": {
                     "zero": zero_adam is not None,
                     "has_muon": muon_opt is not None,
@@ -1250,6 +1269,8 @@ if __name__ == "__main__":
                         help="Add bias (zero-init, no weight decay) to policy/value head linear layers")
     parser.add_argument("--no-norm-fp32", action="store_true",
                         help="Use nn.RMSNorm instead of FP32-wrapped RMSNorm (faster, may reduce numerical stability)")
+    parser.add_argument("--zero-centered-norm", action="store_true",
+                        help="Use zero-centered RMSNorm (weight=0 init, gamma=1+weight, WD pushes gamma toward 1)")
     args = parser.parse_args()
 
     # Validation
@@ -1265,6 +1286,8 @@ if __name__ == "__main__":
         parser.error("--attn-res and --use-te cannot be used together")
     if args.gated_attn and args.use_te:
         parser.error("--gated-attn and --use-te cannot be used together")
+    if args.zero_centered_norm and args.no_norm_fp32:
+        parser.error("--zero-centered-norm conflicts with --no-norm-fp32")
 
     # Detect torchrun launch (torchrun sets RANK, LOCAL_RANK, WORLD_SIZE env vars)
     torchrun_rank = os.environ.get("RANK")

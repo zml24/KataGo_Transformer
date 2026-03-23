@@ -82,6 +82,25 @@ class RMSNormFP32(nn.Module):
             return self.norm(x.float()).to(x.dtype)
 
 
+class ZeroCenteredRMSNormFP32(nn.Module):
+    """Zero-Centered RMSNorm in FP32.
+
+    Weight initialized to 0; forward uses (1 + weight) * rms_norm(x).
+    Weight decay pushes weight toward 0, i.e. gamma toward 1.
+    """
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        with torch.amp.autocast(x.device.type, enabled=False):
+            x_f32 = x.float()
+            mean_sq = (x_f32 * x_f32).mean(-1, keepdim=True)
+            inv_rms = torch.rsqrt(mean_sq + self.eps)
+            return ((1.0 + self.weight.float()) * (x_f32 * inv_rms)).to(x.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Attention Residuals (Full depth attention)
 # ---------------------------------------------------------------------------
@@ -106,7 +125,8 @@ def attn_res(states, proj, norm):
 class TransformerBlock(nn.Module):
     def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
                  use_attn_res: bool = False, is_first_block: bool = False,
-                 use_gated_attn: bool = False, norm_fp32: bool = True):
+                 use_gated_attn: bool = False, norm_fp32: bool = True,
+                 zero_centered_norm: bool = False):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c_main // num_heads
@@ -122,7 +142,12 @@ class TransformerBlock(nn.Module):
         self.ffn_wgate = nn.Linear(c_main, ffn_dim, bias=False)
         self.ffn_w2 = nn.Linear(ffn_dim, c_main, bias=False)
 
-        NormClass = RMSNormFP32 if norm_fp32 else nn.RMSNorm
+        if zero_centered_norm:
+            NormClass = ZeroCenteredRMSNormFP32
+        elif norm_fp32:
+            NormClass = RMSNormFP32
+        else:
+            NormClass = nn.RMSNorm
         self.norm1 = NormClass(c_main, eps=1e-6)
         self.norm2 = NormClass(c_main, eps=1e-6)
 
@@ -365,13 +390,14 @@ class ValueHead(nn.Module):
 class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop", varlen: bool = False,
                  attn_res: bool = False, gated_attn: bool = False, head_bias: bool = False,
-                 norm_fp32: bool = True):
+                 norm_fp32: bool = True, zero_centered_norm: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
         self.varlen = varlen
         self.attn_res = attn_res
         self.gated_attn = gated_attn
+        self.zero_centered_norm = zero_centered_norm
         self.c_trunk = config["hidden_size"]
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
@@ -404,10 +430,14 @@ class Model(nn.Module):
                 is_first_block=(i == 0),
                 use_gated_attn=gated_attn,
                 norm_fp32=norm_fp32,
+                zero_centered_norm=zero_centered_norm,
             ))
 
         # Final normalization
-        self.norm_final = (RMSNormFP32 if norm_fp32 else nn.RMSNorm)(self.c_trunk, eps=1e-6)
+        if zero_centered_norm:
+            self.norm_final = ZeroCenteredRMSNormFP32(self.c_trunk, eps=1e-6)
+        else:
+            self.norm_final = (RMSNormFP32 if norm_fp32 else nn.RMSNorm)(self.c_trunk, eps=1e-6)
 
         # Output heads
         num_scorebeliefs = config["num_scorebeliefs"]
@@ -439,6 +469,22 @@ class Model(nn.Module):
                     if ".out_proj." in name or ".ffn_w2." in name:
                         std = std / math.sqrt(2.0 * num_blocks)
                     nn.init.normal_(p, mean=0.0, std=std)
+
+    def fuse_zero_centered_norm(self):
+        """Fuse zero-centered norm: replace ZeroCenteredRMSNormFP32 with RMSNormFP32.
+
+        Each module's weight is replaced by weight + 1, producing standard RMSNorm behavior.
+        """
+        for name, module in list(self.named_modules()):
+            if isinstance(module, ZeroCenteredRMSNormFP32):
+                new_norm = RMSNormFP32(module.weight.shape[0], eps=module.eps)
+                new_norm.norm.weight.data.copy_(module.weight.data + 1.0)
+                parts = name.split(".")
+                parent = self
+                for part in parts[:-1]:
+                    parent = getattr(parent, part)
+                setattr(parent, parts[-1], new_norm)
+        self.zero_centered_norm = False
 
     def _forward_trunk_impl(self, input_spatial, input_global):
         x, attn_mask, mask_flat = self._forward_stem_impl(input_spatial, input_global)

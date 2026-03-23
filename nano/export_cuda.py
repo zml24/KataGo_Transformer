@@ -61,8 +61,10 @@ def _looks_like_te_checkpoint(model_state):
     return any(".layer.self_attention." in key for key in model_state)
 
 
-def _convert_checkpoint_te_to_model_standalone(state_dict):
+def _convert_checkpoint_te_to_model_standalone(state_dict, zero_centered_norm=False):
     """把 TransformerEngine checkpoint 映射回 model.py 的权重命名。"""
+    # ZeroCenteredRMSNormFP32 has .weight directly; RMSNormFP32 wraps nn.RMSNorm as .norm.weight
+    norm_suffix = ".weight" if zero_centered_norm else ".norm.weight"
     new_sd = {}
     for key, value in state_dict.items():
         if "_extra_state" in key:
@@ -75,11 +77,11 @@ def _convert_checkpoint_te_to_model_standalone(state_dict):
         elif ".layer.layernorm_mlp.fc2_weight" in key:
             new_sd[key.replace(".layer.layernorm_mlp.fc2_weight", ".ffn_w2.weight")] = value
         elif ".layer.self_attention.layernorm_qkv.layer_norm_weight" in key:
-            new_sd[key.replace(".layer.self_attention.layernorm_qkv.layer_norm_weight", ".norm1.norm.weight")] = value
+            new_sd[key.replace(".layer.self_attention.layernorm_qkv.layer_norm_weight", ".norm1" + norm_suffix)] = value
         elif ".layer.self_attention.layernorm_qkv.layer_norm_bias" in key:
             continue
         elif ".layer.layernorm_mlp.layer_norm_weight" in key:
-            new_sd[key.replace(".layer.layernorm_mlp.layer_norm_weight", ".norm2.norm.weight")] = value
+            new_sd[key.replace(".layer.layernorm_mlp.layer_norm_weight", ".norm2" + norm_suffix)] = value
         elif ".layer.layernorm_mlp.layer_norm_bias" in key:
             continue
         elif ".layer.self_attention.layernorm_qkv.query_weight" in key:
@@ -91,9 +93,9 @@ def _convert_checkpoint_te_to_model_standalone(state_dict):
         elif ".layer.self_attention.proj.weight" in key:
             new_sd[key.replace(".layer.self_attention.proj.weight", ".out_proj.weight")] = value
         elif key == "norm_final.weight":
-            new_sd["norm_final.norm.weight"] = value
+            new_sd["norm_final" + norm_suffix] = value
         elif key.endswith(".norm_final.weight"):
-            new_sd[key.replace(".norm_final.weight", ".norm_final.norm.weight")] = value
+            new_sd[key.replace(".norm_final.weight", ".norm_final" + norm_suffix)] = value
         else:
             new_sd[key] = value
     return new_sd
@@ -109,16 +111,19 @@ def _make_model(checkpoint_path, pos_len, score_mode, use_ema):
         raise RuntimeError("原生 CUDA 导出当前只支持 stem=cnn1/cnn3/cnn5")
     varlen = state.get("varlen", False)
     head_bias = state.get("head_bias", False)
-    model = Model(config, pos_len=pos_len, score_mode=score_mode, varlen=varlen, head_bias=head_bias)
+    zero_centered_norm = state.get("zero_centered_norm", False)
+    model = Model(config, pos_len=pos_len, score_mode=score_mode, varlen=varlen, head_bias=head_bias, zero_centered_norm=zero_centered_norm)
     model_state = _resolve_model_state(state, use_ema)
     if _looks_like_te_checkpoint(model_state):
         print("检测到 TransformerEngine checkpoint，先转换为 model.py 权重命名")
-        model_state = _convert_checkpoint_te_to_model_standalone(model_state)
+        model_state = _convert_checkpoint_te_to_model_standalone(model_state, zero_centered_norm=zero_centered_norm)
     result = model.load_state_dict(model_state, strict=False)
     if result.missing_keys:
         print(f"Missing keys (will use default init): {result.missing_keys}")
     if result.unexpected_keys:
         print(f"Unexpected keys (ignored): {result.unexpected_keys}")
+    if zero_centered_norm:
+        model.fuse_zero_centered_norm()
     model.eval()
     return model, config, varlen
 

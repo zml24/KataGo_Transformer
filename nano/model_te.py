@@ -27,6 +27,7 @@ from configs import get_num_bin_input_features, get_num_global_input_features
 from model import (
     EXTRA_SCORE_DISTR_RADIUS,
     RMSNormFP32,
+    ZeroCenteredRMSNormFP32,
     SoftPlusWithGradientFloor,
     apply_rotary_emb,
     cross_entropy,
@@ -46,7 +47,8 @@ class TransformerBlockTE(nn.Module):
     """
 
     def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
-                 init_method=None, output_layer_init_method=None):
+                 init_method=None, output_layer_init_method=None,
+                 zero_centered_gamma: bool = False):
         super().__init__()
         self.layer = te.TransformerLayer(
             c_main, ffn_dim, num_heads,
@@ -60,6 +62,7 @@ class TransformerBlockTE(nn.Module):
             bias=False,
             activation="swiglu",
             attn_input_format="bshd",
+            zero_centered_gamma=zero_centered_gamma,
         )
 
     def forward(self, x, rope, attn_mask=None):
@@ -78,7 +81,8 @@ class TransformerBlockTE(nn.Module):
 class TransformerBlockTEDecomposed(nn.Module):
     """Export-only TE block with manual RoPE outside TE custom fused kernels."""
 
-    def __init__(self, c_main: int, num_heads: int, ffn_dim: int):
+    def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
+                 zero_centered_gamma: bool = False):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c_main // num_heads
@@ -88,6 +92,7 @@ class TransformerBlockTEDecomposed(nn.Module):
             eps=1e-6,
             bias=False,
             normalization="RMSNorm",
+            zero_centered_gamma=zero_centered_gamma,
         )
         self.attention = te.DotProductAttention(
             num_attention_heads=num_heads,
@@ -104,6 +109,7 @@ class TransformerBlockTEDecomposed(nn.Module):
             bias=False,
             normalization="RMSNorm",
             activation="swiglu",
+            zero_centered_gamma=zero_centered_gamma,
         )
 
     def forward(self, x, rope_cos, rope_sin, attn_mask=None):
@@ -136,11 +142,13 @@ def _replace_nn_linear_with_te(module):
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
-                 use_fp8: bool = False, varlen: bool = False, head_bias: bool = False):
+                 use_fp8: bool = False, varlen: bool = False, head_bias: bool = False,
+                 zero_centered_norm: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
         self.varlen = varlen
+        self.zero_centered_norm = zero_centered_norm
         self.c_trunk = config["hidden_size"]
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
@@ -170,10 +178,12 @@ class Model(nn.Module):
                 c_main=self.c_trunk,
                 num_heads=num_heads,
                 ffn_dim=ffn_dim,
+                zero_centered_gamma=zero_centered_norm,
             ))
 
         # Final normalization (TE fused kernel)
-        self.norm_final = te.RMSNorm(self.c_trunk, eps=1e-6)
+        self.norm_final = te.RMSNorm(self.c_trunk, eps=1e-6,
+                                      zero_centered_gamma=zero_centered_norm)
 
         # Output heads: non-FP8 uses te.Linear for fused kernels; FP8 keeps nn.Linear (dims not FP8-aligned)
         num_scorebeliefs = config["num_scorebeliefs"]
@@ -218,6 +228,7 @@ class Model(nn.Module):
             TransformerBlockTE(
                 c_main=self.c_trunk, num_heads=num_heads, ffn_dim=ffn_dim,
                 init_method=init_fn, output_layer_init_method=output_init_fn,
+                zero_centered_gamma=self.zero_centered_norm,
             )
             for _ in range(num_blocks)
         ])
@@ -360,11 +371,13 @@ class ModelDecomposedExport(nn.Module):
     """Export-only TE model that keeps TE modules but applies RoPE via plain PyTorch ops."""
 
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
-                 use_fp8: bool = False, varlen: bool = False, head_bias: bool = False):
+                 use_fp8: bool = False, varlen: bool = False, head_bias: bool = False,
+                 zero_centered_norm: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
         self.varlen = varlen
+        self.zero_centered_norm = zero_centered_norm
         self.c_trunk = config["hidden_size"]
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
@@ -391,10 +404,12 @@ class ModelDecomposedExport(nn.Module):
                 c_main=self.c_trunk,
                 num_heads=num_heads,
                 ffn_dim=ffn_dim,
+                zero_centered_gamma=zero_centered_norm,
             )
             for _ in range(config["num_layers"])
         ])
-        self.norm_final = te.RMSNorm(self.c_trunk, eps=1e-6)
+        self.norm_final = te.RMSNorm(self.c_trunk, eps=1e-6,
+                                      zero_centered_gamma=zero_centered_norm)
 
         num_scorebeliefs = config["num_scorebeliefs"]
         self.policy_head = PolicyHead(self.c_trunk, pos_len, head_bias=head_bias)
@@ -562,11 +577,15 @@ def convert_checkpoint_model_to_te_decomposed(state_dict):
     return new_sd
 
 
-def convert_checkpoint_te_to_model(state_dict):
+def convert_checkpoint_te_to_model(state_dict, zero_centered_norm=False):
     """Convert TE (te.TransformerLayer) state_dict back to model.py format.
 
     Filters out TE-specific _extra_state keys.
+    When zero_centered_norm=True, maps norm weights to ZeroCenteredRMSNormFP32 paths
+    (e.g. .norm1.weight) instead of RMSNormFP32 paths (e.g. .norm1.norm.weight).
     """
+    # ZeroCenteredRMSNormFP32 has .weight directly; RMSNormFP32 wraps nn.RMSNorm as .norm.weight
+    norm_suffix = ".weight" if zero_centered_norm else ".norm.weight"
     new_sd = {}
     for key, value in state_dict.items():
         if "_extra_state" in key:
@@ -579,12 +598,12 @@ def convert_checkpoint_te_to_model(state_dict):
         elif ".layer.layernorm_mlp.fc2_weight" in key:
             new_sd[key.replace(".layer.layernorm_mlp.fc2_weight", ".ffn_w2.weight")] = value
         elif ".layer.self_attention.layernorm_qkv.layer_norm_weight" in key:
-            new_sd[key.replace(".layer.self_attention.layernorm_qkv.layer_norm_weight", ".norm1.norm.weight")] = value
+            new_sd[key.replace(".layer.self_attention.layernorm_qkv.layer_norm_weight", ".norm1" + norm_suffix)] = value
         elif ".layer.self_attention.layernorm_qkv.layer_norm_bias" in key:
             # model.py uses nn.RMSNorm inside RMSNormFP32 and therefore has no bias parameter.
             continue
         elif ".layer.layernorm_mlp.layer_norm_weight" in key:
-            new_sd[key.replace(".layer.layernorm_mlp.layer_norm_weight", ".norm2.norm.weight")] = value
+            new_sd[key.replace(".layer.layernorm_mlp.layer_norm_weight", ".norm2" + norm_suffix)] = value
         elif ".layer.layernorm_mlp.layer_norm_bias" in key:
             continue
         elif ".layer.self_attention.layernorm_qkv.query_weight" in key:
@@ -596,9 +615,9 @@ def convert_checkpoint_te_to_model(state_dict):
         elif ".layer.self_attention.proj.weight" in key:
             new_sd[key.replace(".layer.self_attention.proj.weight", ".out_proj.weight")] = value
         elif key == "norm_final.weight":
-            new_sd["norm_final.norm.weight"] = value
+            new_sd["norm_final" + norm_suffix] = value
         elif key.endswith(".norm_final.weight"):
-            new_sd[key.replace(".norm_final.weight", ".norm_final.norm.weight")] = value
+            new_sd[key.replace(".norm_final.weight", ".norm_final" + norm_suffix)] = value
         else:
             new_sd[key] = value
     return new_sd

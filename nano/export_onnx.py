@@ -180,9 +180,12 @@ def _load_checkpoint(args):
     head_bias = state.get("head_bias", False)
     if head_bias:
         print(f"Checkpoint was trained with --head-bias; head linear layers include bias")
+    zero_centered_norm = state.get("zero_centered_norm", False)
+    if zero_centered_norm:
+        print(f"Checkpoint was trained with --zero-centered-norm; will fuse before export")
     print(f"Model config: {config}")
     print(f"pos_len={args.pos_len}, score_mode={args.score_mode}, method={args.method}")
-    return state, config, varlen, attn_res, gated_attn, head_bias
+    return state, config, varlen, attn_res, gated_attn, head_bias, zero_centered_norm
 
 
 def _resolve_output_path(args):
@@ -224,12 +227,15 @@ def _detect_checkpoint_format_standalone(state_dict):
     return "pt"
 
 
-def _convert_checkpoint_te_to_model_standalone(state_dict):
+def _convert_checkpoint_te_to_model_standalone(state_dict, zero_centered_norm=False):
     """Standalone version of convert_checkpoint_te_to_model (no TE dependency).
 
     Converts TE (te.TransformerLayer) state_dict back to model.py format.
     Filters out TE-specific _extra_state keys.
+    When zero_centered_norm=True, maps norm weights to ZeroCenteredRMSNormFP32 paths.
     """
+    # ZeroCenteredRMSNormFP32 has .weight directly; RMSNormFP32 wraps nn.RMSNorm as .norm.weight
+    norm_suffix = ".weight" if zero_centered_norm else ".norm.weight"
     new_sd = {}
     for key, value in state_dict.items():
         if "_extra_state" in key:
@@ -242,11 +248,11 @@ def _convert_checkpoint_te_to_model_standalone(state_dict):
         elif ".layer.layernorm_mlp.fc2_weight" in key:
             new_sd[key.replace(".layer.layernorm_mlp.fc2_weight", ".ffn_w2.weight")] = value
         elif ".layer.self_attention.layernorm_qkv.layer_norm_weight" in key:
-            new_sd[key.replace(".layer.self_attention.layernorm_qkv.layer_norm_weight", ".norm1.norm.weight")] = value
+            new_sd[key.replace(".layer.self_attention.layernorm_qkv.layer_norm_weight", ".norm1" + norm_suffix)] = value
         elif ".layer.self_attention.layernorm_qkv.layer_norm_bias" in key:
             continue
         elif ".layer.layernorm_mlp.layer_norm_weight" in key:
-            new_sd[key.replace(".layer.layernorm_mlp.layer_norm_weight", ".norm2.norm.weight")] = value
+            new_sd[key.replace(".layer.layernorm_mlp.layer_norm_weight", ".norm2" + norm_suffix)] = value
         elif ".layer.layernorm_mlp.layer_norm_bias" in key:
             continue
         elif ".layer.self_attention.layernorm_qkv.query_weight" in key:
@@ -258,9 +264,9 @@ def _convert_checkpoint_te_to_model_standalone(state_dict):
         elif ".layer.self_attention.proj.weight" in key:
             new_sd[key.replace(".layer.self_attention.proj.weight", ".out_proj.weight")] = value
         elif key == "norm_final.weight":
-            new_sd["norm_final.norm.weight"] = value
+            new_sd["norm_final" + norm_suffix] = value
         elif key.endswith(".norm_final.weight"):
-            new_sd[key.replace(".norm_final.weight", ".norm_final.norm.weight")] = value
+            new_sd[key.replace(".norm_final.weight", ".norm_final" + norm_suffix)] = value
         else:
             new_sd[key] = value
     return new_sd
@@ -724,7 +730,7 @@ def _make_te_decomposed_fallback_args(args):
     return fallback_args
 
 
-def _export_legacy(args, state, config, varlen=False, attn_res=False, gated_attn=False, head_bias=False):
+def _export_legacy(args, state, config, varlen=False, attn_res=False, gated_attn=False, head_bias=False, zero_centered_norm=False):
     model_state = _resolve_model_state(state, args.use_ema)
     should_try_te_conversion = args.use_te or _looks_like_te_checkpoint(model_state)
     if should_try_te_conversion:
@@ -736,10 +742,12 @@ def _export_legacy(args, state, config, varlen=False, attn_res=False, gated_attn
             convert_checkpoint_te_to_model = _convert_checkpoint_te_to_model_standalone
         if detect_checkpoint_format(model_state) == "te":
             print("Converting TE checkpoint to model.py format for legacy ONNX export")
-            model_state = convert_checkpoint_te_to_model(model_state)
+            model_state = convert_checkpoint_te_to_model(model_state, zero_centered_norm=zero_centered_norm)
 
-    model = Model(config, args.pos_len, score_mode=args.score_mode, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn, head_bias=head_bias)
+    model = Model(config, args.pos_len, score_mode=args.score_mode, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn, head_bias=head_bias, zero_centered_norm=zero_centered_norm)
     model.load_state_dict(model_state)
+    if zero_centered_norm:
+        model.fuse_zero_centered_norm()
     model.eval()
     _print_param_count(model)
 
@@ -772,7 +780,7 @@ def _export_legacy(args, state, config, varlen=False, attn_res=False, gated_attn
     return output_path, wrapper, verify_input0, verify_input1
 
 
-def _export_te_official(args, state, config, varlen=False, head_bias=False):
+def _export_te_official(args, state, config, varlen=False, head_bias=False, zero_centered_norm=False):
     te, te_onnx_export, te_translation_table = _resolve_te_support()
     from model_te import Model as TEModel, convert_checkpoint_model_to_te, detect_checkpoint_format
 
@@ -783,7 +791,7 @@ def _export_te_official(args, state, config, varlen=False, head_bias=False):
         print("Converting model.py checkpoint to TE format for official TE ONNX export")
         model_state = convert_checkpoint_model_to_te(model_state)
 
-    model = TEModel(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8, varlen=varlen, head_bias=head_bias)
+    model = TEModel(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8, varlen=varlen, head_bias=head_bias, zero_centered_norm=zero_centered_norm)
     load_result = model.load_state_dict(model_state, strict=False)
     _validate_te_load_result(load_result)
     model.eval()
@@ -850,7 +858,7 @@ def _export_te_official(args, state, config, varlen=False, head_bias=False):
     return output_path, wrapper, verify_input0, verify_input1
 
 
-def _export_te_decomposed(args, state, config, varlen=False, head_bias=False):
+def _export_te_decomposed(args, state, config, varlen=False, head_bias=False, zero_centered_norm=False):
     te, te_onnx_export, te_translation_table = _resolve_te_support()
     from model_te import (
         ModelDecomposedExport,
@@ -867,7 +875,7 @@ def _export_te_decomposed(args, state, config, varlen=False, head_bias=False):
         model_state = convert_checkpoint_te_to_model(model_state)
 
     model_state = convert_checkpoint_model_to_te_decomposed(model_state)
-    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8, varlen=varlen, head_bias=head_bias)
+    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8, varlen=varlen, head_bias=head_bias, zero_centered_norm=zero_centered_norm)
     load_result = model.load_state_dict(model_state, strict=False)
     _validate_te_load_result(load_result)
     model.eval()
@@ -951,7 +959,7 @@ def export_per_block(args):
         detect_checkpoint_format,
     )
 
-    state, config, varlen, attn_res, gated_attn, head_bias = _load_checkpoint(args)
+    state, config, varlen, attn_res, gated_attn, head_bias, zero_centered_norm = _load_checkpoint(args)
     if attn_res:
         raise RuntimeError("--attn-res checkpoints do not support per-block TE export; use legacy export instead")
     if gated_attn:
@@ -964,7 +972,7 @@ def export_per_block(args):
         model_state = convert_checkpoint_te_to_model(model_state)
 
     model_state = convert_checkpoint_model_to_te_decomposed(model_state)
-    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8, varlen=varlen, head_bias=head_bias)
+    model = ModelDecomposedExport(config, args.pos_len, score_mode=args.score_mode, use_fp8=args.use_fp8, varlen=varlen, head_bias=head_bias, zero_centered_norm=zero_centered_norm)
     load_result = model.load_state_dict(model_state, strict=False)
     _validate_te_load_result(load_result)
     model.eval()
@@ -1059,7 +1067,7 @@ def export_per_block(args):
     return block_paths
 
 
-def _export_fp8_manual(args, state, config, varlen=False, head_bias=False):
+def _export_fp8_manual(args, state, config, varlen=False, head_bias=False, zero_centered_norm=False):
     """Export with manually inserted FP8 Q/DQ nodes (no Transformer Engine dependency).
 
     Uses the pure PyTorch model (model.py) with nn.Linear layers replaced by
@@ -1079,10 +1087,12 @@ def _export_fp8_manual(args, state, config, varlen=False, head_bias=False):
             convert_checkpoint_te_to_model = _convert_checkpoint_te_to_model_standalone
         if detect_checkpoint_format(model_state) == "te":
             print("Converting TE checkpoint to model.py format for FP8 manual export")
-            model_state = convert_checkpoint_te_to_model(model_state)
+            model_state = convert_checkpoint_te_to_model(model_state, zero_centered_norm=zero_centered_norm)
 
-    model = Model(config, args.pos_len, score_mode=args.score_mode, varlen=varlen, head_bias=head_bias)
+    model = Model(config, args.pos_len, score_mode=args.score_mode, varlen=varlen, head_bias=head_bias, zero_centered_norm=zero_centered_norm)
     model.load_state_dict(model_state)
+    if zero_centered_norm:
+        model.fuse_zero_centered_norm()
     model.eval()
 
 
@@ -1136,38 +1146,38 @@ def _export_fp8_manual(args, state, config, varlen=False, head_bias=False):
 
 
 def export(args):
-    state, config, varlen, attn_res, gated_attn, head_bias = _load_checkpoint(args)
+    state, config, varlen, attn_res, gated_attn, head_bias, zero_centered_norm = _load_checkpoint(args)
     if attn_res and args.method != "legacy":
         raise RuntimeError(f"--attn-res checkpoints only support legacy export method, got: {args.method}")
     if gated_attn and args.method != "legacy":
         raise RuntimeError(f"--gated-attn checkpoints only support legacy export method, got: {args.method}")
     if args.method == "fp8-manual":
-        return _export_fp8_manual(args, state, config, varlen=varlen, head_bias=head_bias)
+        return _export_fp8_manual(args, state, config, varlen=varlen, head_bias=head_bias, zero_centered_norm=zero_centered_norm)
     if args.method == "legacy":
-        return _export_legacy(args, state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn, head_bias=head_bias)
+        return _export_legacy(args, state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn, head_bias=head_bias, zero_centered_norm=zero_centered_norm)
     if args.method == "te-decomposed":
         try:
-            return _export_te_decomposed(args, state, config, varlen=varlen, head_bias=head_bias)
+            return _export_te_decomposed(args, state, config, varlen=varlen, head_bias=head_bias, zero_centered_norm=zero_centered_norm)
         except RuntimeError as exc:
             if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                 print("\nWARNING: te-decomposed export failed, falling back to legacy export.")
                 print(f"  original error: {exc}")
-                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn, head_bias=head_bias)
+                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn, head_bias=head_bias, zero_centered_norm=zero_centered_norm)
             raise
     if args.method == "te-official":
         try:
-            return _export_te_official(args, state, config, varlen=varlen, head_bias=head_bias)
+            return _export_te_official(args, state, config, varlen=varlen, head_bias=head_bias, zero_centered_norm=zero_centered_norm)
         except RuntimeError as exc:
             if getattr(args, "fallback_to_te_decomposed_on_te_export_error", False):
                 print("\nWARNING: te-official export failed, falling back to decomposed TE export.")
                 print(f"  original error: {exc}")
                 try:
-                    return _export_te_decomposed(_make_te_decomposed_fallback_args(args), state, config, varlen=varlen, head_bias=head_bias)
+                    return _export_te_decomposed(_make_te_decomposed_fallback_args(args), state, config, varlen=varlen, head_bias=head_bias, zero_centered_norm=zero_centered_norm)
                 except RuntimeError as decomposed_exc:
                     if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                         print("\nWARNING: te-decomposed export failed, falling back to legacy export.")
                         print(f"  original error: {decomposed_exc}")
-                        return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn, head_bias=head_bias)
+                        return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn, head_bias=head_bias, zero_centered_norm=zero_centered_norm)
                     raise RuntimeError(
                         "Both te-official and te-decomposed exports failed.\n"
                         f"te-official error: {exc}\n"
@@ -1176,7 +1186,7 @@ def export(args):
             if getattr(args, "fallback_to_legacy_on_te_export_error", False):
                 print("\nWARNING: te-official export failed, falling back to legacy export.")
                 print(f"  original error: {exc}")
-                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn, head_bias=head_bias)
+                return _export_legacy(_make_legacy_fallback_args(args), state, config, varlen=varlen, attn_res=attn_res, gated_attn=gated_attn, head_bias=head_bias, zero_centered_norm=zero_centered_norm)
             raise
     raise ValueError(f"Unsupported export method: {args.method}")
 
