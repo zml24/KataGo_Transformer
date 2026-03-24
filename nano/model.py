@@ -408,9 +408,19 @@ class Model(nn.Module):
 
         # Stem
         self.stem = config.get("stem", "cnn3")
-        kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5}[self.stem]
-        self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
-                                      kernel_size=kernel_size, padding="same", bias=False)
+        dw_kernels = {"dw19": 19, "dw37": 37}
+        if self.stem in dw_kernels:
+            # Pointwise 1x1 to expand channels, then depthwise large-kernel conv
+            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
+                                          kernel_size=1, bias=False)
+            self.conv_dw = nn.Conv2d(self.c_trunk, self.c_trunk,
+                                     kernel_size=dw_kernels[self.stem], padding="same",
+                                     groups=self.c_trunk, bias=False)
+        else:
+            kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5}[self.stem]
+            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
+                                          kernel_size=kernel_size, padding="same", bias=False)
+            self.conv_dw = None
         self.linear_global = nn.Linear(num_global_features, self.c_trunk, bias=False)
 
         # Precompute RoPE embeddings once for the whole model (rotate_half style)
@@ -523,6 +533,8 @@ class Model(nn.Module):
         # Stem: NCHW -> NLC
         x_global = self.linear_global(input_global)
         x_spatial = self.conv_spatial(input_spatial)
+        if self.conv_dw is not None:
+            x_spatial = self.conv_dw(x_spatial)
         x = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
         x = x.view(N, self.c_trunk, L).permute(0, 2, 1)
 
