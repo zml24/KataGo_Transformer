@@ -284,7 +284,16 @@ def main(rank, world_size, args, gpu_id):
     checkpoint_path = os.path.join(args.traindir, "checkpoint.ckpt")
     if os.path.exists(checkpoint_path):
         logging.info(f"Loading checkpoint: {checkpoint_path}")
-        state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        for _attempt in range(3):
+            try:
+                state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+                break
+            except RuntimeError as e:
+                if _attempt < 2 and "corrupted" in str(e):
+                    logging.warning(f"Checkpoint load attempt {_attempt+1} failed ({e}), retrying...")
+                    import time as _time; _time.sleep(2)
+                else:
+                    raise
         ckpt_config = configs.migrate_config(state.get("config", model_config))
         if ckpt_config != model_config:
             logging.warning(f"Checkpoint config differs from command-line config, using checkpoint config")
@@ -766,12 +775,17 @@ def main(rank, world_size, args, gpu_id):
 
             def _do_save():
                 path = os.path.join(args.traindir, "checkpoint.ckpt")
-                torch.save(state_dict, path + ".tmp")
-                os.replace(path + ".tmp", path)
-                # Keep a numbered copy
+                tmp_path = path + ".tmp"
+                torch.save(state_dict, tmp_path)
+                # fsync to ensure data is persisted before replacing (critical on DFS)
+                with open(tmp_path, "rb") as f:
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, path)
+                # Keep a numbered copy (use copy instead of hardlink for independence)
                 numbered = os.path.join(args.traindir, f"checkpoint-s{_samples}.ckpt")
                 if not os.path.exists(numbered):
-                    os.link(path, numbered)
+                    import shutil
+                    shutil.copy2(path, numbered)
                 logging.info(f"Saved checkpoint at step {_step}, {_samples} samples")
 
             if async_save:
