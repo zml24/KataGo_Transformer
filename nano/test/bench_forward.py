@@ -46,6 +46,11 @@ def main():
                         help="Score head mode (default: simple)")
     parser.add_argument("--varlen", action="store_true",
                         help="Enable variable-length board input with masking")
+    parser.add_argument("--stem", type=str, default=None,
+                        choices=["cnn1", "cnn3", "cnn5", "dw19", "dw37"],
+                        help="Override stem type (default: use config preset)")
+    parser.add_argument("--zero-centered-norm", action="store_true",
+                        help="Use zero-centered RMSNorm")
     args = parser.parse_args()
 
     assert torch.cuda.is_available(), "CUDA is required for this benchmark"
@@ -55,18 +60,23 @@ def main():
 
     if args.use_fp8:
         assert args.use_te, "--use-fp8 requires --use-te"
+
+    # Build config, optionally overriding stem
+    model_config = dict(configs.config_of_name[args.model_kind])
+    if args.stem is not None:
+        model_config["stem"] = args.stem
+
     # Model setup
     if args.use_te:
         from model_te import Model
-        model = Model(configs.config_of_name[args.model_kind], args.pos_len,
+        model = Model(model_config, args.pos_len,
                       score_mode=args.score_mode, use_fp8=args.use_fp8,
                       varlen=args.varlen)
     else:
         from model import Model
-        model = Model(configs.config_of_name[args.model_kind], args.pos_len,
-                      score_mode=args.score_mode, varlen=args.varlen)
-
-    model_config = configs.config_of_name[args.model_kind]
+        model = Model(model_config, args.pos_len,
+                      score_mode=args.score_mode, varlen=args.varlen,
+                      zero_centered_norm=args.zero_centered_norm)
     model.initialize()
     model.to(device)
     model.eval()
@@ -96,6 +106,8 @@ def main():
     print(f"torch.compile:  {'OFF' if args.no_compile else 'ON'}")
     print(f"TransformerEngine: {'ON' if args.use_te else 'OFF'}")
     print(f"FP8:            {'ON' if args.use_fp8 else 'OFF'}")
+    print(f"Stem:           {model_config.get('stem', 'cnn3')}")
+    print(f"Zero-centered:  {'ON' if args.zero_centered_norm else 'OFF'}")
     print(f"Score mode:     {args.score_mode}")
     print(f"FLOPs/sample:   {forward_flops/1e9:.2f} GFLOPs")
     print(f"GPU:            {gpu_name}")
