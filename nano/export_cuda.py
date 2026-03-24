@@ -13,7 +13,6 @@ from model import Model
 
 
 MAGIC = b"KGTRN001"
-FORMAT_VERSION = 3
 POLICY_CHANNELS = (0, 5)
 
 
@@ -125,7 +124,7 @@ def _make_model(checkpoint_path, pos_len, score_mode, use_ema):
     if zero_centered_norm:
         model.fuse_zero_centered_norm()
     model.eval()
-    return model, config, varlen
+    return model, config, varlen, head_bias
 
 
 def _transpose_linear(weight):
@@ -225,7 +224,7 @@ def _score_mode_id(score_mode):
     return {"simple": 0, "mix": 1, "mixop": 2}[score_mode]
 
 
-def _collect_tensors(model):
+def _collect_tensors(model, head_bias):
     tensors = []
     tensors.append(("stem.conv.weight", model.conv_spatial.weight.detach().cpu().float().contiguous()))
     tensors.append(("stem.global.weight", _transpose_linear(model.linear_global.weight)))
@@ -253,51 +252,57 @@ def _collect_tensors(model):
 
     # Policy head
     tensors.append(("policy.board_full.weight", _full_policy_weight(model.policy_head.linear_board.weight)))
-    tensors.append(("policy.board_full.bias", _get_bias(model.policy_head.linear_board)))
     tensors.append(("policy.pass_full.weight", _full_policy_weight(model.policy_head.linear_pass.weight)))
-    tensors.append(("policy.pass_full.bias", _get_bias(model.policy_head.linear_pass)))
     tensors.append(("policy.board.weight", _selected_policy_weight(model.policy_head.linear_board.weight)))
-    tensors.append(("policy.board.bias", _get_bias(model.policy_head.linear_board)[list(POLICY_CHANNELS)].contiguous()))
     tensors.append(("policy.pass.weight", _selected_policy_weight(model.policy_head.linear_pass.weight)))
-    tensors.append(("policy.pass.bias", _get_bias(model.policy_head.linear_pass)[list(POLICY_CHANNELS)].contiguous()))
+    if head_bias:
+        tensors.append(("policy.board_full.bias", _get_bias(model.policy_head.linear_board)))
+        tensors.append(("policy.pass_full.bias", _get_bias(model.policy_head.linear_pass)))
+        tensors.append(("policy.board.bias", _get_bias(model.policy_head.linear_board)[list(POLICY_CHANNELS)].contiguous()))
+        tensors.append(("policy.pass.bias", _get_bias(model.policy_head.linear_pass)[list(POLICY_CHANNELS)].contiguous()))
 
     # Value head (selected)
     value_w, score_w, ownership_w = _selected_value_weights(model)
-    value_b, score_b, ownership_b = _selected_value_biases(model)
     tensors.append(("value.value.weight", value_w))
-    tensors.append(("value.value.bias", value_b))
     tensors.append(("value.score.weight", score_w))
-    tensors.append(("value.score.bias", score_b))
     tensors.append(("value.ownership.weight", ownership_w))
-    tensors.append(("value.ownership.bias", ownership_b))
+    if head_bias:
+        value_b, score_b, ownership_b = _selected_value_biases(model)
+        tensors.append(("value.value.bias", value_b))
+        tensors.append(("value.score.bias", score_b))
+        tensors.append(("value.ownership.bias", ownership_b))
 
     # Value head (full)
     _unused_value_w, misc_w, moremisc_w, _unused_ownership_w, scoring_w, futurepos_w, seki_w = _full_value_weights(model)
-    _unused_value_b, misc_b, moremisc_b, _unused_ownership_b, scoring_b, futurepos_b, seki_b = _full_value_biases(model)
     tensors.append(("value.misc.weight", misc_w))
-    tensors.append(("value.misc.bias", misc_b))
     tensors.append(("value.moremisc.weight", moremisc_w))
-    tensors.append(("value.moremisc.bias", moremisc_b))
     tensors.append(("value.scoring.weight", scoring_w))
-    tensors.append(("value.scoring.bias", scoring_b))
     tensors.append(("value.futurepos.weight", futurepos_w))
-    tensors.append(("value.futurepos.bias", futurepos_b))
     tensors.append(("value.seki.weight", seki_w))
-    tensors.append(("value.seki.bias", seki_b))
+    if head_bias:
+        _unused_value_b, misc_b, moremisc_b, _unused_ownership_b, scoring_b, futurepos_b, seki_b = _full_value_biases(model)
+        tensors.append(("value.misc.bias", misc_b))
+        tensors.append(("value.moremisc.bias", moremisc_b))
+        tensors.append(("value.scoring.bias", scoring_b))
+        tensors.append(("value.futurepos.bias", futurepos_b))
+        tensors.append(("value.seki.bias", seki_b))
 
     # Score belief head
     score_mode = model.value_head.score_mode
     if score_mode == "simple":
         tensors.append(("scorebelief.simple.weight", _transpose_linear(model.value_head.linear_s_simple.weight)))
-        tensors.append(("scorebelief.simple.bias", _get_bias(model.value_head.linear_s_simple)))
+        if head_bias:
+            tensors.append(("scorebelief.simple.bias", _get_bias(model.value_head.linear_s_simple)))
     else:
         tensors.append(("scorebelief.mix.weight", _transpose_linear(model.value_head.linear_s_mix.weight)))
-        tensors.append(("scorebelief.mix.bias", _get_bias(model.value_head.linear_s_mix)))
+        if head_bias:
+            tensors.append(("scorebelief.mix.bias", _get_bias(model.value_head.linear_s_mix)))
         if score_mode == "mixop":
             tensors.append(("scorebelief.s2off.weight", _transpose_linear(model.value_head.linear_s2off.weight)))
-            tensors.append(("scorebelief.s2off.bias", _get_bias(model.value_head.linear_s2off)))
             tensors.append(("scorebelief.s2par.weight", _transpose_linear(model.value_head.linear_s2par.weight)))
-            tensors.append(("scorebelief.s2par.bias", _get_bias(model.value_head.linear_s2par)))
+            if head_bias:
+                tensors.append(("scorebelief.s2off.bias", _get_bias(model.value_head.linear_s2off)))
+                tensors.append(("scorebelief.s2par.bias", _get_bias(model.value_head.linear_s2par)))
     return tensors
 
 
@@ -308,13 +313,18 @@ def _open_output(path):
 
 
 def export_checkpoint(checkpoint, output, pos_len, score_mode, use_ema):
-    model, config, varlen = _make_model(checkpoint, pos_len, score_mode, use_ema)
-    tensors = _collect_tensors(model)
+    model, config, varlen, head_bias = _make_model(checkpoint, pos_len, score_mode, use_ema)
+    # FORMAT_VERSION 3 包含 bias 张量；FORMAT_VERSION 2 不含 bias 张量。
+    # 仅当模型训练时启用了 head_bias 时才使用 v3。
+    format_version = 3 if head_bias else 2
+    tensors = _collect_tensors(model, head_bias)
+
+    print(f"format_version={format_version}, head_bias={head_bias}")
 
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     with _open_output(output) as out:
         out.write(MAGIC)
-        _write_u32(out, FORMAT_VERSION)
+        _write_u32(out, format_version)
         _write_string(out, os.path.splitext(os.path.basename(output))[0])
         _write_i32(out, config["version"])
         _write_i32(out, pos_len)
@@ -329,8 +339,6 @@ def export_checkpoint(checkpoint, output, pos_len, score_mode, use_ema):
         _write_i32(out, _score_mode_id(model.value_head.score_mode))
         _write_i32(out, model.value_head.num_scorebeliefs)
         _write_i32(out, model.value_head.scorebelief_len)
-        # varlen flag 仅在 FORMAT_VERSION >= 3 时写入；
-        # version 2 不含此字段，任意一局棋都是 fixlen 推理。
 
         _write_f32(out, 20.0)
         _write_f32(out, 20.0)
