@@ -392,8 +392,12 @@ class Model(nn.Module):
         # ONNX export needs the full TE graph visible to torch.export / torch.onnx.
         if for_onnx_export:
             x = self._forward_blocks_impl(x, attn_mask=attn_mask)
+        elif self.hybrid:
+            # Hybrid mode: let torch.compile trace through — TE ops cause graph breaks
+            # but SDPA and surrounding tensor ops still get compiled.
+            x = self._run_trunk_impl(x, attn_mask=attn_mask)
         else:
-            # Trunk is isolated from torch.compile for TE compatibility during training/inference.
+            # Full TE mode: isolate from torch.compile to avoid graph-break warnings.
             x = self._run_trunk_no_compile(x, attn_mask=attn_mask)
 
         # Output heads in fp32.
