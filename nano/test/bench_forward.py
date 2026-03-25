@@ -37,8 +37,9 @@ def main():
                         help="Number of timed iterations (default: 100)")
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile")
-    parser.add_argument("--use-te", action="store_true",
-                        help="Use TransformerEngine model (model_te.py)")
+    parser.add_argument("--use-te", nargs='?', const='full', default=None,
+                        choices=['full', 'hybrid'],
+                        help="Use TransformerEngine: 'full' (default), 'hybrid' (TE linear + PyTorch SDPA)")
     parser.add_argument("--use-fp8", action="store_true",
                         help="Enable FP8 inference (requires --use-te and Hopper/Ada GPU)")
     parser.add_argument("--score-mode", type=str, default="simple",
@@ -71,7 +72,7 @@ def main():
         from model_te import Model
         model = Model(model_config, args.pos_len,
                       score_mode=args.score_mode, use_fp8=args.use_fp8,
-                      varlen=args.varlen)
+                      varlen=args.varlen, hybrid=(args.use_te == 'hybrid'))
     else:
         from model import Model
         model = Model(model_config, args.pos_len,
@@ -104,7 +105,7 @@ def main():
     print(f"Batch size:     {args.batch_size}")
     print(f"Board:          {args.pos_len}x{args.pos_len}")
     print(f"torch.compile:  {'OFF' if args.no_compile else 'ON'}")
-    print(f"TransformerEngine: {'ON' if args.use_te else 'OFF'}")
+    print(f"TransformerEngine: {args.use_te.upper() if args.use_te else 'OFF'}")
     print(f"FP8:            {'ON' if args.use_fp8 else 'OFF'}")
     print(f"Stem:           {model_config.get('stem', 'cnn3')}")
     print(f"Zero-centered:  {'ON' if args.zero_centered_norm else 'OFF'}")

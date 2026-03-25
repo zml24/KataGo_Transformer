@@ -162,8 +162,13 @@ class ModelEMA:
 def main(rank, world_size, args, gpu_id):
     # Conditional model import
     if args.use_te:
-        from model_te import Model, detect_checkpoint_format, convert_checkpoint_model_to_te
-        model_extra_kwargs = {"use_fp8": args.use_fp8, "varlen": args.varlen, "head_bias": args.head_bias, "zero_centered_norm": args.zero_centered_norm}
+        from model_te import (
+            Model, detect_checkpoint_format,
+            convert_checkpoint_model_to_te, convert_checkpoint_model_to_te_decomposed,
+            convert_checkpoint_te_to_model, convert_checkpoint_te_decomposed_to_model,
+        )
+        model_extra_kwargs = {"use_fp8": args.use_fp8, "varlen": args.varlen, "head_bias": args.head_bias,
+                              "zero_centered_norm": args.zero_centered_norm, "hybrid": (args.use_te == 'hybrid')}
     else:
         from model import Model
         model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res, "gated_attn": args.gated_attn, "head_bias": args.head_bias, "norm_fp32": not args.no_norm_fp32, "zero_centered_norm": args.zero_centered_norm, "use_gab": args.use_gab, "use_tab": args.use_tab}
@@ -372,16 +377,36 @@ def main(rank, world_size, args, gpu_id):
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
-            if detect_checkpoint_format(model_state) == "pt":
-                logging.info("Converting model.py checkpoint to TE format")
-                model_state = convert_checkpoint_model_to_te(model_state)
+            fmt = detect_checkpoint_format(model_state)
+            if args.use_te == 'hybrid':
+                if fmt == "pt":
+                    logging.info("Converting model.py checkpoint to hybrid TE format")
+                    model_state = convert_checkpoint_model_to_te_decomposed(model_state)
+                elif fmt == "te":
+                    logging.info("Converting full TE checkpoint to hybrid TE format")
+                    model_state = convert_checkpoint_te_to_model(model_state)
+                    model_state = convert_checkpoint_model_to_te_decomposed(model_state)
+            else:  # full
+                if fmt == "pt":
+                    logging.info("Converting model.py checkpoint to TE format")
+                    model_state = convert_checkpoint_model_to_te(model_state)
+                elif fmt == "te_decomposed":
+                    logging.info("Converting hybrid TE checkpoint to full TE format")
+                    model_state = convert_checkpoint_te_decomposed_to_model(model_state)
+                    model_state = convert_checkpoint_model_to_te(model_state)
             model.load_state_dict(model_state, strict=False)
         else:
             try:
-                from model_te import detect_checkpoint_format as _detect, convert_checkpoint_te_to_model as _convert
-                if _detect(model_state) == "te":
+                from model_te import detect_checkpoint_format as _detect, \
+                    convert_checkpoint_te_to_model as _convert, \
+                    convert_checkpoint_te_decomposed_to_model as _convert_decomp
+                fmt = _detect(model_state)
+                if fmt == "te":
                     logging.info("Converting TE checkpoint to model.py format")
                     model_state = _convert(model_state, zero_centered_norm=args.zero_centered_norm)
+                elif fmt == "te_decomposed":
+                    logging.info("Converting hybrid TE checkpoint to model.py format")
+                    model_state = _convert_decomp(model_state, zero_centered_norm=args.zero_centered_norm)
             except ImportError:
                 pass
             model.load_state_dict(model_state)
@@ -462,16 +487,36 @@ def main(rank, world_size, args, gpu_id):
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
-            if detect_checkpoint_format(model_state) == "pt":
-                logging.info("Converting model.py initial checkpoint to TE format")
-                model_state = convert_checkpoint_model_to_te(model_state)
+            fmt = detect_checkpoint_format(model_state)
+            if args.use_te == 'hybrid':
+                if fmt == "pt":
+                    logging.info("Converting model.py initial checkpoint to hybrid TE format")
+                    model_state = convert_checkpoint_model_to_te_decomposed(model_state)
+                elif fmt == "te":
+                    logging.info("Converting full TE initial checkpoint to hybrid TE format")
+                    model_state = convert_checkpoint_te_to_model(model_state)
+                    model_state = convert_checkpoint_model_to_te_decomposed(model_state)
+            else:  # full
+                if fmt == "pt":
+                    logging.info("Converting model.py initial checkpoint to TE format")
+                    model_state = convert_checkpoint_model_to_te(model_state)
+                elif fmt == "te_decomposed":
+                    logging.info("Converting hybrid TE initial checkpoint to full TE format")
+                    model_state = convert_checkpoint_te_decomposed_to_model(model_state)
+                    model_state = convert_checkpoint_model_to_te(model_state)
             model.load_state_dict(model_state, strict=False)
         else:
             try:
-                from model_te import detect_checkpoint_format as _detect, convert_checkpoint_te_to_model as _convert
-                if _detect(model_state) == "te":
+                from model_te import detect_checkpoint_format as _detect, \
+                    convert_checkpoint_te_to_model as _convert, \
+                    convert_checkpoint_te_decomposed_to_model as _convert_decomp
+                fmt = _detect(model_state)
+                if fmt == "te":
                     logging.info("Converting TE initial checkpoint to model.py format")
                     model_state = _convert(model_state, zero_centered_norm=args.zero_centered_norm)
+                elif fmt == "te_decomposed":
+                    logging.info("Converting hybrid TE initial checkpoint to model.py format")
+                    model_state = _convert_decomp(model_state, zero_centered_norm=args.zero_centered_norm)
             except ImportError:
                 pass
             result = model.load_state_dict(model_state, strict=False)
@@ -609,13 +654,13 @@ def main(rank, world_size, args, gpu_id):
         muon_opt = ZeROMuon(
             muon_params, lr_multiplier=0.2,
             momentum=0.95, wd=base_wd,
-            device=device, rank=rank, world_size=world_size, use_te=args.use_te,
+            device=device, rank=rank, world_size=world_size, use_te=bool(args.use_te),
             num_heads=num_heads,
         ) if muon_params else None
         shampoo_opt = ZeROShampoo(
             shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
             momentum=0.9, wd=base_wd, beta2=0.95,
-            device=device, rank=rank, world_size=world_size, use_te=args.use_te,
+            device=device, rank=rank, world_size=world_size, use_te=bool(args.use_te),
             num_heads=num_heads,
         ) if shampoo_params else None
     else:
@@ -628,13 +673,13 @@ def main(rank, world_size, args, gpu_id):
         inner_optimizer = torch.optim.AdamW(adam_param_groups, lr=base_lr, betas=(0.9, 0.95), fused=(device.type == "cuda"))
         muon_opt = MuonOptimizer(
             muon_params, lr_multiplier=0.2,
-            momentum=0.95, wd=base_wd, device=device, use_te=args.use_te,
+            momentum=0.95, wd=base_wd, device=device, use_te=bool(args.use_te),
             num_heads=num_heads,
         ) if muon_params else None
         shampoo_opt = ShampooOptimizer(
             shampoo_params, lr_multiplier=args.shampoo_lr_multiplier,
             momentum=0.9, wd=base_wd, beta2=0.95, device=device,
-            use_te=args.use_te, num_heads=num_heads,
+            use_te=bool(args.use_te), num_heads=num_heads,
         ) if shampoo_params else None
 
     # Restore optimizer state
@@ -1308,7 +1353,10 @@ if __name__ == "__main__":
     parser.add_argument("--score-mode", type=str, default="simple", choices=["mixop", "mix", "simple"],
                         help="Score belief head mode: mixop=linear+offset/parity+MoS, mix=linear+MoS, simple=single linear")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
-    parser.add_argument("--use-te", action="store_true", help="Use TransformerEngine model (model_te.py) for fused kernels")
+    parser.add_argument("--use-te", nargs='?', const='full', default=None,
+                        choices=['full', 'hybrid'],
+                        help="Use TransformerEngine: 'full' (default, fused TE block), "
+                             "'hybrid' (TE linear + PyTorch SDPA)")
     parser.add_argument("--use-fp8", action="store_true", help="Enable FP8 training (requires --use-te and Hopper/Ada GPU)")
     parser.add_argument("--amp-dtype", type=str, default="bf16", choices=["bf16", "fp16", "none"],
                         help="AMP dtype: bf16 (default), fp16 (with loss scaling), none (disable AMP)")
@@ -1367,6 +1415,8 @@ if __name__ == "__main__":
         parser.error("--use-gab and --use-te cannot be used together (model_te does not support GAB)")
     if args.use_tab and args.use_te:
         parser.error("--use-tab and --use-te cannot be used together (model_te does not support TAB)")
+    if args.varlen and args.use_te == 'full':
+        parser.error("--varlen requires --use-te hybrid (--use-te full does not support varlen)")
     if args.zero_centered_norm and args.no_norm_fp32:
         parser.error("--zero-centered-norm conflicts with --no-norm-fp32")
 

@@ -21,6 +21,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import transformer_engine.pytorch as te
 
 from configs import get_num_bin_input_features, get_num_global_input_features
@@ -126,6 +127,55 @@ class TransformerBlockTEDecomposed(nn.Module):
         return x + self.ln_mlp(x)
 
 
+class TransformerBlockTEHybrid(nn.Module):
+    """TE block with fused linear kernels but PyTorch SDPA for attention.
+
+    Uses te.LayerNormLinear for fused LayerNorm+QKV, te.LayerNormMLP for fused
+    LayerNorm+SwiGLU FFN, but F.scaled_dot_product_attention for attention.
+    Weight layout is identical to TransformerBlockTEDecomposed.
+    """
+
+    def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
+                 zero_centered_gamma: bool = False):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = c_main // num_heads
+        self.ln_qkv = te.LayerNormLinear(
+            c_main,
+            3 * c_main,
+            eps=1e-6,
+            bias=False,
+            normalization="RMSNorm",
+            zero_centered_gamma=zero_centered_gamma,
+        )
+        self.proj = te.Linear(c_main, c_main, bias=False)
+        self.ln_mlp = te.LayerNormMLP(
+            c_main,
+            ffn_dim,
+            eps=1e-6,
+            bias=False,
+            normalization="RMSNorm",
+            activation="swiglu",
+            zero_centered_gamma=zero_centered_gamma,
+        )
+
+    def forward(self, x, rope_cos, rope_sin, attn_mask=None):
+        B, L, _ = x.shape
+        residual = x
+        qkv = self.ln_qkv(x).view(B, L, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)           # (B, L, H, D)
+        q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
+        # SDPA expects (B, H, L, D)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=0.0)
+        attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, -1)
+        x = residual + self.proj(attn_out)
+        return x + self.ln_mlp(x)
+
+
 def _replace_nn_linear_with_te(module):
     """Recursively replace nn.Linear with te.Linear in a module."""
     for name, child in module.named_children():
@@ -143,12 +193,13 @@ def _replace_nn_linear_with_te(module):
 class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
                  use_fp8: bool = False, varlen: bool = False, head_bias: bool = False,
-                 zero_centered_norm: bool = False):
+                 zero_centered_norm: bool = False, hybrid: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
         self.varlen = varlen
         self.zero_centered_norm = zero_centered_norm
+        self.hybrid = hybrid
         self.c_trunk = config["hidden_size"]
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
@@ -178,12 +229,19 @@ class Model(nn.Module):
         # Precompute RoPE embeddings (rotate_half)
         emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)  # (L, 1, 1, dim_half)
         emb_full = torch.cat([emb, emb], dim=-1)              # (L, 1, 1, dim)
-        self.register_buffer("rope", emb_full, persistent=False)
+        if hybrid:
+            # Hybrid mode: precompute cos/sin for manual RoPE application
+            self.register_buffer("rope_cos", emb_full.cos(), persistent=False)
+            self.register_buffer("rope_sin", emb_full.sin(), persistent=False)
+        else:
+            # Full TE mode: raw embeddings for TE's internal RoPE
+            self.register_buffer("rope", emb_full, persistent=False)
 
         # Transformer blocks
+        BlockClass = TransformerBlockTEHybrid if hybrid else TransformerBlockTE
         self.blocks = nn.ModuleList()
         for _ in range(config["num_layers"]):
-            self.blocks.append(TransformerBlockTE(
+            self.blocks.append(BlockClass(
                 c_main=self.c_trunk,
                 num_heads=num_heads,
                 ffn_dim=ffn_dim,
@@ -207,8 +265,12 @@ class Model(nn.Module):
         self.moving_unowned_proportion_weight = 0.0
 
     def _run_trunk_impl(self, x, attn_mask=None):
-        for block in self.blocks:
-            x = block(x, rope=self.rope, attn_mask=attn_mask)
+        if self.hybrid:
+            for block in self.blocks:
+                x = block(x, self.rope_cos, self.rope_sin, attn_mask=attn_mask)
+        else:
+            for block in self.blocks:
+                x = block(x, rope=self.rope, attn_mask=attn_mask)
         return self.norm_final(x)
 
     @torch._dynamo.disable
@@ -230,17 +292,34 @@ class Model(nn.Module):
             std = init_std / math.sqrt(2.0 * num_blocks)
             nn.init.normal_(tensor, mean=0.0, std=std)
 
-        # Rebuild blocks with TE-native init methods
-        num_heads = self.config["num_heads"]
-        ffn_dim = self.config["ffn_dim"]
-        self.blocks = nn.ModuleList([
-            TransformerBlockTE(
-                c_main=self.c_trunk, num_heads=num_heads, ffn_dim=ffn_dim,
-                init_method=init_fn, output_layer_init_method=output_init_fn,
-                zero_centered_gamma=self.zero_centered_norm,
-            )
-            for _ in range(num_blocks)
-        ])
+        if self.hybrid:
+            # Hybrid mode: iterate parameters directly (TransformerBlockTEHybrid
+            # doesn't accept init_method, unlike TransformerBlockTE)
+            for name, p in self.named_parameters():
+                if not name.startswith("blocks."):
+                    continue
+                if p.dim() < 2:
+                    # 1D params: layer_norm weights are left at default init
+                    if "layer_norm" not in name:
+                        nn.init.zeros_(p)
+                else:
+                    # Output layers: proj.weight (attn output), fc2_weight (FFN output)
+                    if ".proj.weight" in name or "fc2_weight" in name:
+                        output_init_fn(p)
+                    else:
+                        init_fn(p)
+        else:
+            # Full TE mode: rebuild blocks with TE-native init methods
+            num_heads = self.config["num_heads"]
+            ffn_dim = self.config["ffn_dim"]
+            self.blocks = nn.ModuleList([
+                TransformerBlockTE(
+                    c_main=self.c_trunk, num_heads=num_heads, ffn_dim=ffn_dim,
+                    init_method=init_fn, output_layer_init_method=output_init_fn,
+                    zero_centered_gamma=self.zero_centered_norm,
+                )
+                for _ in range(num_blocks)
+            ])
 
         # Stem
         init_fn(self.conv_spatial.weight)
@@ -267,8 +346,13 @@ class Model(nn.Module):
 
         if self.varlen:
             mask_flat = input_spatial[:, 0, :, :].contiguous().view(N, L)  # (N, L) float
-            # TE boolean mask: True = masked (opposite of PyTorch additive mask)
-            attn_mask = (mask_flat == 0).view(N, 1, 1, L)  # (N, 1, 1, L) bool
+            if self.hybrid:
+                # Hybrid: additive mask for SDPA (0=valid, -inf=masked)
+                attn_mask = torch.zeros(N, 1, 1, L, device=input_spatial.device, dtype=input_spatial.dtype)
+                attn_mask.masked_fill_(mask_flat.view(N, 1, 1, L) == 0, float('-inf'))
+            else:
+                # Full TE: boolean mask (True=masked)
+                attn_mask = (mask_flat == 0).view(N, 1, 1, L)  # (N, 1, 1, L) bool
         else:
             attn_mask = None
             mask_flat = None
@@ -510,10 +594,12 @@ class ModelDecomposedExport(nn.Module):
 # Checkpoint format detection and conversion
 # ---------------------------------------------------------------------------
 def detect_checkpoint_format(state_dict):
-    """Detect checkpoint format: 'pt' (model.py) or 'te' (TransformerEngine)."""
+    """Detect checkpoint format: 'pt' (model.py), 'te' (full TE), or 'te_decomposed' (hybrid/decomposed TE)."""
     for key in state_dict:
         if ".layer.self_attention." in key:
             return "te"
+        if ".ln_qkv." in key:
+            return "te_decomposed"
     return "pt"
 
 
@@ -594,6 +680,45 @@ def convert_checkpoint_model_to_te_decomposed(state_dict):
             continue
         elif ".out_proj.weight" in key:
             new_sd[key.replace(".out_proj.weight", ".proj.weight")] = value
+        else:
+            new_sd[key] = value
+    return new_sd
+
+
+def convert_checkpoint_te_decomposed_to_model(state_dict, zero_centered_norm=False):
+    """Convert hybrid/decomposed TE state_dict back to model.py format.
+
+    Handles the fused weight layout used by TransformerBlockTEHybrid and
+    TransformerBlockTEDecomposed (ln_qkv, ln_mlp, proj).
+    """
+    norm_suffix = ".weight" if zero_centered_norm else ".norm.weight"
+    new_sd = {}
+    for key, value in state_dict.items():
+        if "_extra_state" in key:
+            continue
+        if ".ln_mlp.fc1_weight" in key:
+            block_prefix = key.rsplit(".ln_mlp.fc1_weight", 1)[0]
+            half = value.shape[0] // 2
+            new_sd[block_prefix + ".ffn_w1.weight"] = value[:half]
+            new_sd[block_prefix + ".ffn_wgate.weight"] = value[half:]
+        elif ".ln_mlp.fc2_weight" in key:
+            new_sd[key.replace(".ln_mlp.fc2_weight", ".ffn_w2.weight")] = value
+        elif ".ln_qkv.layer_norm_weight" in key:
+            new_sd[key.replace(".ln_qkv.layer_norm_weight", ".norm1" + norm_suffix)] = value
+        elif ".ln_mlp.layer_norm_weight" in key:
+            new_sd[key.replace(".ln_mlp.layer_norm_weight", ".norm2" + norm_suffix)] = value
+        elif ".ln_qkv.weight" in key:
+            block_prefix = key.rsplit(".ln_qkv.weight", 1)[0]
+            c = value.shape[0] // 3
+            new_sd[block_prefix + ".q_proj.weight"] = value[:c]
+            new_sd[block_prefix + ".k_proj.weight"] = value[c:2*c]
+            new_sd[block_prefix + ".v_proj.weight"] = value[2*c:]
+        elif ".proj.weight" in key and ".ln_mlp." not in key:
+            new_sd[key.replace(".proj.weight", ".out_proj.weight")] = value
+        elif key == "norm_final.weight":
+            new_sd["norm_final" + norm_suffix] = value
+        elif key.endswith(".norm_final.weight"):
+            new_sd[key.replace(".norm_final.weight", ".norm_final" + norm_suffix)] = value
         else:
             new_sd[key] = value
     return new_sd
