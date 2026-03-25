@@ -60,9 +60,7 @@ def migrate_config(old: ModelConfig) -> ModelConfig:
     if "hidden_size" in old:
         old = dict(old)
         # Remove legacy fields that are no longer supported
-        for legacy_key in ("use_ape", "ape", "pos_enc", "rpe", "use_gab",
-                           "gab_num_templates", "gab_num_fourier_features",
-                           "gab_mlp_hidden", "gab_d1", "gab_d2",
+        for legacy_key in ("use_ape", "ape", "pos_enc", "rpe",
                            "stem_d4", "stem_norm", "stem_init_aligned"):
             old.pop(legacy_key, None)
         old.setdefault("stem", "cnn3")

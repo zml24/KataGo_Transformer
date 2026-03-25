@@ -166,7 +166,7 @@ def main(rank, world_size, args, gpu_id):
         model_extra_kwargs = {"use_fp8": args.use_fp8, "varlen": args.varlen, "head_bias": args.head_bias, "zero_centered_norm": args.zero_centered_norm}
     else:
         from model import Model
-        model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res, "gated_attn": args.gated_attn, "head_bias": args.head_bias, "norm_fp32": not args.no_norm_fp32, "zero_centered_norm": args.zero_centered_norm}
+        model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res, "gated_attn": args.gated_attn, "head_bias": args.head_bias, "norm_fp32": not args.no_norm_fp32, "zero_centered_norm": args.zero_centered_norm, "use_gab": args.use_gab, "use_tab": args.use_tab}
 
     # Parse td_value_loss_scales
     td_value_loss_scales = [float(x) for x in args.td_value_loss_scales.split(",")]
@@ -275,6 +275,21 @@ def main(rank, world_size, args, gpu_id):
         model_config = configs.config_of_name[args.model_kind].copy()
         if args.stem != "cnn3":
             model_config["stem"] = args.stem
+    # Inject GAB/TAB parameters into model config
+    if args.use_gab:
+        model_config["gab_num_templates"] = args.gab_num_templates
+        model_config["gab_num_fourier_features"] = args.gab_num_fourier_features
+        model_config["gab_mlp_hidden"] = args.gab_mlp_hidden
+        model_config["gab_d1"] = args.gab_d1
+        model_config["gab_d2"] = args.gab_d2
+    if args.use_tab:
+        model_config["tab_c_z"] = args.tab_c_z
+        model_config["tab_num_templates"] = args.tab_num_templates
+        model_config["tab_num_freqs"] = args.tab_num_freqs
+        model_config["tab_num_blocks"] = args.tab_num_blocks
+        model_config["tab_dilation"] = args.tab_dilation
+        model_config["tab_use_frequency_mixing"] = args.tab_use_frequency_mixing
+
     logging.info(f"Model config: {json.dumps(model_config, indent=2, default=str)}")
 
     pos_len = args.pos_len
@@ -339,6 +354,20 @@ def main(rank, world_size, args, gpu_id):
             raise RuntimeError(
                 f"Checkpoint zero_centered_norm={ckpt_zero_centered_norm} differs from "
                 f"--zero-centered-norm={args.zero_centered_norm}; rerun with a matching flag"
+            )
+        # Verify use_gab flag matches checkpoint
+        ckpt_use_gab = state.get("use_gab", False)
+        if ckpt_use_gab != args.use_gab:
+            raise RuntimeError(
+                f"Checkpoint use_gab={ckpt_use_gab} differs from --use-gab={args.use_gab}; "
+                "rerun with a matching flag"
+            )
+        # Verify use_tab flag matches checkpoint
+        ckpt_use_tab = state.get("use_tab", False)
+        if ckpt_use_tab != args.use_tab:
+            raise RuntimeError(
+                f"Checkpoint use_tab={ckpt_use_tab} differs from --use-tab={args.use_tab}; "
+                "rerun with a matching flag"
             )
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
@@ -415,6 +444,20 @@ def main(rank, world_size, args, gpu_id):
             raise RuntimeError(
                 f"Initial checkpoint zero_centered_norm={ckpt_zero_centered_norm} differs from "
                 f"--zero-centered-norm={args.zero_centered_norm}; rerun with a matching flag"
+            )
+        # Verify use_gab flag matches initial checkpoint
+        ckpt_use_gab = state.get("use_gab", False)
+        if ckpt_use_gab != args.use_gab:
+            raise RuntimeError(
+                f"Initial checkpoint use_gab={ckpt_use_gab} differs from --use-gab={args.use_gab}; "
+                "rerun with a matching flag"
+            )
+        # Verify use_tab flag matches initial checkpoint
+        ckpt_use_tab = state.get("use_tab", False)
+        if ckpt_use_tab != args.use_tab:
+            raise RuntimeError(
+                f"Initial checkpoint use_tab={ckpt_use_tab} differs from --use-tab={args.use_tab}; "
+                "rerun with a matching flag"
             )
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
@@ -745,6 +788,8 @@ def main(rank, world_size, args, gpu_id):
                 "head_bias": args.head_bias,
                 "norm_fp32": not args.no_norm_fp32,
                 "zero_centered_norm": args.zero_centered_norm,
+                "use_gab": args.use_gab,
+                "use_tab": args.use_tab,
                 "training_mode": {
                     "zero": zero_adam is not None,
                     "has_muon": muon_opt is not None,
@@ -1285,6 +1330,24 @@ if __name__ == "__main__":
                         help="Use nn.RMSNorm instead of FP32-wrapped RMSNorm (faster, may reduce numerical stability)")
     parser.add_argument("--zero-centered-norm", action="store_true",
                         help="Use zero-centered RMSNorm (weight=0 init, gamma=1+weight, WD pushes gamma toward 1)")
+    # GAB (Global Average Biasing)
+    parser.add_argument("--use-gab", action="store_true",
+                        help="Enable Global Average Biasing (input-independent positional attention templates)")
+    parser.add_argument("--gab-num-templates", type=int, default=32, help="Number of GAB templates")
+    parser.add_argument("--gab-num-fourier-features", type=int, default=12, help="Number of GAB Fourier features")
+    parser.add_argument("--gab-mlp-hidden", type=int, default=96, help="GAB MLP hidden dimension")
+    parser.add_argument("--gab-d1", type=int, default=64, help="GAB per-token projection dimension")
+    parser.add_argument("--gab-d2", type=int, default=64, help="GAB compressed global dimension")
+    # TAB (Trunk Average Biasing)
+    parser.add_argument("--use-tab", action="store_true",
+                        help="Enable Trunk Average Biasing (input-dependent factored attention bias via complex equivariant convolutions)")
+    parser.add_argument("--tab-c-z", type=int, default=8, help="TAB complex channels (also frequency count for FrequencyMixing variant)")
+    parser.add_argument("--tab-num-templates", type=int, default=16, help="Number of TAB templates")
+    parser.add_argument("--tab-num-freqs", type=int, default=8, help="TAB frequency count (only for non-FrequencyMixing TABModule)")
+    parser.add_argument("--tab-num-blocks", type=int, default=2, help="Number of TAB equivariant blocks")
+    parser.add_argument("--tab-dilation", type=int, default=2, help="TAB convolution dilation rate")
+    parser.add_argument("--tab-use-frequency-mixing", action="store_true",
+                        help="Use FrequencyMixingTABModule instead of TABModule (c_z = frequency count, depthwise + pointwise)")
     args = parser.parse_args()
 
     # Validation
@@ -1300,6 +1363,10 @@ if __name__ == "__main__":
         parser.error("--attn-res and --use-te cannot be used together")
     if args.gated_attn and args.use_te:
         parser.error("--gated-attn and --use-te cannot be used together")
+    if args.use_gab and args.use_te:
+        parser.error("--use-gab and --use-te cannot be used together (model_te does not support GAB)")
+    if args.use_tab and args.use_te:
+        parser.error("--use-tab and --use-te cannot be used together (model_te does not support TAB)")
     if args.zero_centered_norm and args.no_norm_fp32:
         parser.error("--zero-centered-norm conflicts with --no-norm-fp32")
 
