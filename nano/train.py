@@ -171,7 +171,7 @@ def main(rank, world_size, args, gpu_id):
                               "zero_centered_norm": args.zero_centered_norm, "hybrid": (args.use_te == 'hybrid')}
     else:
         from model import Model
-        model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res, "gated_attn": args.gated_attn, "head_bias": args.head_bias, "norm_fp32": not args.no_norm_fp32, "zero_centered_norm": args.zero_centered_norm, "use_gab": args.use_gab, "use_tab": args.use_tab}
+        model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res, "gated_attn": args.gated_attn, "head_bias": args.head_bias, "norm_fp32": not args.no_norm_fp32, "zero_centered_norm": args.zero_centered_norm, "use_gab": args.use_gab, "use_tab": args.use_tab, "learnable_rope": args.learnable_rope}
 
     # Parse td_value_loss_scales
     td_value_loss_scales = [float(x) for x in args.td_value_loss_scales.split(",")]
@@ -577,6 +577,8 @@ def main(rank, world_size, args, gpu_id):
                 no_decay_params[name] = p
         elif "attn_res_proj" in name or "mlp_res_proj" in name:
             adam_params[name] = p
+        elif "rope_freqs" in name:
+            no_decay_params[name] = p
         elif args.optimizer == "muon" and "blocks." in name:
             muon_params[name] = p
         elif args.optimizer == "shampoo" and "blocks." in name:
@@ -1396,6 +1398,8 @@ if __name__ == "__main__":
     parser.add_argument("--tab-dilation", type=int, default=2, help="TAB convolution dilation rate")
     parser.add_argument("--tab-use-frequency-mixing", action="store_true",
                         help="Use FrequencyMixingTABModule instead of TABModule (c_z = frequency count, depthwise + pointwise)")
+    parser.add_argument("--learnable-rope", action="store_true",
+                        help="Enable learnable per-head RoPE frequencies (replaces fixed precomputed RoPE)")
     args = parser.parse_args()
 
     # Validation

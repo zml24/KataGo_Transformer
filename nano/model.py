@@ -71,6 +71,25 @@ def apply_rotary_emb(xq, xk, cos, sin):
     return xq_out.to(orig_dtype), xk_out.to(orig_dtype)
 
 
+def apply_learnable_rotary_emb(xq, xk, cos, sin):
+    """Apply learnable per-head rotary embeddings (FP32 for stability).
+    xq, xk: (B, L, H, D)
+    cos, sin: (H, L, P) where P = D // 2, per-head per-pair
+    """
+    def _rotate(x, cos, sin):
+        orig_dtype = x.dtype
+        B, L, H, D = x.shape
+        with torch.amp.autocast(x.device.type, enabled=False):
+            x = x.float().view(B, L, H, D // 2, 2)
+            x0, x1 = x.unbind(dim=-1)                   # each (B, L, H, P)
+            c = cos.permute(1, 0, 2).unsqueeze(0)        # (1, L, H, P)
+            s = sin.permute(1, 0, 2).unsqueeze(0)
+            out = torch.stack([x0 * c - x1 * s, x0 * s + x1 * c], dim=-1)
+        return out.reshape(B, L, H, D).to(orig_dtype)
+
+    return _rotate(xq, cos, sin), _rotate(xk, cos, sin)
+
+
 class RMSNormFP32(nn.Module):
     """RMSNorm that always runs in float32 (disables autocast)."""
     def __init__(self, dim, eps=1e-6):
@@ -461,13 +480,26 @@ class TransformerBlock(nn.Module):
                  use_gab: bool = False, use_tab: bool = False,
                  gab_num_templates: int = 0, tab_num_templates: int = 0,
                  gab_d1: int = 64, gab_d2: int = 64,
-                 tab_num_extra_dims: int = 0):
+                 tab_num_extra_dims: int = 0,
+                 learnable_rope: bool = False, pos_len: int = 0):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c_main // num_heads
         self.ffn_dim = ffn_dim
         self.use_gab = use_gab
         self.use_tab = use_tab
+
+        # Learnable RoPE: per-head 2D frequency parameters
+        self.learnable_rope = learnable_rope
+        if learnable_rope:
+            assert self.head_dim % 2 == 0, f"Head dim must be even for learnable RoPE, got {self.head_dim}"
+            P = self.head_dim // 2
+            self.pos_len = pos_len
+            log_lo = math.log(1.0 / 50.0)
+            log_hi = math.log(1.0)
+            init_freqs = torch.exp(torch.empty(num_heads, P, 2).uniform_(log_lo, log_hi))
+            init_freqs = init_freqs * (torch.randint(0, 2, (num_heads, P, 2)) * 2 - 1).float()
+            self.rope_freqs = nn.Parameter(init_freqs)  # (num_heads, P, 2)
 
         self.q_proj = nn.Linear(c_main, c_main, bias=False)
         self.k_proj = nn.Linear(c_main, c_main, bias=False)
@@ -514,6 +546,20 @@ class TransformerBlock(nn.Module):
                 self.attn_res_norm = NormClass(c_main)
             self.mlp_res_proj = nn.Linear(c_main, 1, bias=False)
             self.mlp_res_norm = NormClass(c_main)
+
+    def _compute_learnable_rope(self, L, device):
+        """Compute per-head cos/sin from learnable 2D frequencies.
+        Returns cos, sin each of shape (H, L, P).
+        """
+        idx = torch.arange(L, device=device)
+        s_x = (idx % self.pos_len).float()   # col
+        s_y = (idx // self.pos_len).float()   # row
+        omega_x = self.rope_freqs[:, :, 0]    # (H, P)
+        omega_y = self.rope_freqs[:, :, 1]    # (H, P)
+        # angles[h, l, p] = s_x[l] * omega_x[h, p] + s_y[l] * omega_y[h, p]
+        angles = (s_x.unsqueeze(0).unsqueeze(-1) * omega_x.unsqueeze(1)
+                + s_y.unsqueeze(0).unsqueeze(-1) * omega_y.unsqueeze(1))  # (H, L, P)
+        return torch.cos(angles), torch.sin(angles)
 
     def _compute_gab_bias(self, x_norm, mask_flat, gab_tab_shared):
         """Compute attention bias from GAB templates and/or TAB factored K/Q.
@@ -585,7 +631,11 @@ class TransformerBlock(nn.Module):
         k = self.k_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
         v = self.v_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
 
-        q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
+        if self.learnable_rope:
+            cos, sin = self._compute_learnable_rope(L, x.device)
+            q, k = apply_learnable_rotary_emb(q, k, cos, sin)
+        else:
+            q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
 
         # SDPA: (B, H, S, D)
         q = q.permute(0, 2, 1, 3)
@@ -648,7 +698,11 @@ class TransformerBlock(nn.Module):
         q = self.q_proj(h_normed).view(B, L, self.num_heads, self.head_dim)
         k = self.k_proj(h_normed).view(B, L, self.num_heads, self.head_dim)
         v = self.v_proj(h_normed).view(B, L, self.num_heads, self.head_dim)
-        q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
+        if self.learnable_rope:
+            cos, sin = self._compute_learnable_rope(L, h.device)
+            q, k = apply_learnable_rotary_emb(q, k, cos, sin)
+        else:
+            q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
@@ -836,7 +890,8 @@ class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop", varlen: bool = False,
                  attn_res: bool = False, gated_attn: bool = False, head_bias: bool = False,
                  norm_fp32: bool = True, zero_centered_norm: bool = False,
-                 use_gab: bool = False, use_tab: bool = False):
+                 use_gab: bool = False, use_tab: bool = False,
+                 learnable_rope: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
@@ -870,11 +925,16 @@ class Model(nn.Module):
             self.conv_dw = None
         self.linear_global = nn.Linear(num_global_features, self.c_trunk, bias=False)
 
-        # Precompute RoPE embeddings once for the whole model (rotate_half style)
-        emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)
-        emb_expanded = torch.cat([emb, emb], dim=-1)
-        self.register_buffer("rope_cos", emb_expanded.cos(), persistent=False)
-        self.register_buffer("rope_sin", emb_expanded.sin(), persistent=False)
+        # RoPE: fixed precomputed (default) or learnable per-head frequencies
+        self.learnable_rope = learnable_rope
+        if not learnable_rope:
+            emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)
+            emb_expanded = torch.cat([emb, emb], dim=-1)
+            self.register_buffer("rope_cos", emb_expanded.cos(), persistent=False)
+            self.register_buffer("rope_sin", emb_expanded.sin(), persistent=False)
+        else:
+            self.rope_cos = None
+            self.rope_sin = None
 
         # GAB shared module
         if use_gab:
@@ -921,6 +981,8 @@ class Model(nn.Module):
                 gab_d1=config.get("gab_d1", 64),
                 gab_d2=config.get("gab_d2", 64),
                 tab_num_extra_dims=tab_num_extra_dims,
+                learnable_rope=learnable_rope,
+                pos_len=pos_len,
             ))
 
         # Final normalization

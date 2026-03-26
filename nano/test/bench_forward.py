@@ -54,6 +54,8 @@ def main():
                         help="Use zero-centered RMSNorm")
     parser.add_argument("--attn-res", action="store_true",
                         help="Enable attention residuals (full depth attention)")
+    parser.add_argument("--learnable-rope", action="store_true",
+                        help="Enable learnable per-head RoPE frequencies")
     args = parser.parse_args()
 
     assert torch.cuda.is_available(), "CUDA is required for this benchmark"
@@ -80,7 +82,8 @@ def main():
         model = Model(model_config, args.pos_len,
                       score_mode=args.score_mode, varlen=args.varlen,
                       zero_centered_norm=args.zero_centered_norm,
-                      attn_res=args.attn_res)
+                      attn_res=args.attn_res,
+                      learnable_rope=args.learnable_rope)
     model.initialize()
     model.to(device)
     model.eval()
@@ -113,6 +116,7 @@ def main():
     print(f"Stem:           {model_config.get('stem', 'cnn3')}")
     print(f"Zero-centered:  {'ON' if args.zero_centered_norm else 'OFF'}")
     print(f"Attn residuals: {'ON' if args.attn_res else 'OFF'}")
+    print(f"Learnable RoPE: {'ON' if args.learnable_rope else 'OFF'}")
     print(f"Score mode:     {args.score_mode}")
     print(f"FLOPs/sample:   {forward_flops/1e9:.2f} GFLOPs")
     print(f"GPU:            {gpu_name}")
