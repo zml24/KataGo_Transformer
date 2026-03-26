@@ -628,24 +628,22 @@ class TransformerBlock(nn.Module):
         x = x + self.ffn_w2(ffn_hidden)
         return x
 
-    def forward_attn_res(self, states, hidden_states, rope_cos, rope_sin,
+    def forward_attn_res(self, states, rope_cos, rope_sin,
                          attn_mask=None, mask_flat=None, gab_tab_shared=None):
         """Forward with Attention Residuals: depth attention replaces standard residual.
 
-        states: mutable list of all previous layer outputs. states[-1] == hidden_states
-                on entry. This method appends the post-attention state; the caller
-                appends the post-MLP state (the return value).
-        hidden_states: current layer input [B, L, C]
+        states: mutable list of all previous sub-layer outputs. Each entry is an
+                individual sub-layer output (not accumulated). This method appends
+                the attn output and mlp output as separate entries.
         """
-        B, L, C = hidden_states.shape
-
         # 1. Depth attention before self-attention
         if not self.skip_first_attn_res:
             h = attn_res(states, self.attn_res_proj, self.attn_res_norm)
         else:
-            h = hidden_states
+            h = states[-1]
 
-        # 2. Self-attention (input is h, residual added to hidden_states)
+        # 2. Self-attention
+        B, L, C = h.shape
         h_normed = self.norm1(h)
         q = self.q_proj(h_normed).view(B, L, self.num_heads, self.head_dim)
         k = self.k_proj(h_normed).view(B, L, self.num_heads, self.head_dim)
@@ -678,23 +676,24 @@ class TransformerBlock(nn.Module):
         attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, C)
         if self.use_gated_attn:
             attn_out = torch.sigmoid(self.attn_gate_proj(h_normed)) * attn_out
-        hidden_states = hidden_states + self.out_proj(attn_out)
+        attn_out = self.out_proj(attn_out)
 
-        # 3. Record post-attention state in history for MLP depth attention
-        states.append(hidden_states)
+        # 3. Record attn output in history
+        states.append(attn_out)
 
-        # 4. Depth attention before FFN (now sees post-attention state)
+        # 4. Depth attention before FFN (now sees attn output too)
         h = attn_res(states, self.mlp_res_proj, self.mlp_res_norm)
 
-        # 5. FFN (input is h, residual added to hidden_states)
+        # 5. FFN
         h_normed = self.norm2(h)
         w1_out = F.silu(self.ffn_w1(h_normed))
         wgate_out = self.ffn_wgate(h_normed)
-        with torch.amp.autocast(hidden_states.device.type, enabled=False):
-            ffn_hidden = (w1_out.float() * wgate_out.float()).to(hidden_states.dtype)
-        hidden_states = hidden_states + self.ffn_w2(ffn_hidden)
+        with torch.amp.autocast(h.device.type, enabled=False):
+            ffn_hidden = (w1_out.float() * wgate_out.float()).to(h.dtype)
+        mlp_out = self.ffn_w2(ffn_hidden)
 
-        return hidden_states
+        # 6. Record mlp output in history
+        states.append(mlp_out)
 
 
 # ---------------------------------------------------------------------------
@@ -926,9 +925,17 @@ class Model(nn.Module):
 
         # Final normalization
         if zero_centered_norm:
-            self.norm_final = ZeroCenteredRMSNormFP32(self.c_trunk, eps=1e-6)
+            NormClass = ZeroCenteredRMSNormFP32
+        elif norm_fp32:
+            NormClass = RMSNormFP32
         else:
-            self.norm_final = (RMSNormFP32 if norm_fp32 else nn.RMSNorm)(self.c_trunk, eps=1e-6)
+            NormClass = nn.RMSNorm
+        self.norm_final = NormClass(self.c_trunk, eps=1e-6)
+
+        # Final depth attention for attn_res (aggregates all sub-layer outputs)
+        if attn_res:
+            self.final_attn_res_proj = nn.Linear(self.c_trunk, 1, bias=False)
+            self.final_attn_res_norm = NormClass(self.c_trunk, eps=1e-6)
 
         # Output heads
         num_scorebeliefs = config["num_scorebeliefs"]
@@ -1011,14 +1018,14 @@ class Model(nn.Module):
     def _forward_blocks_attn_res_impl(self, x, attn_mask=None, mask_flat=None,
                                        gab_tab_shared=None):
         states = [x]  # stem output as first state
-        hidden_states = x
         for block in self.blocks:
-            hidden_states = block.forward_attn_res(
-                states, hidden_states, self.rope_cos, self.rope_sin,
+            block.forward_attn_res(
+                states, self.rope_cos, self.rope_sin,
                 attn_mask=attn_mask, mask_flat=mask_flat, gab_tab_shared=gab_tab_shared,
             )
-            states.append(hidden_states)
-        return self.norm_final(hidden_states)
+        # Final depth attention to aggregate all sub-layer outputs
+        h = attn_res(states, self.final_attn_res_proj, self.final_attn_res_norm)
+        return self.norm_final(h)
 
     def _forward_stem_impl(self, input_spatial, input_global):
         N = input_spatial.shape[0]

@@ -52,6 +52,8 @@ def main():
                         help="Override stem type (default: use config preset)")
     parser.add_argument("--zero-centered-norm", action="store_true",
                         help="Use zero-centered RMSNorm")
+    parser.add_argument("--attn-res", action="store_true",
+                        help="Enable attention residuals (full depth attention)")
     args = parser.parse_args()
 
     assert torch.cuda.is_available(), "CUDA is required for this benchmark"
@@ -77,7 +79,8 @@ def main():
         from model import Model
         model = Model(model_config, args.pos_len,
                       score_mode=args.score_mode, varlen=args.varlen,
-                      zero_centered_norm=args.zero_centered_norm)
+                      zero_centered_norm=args.zero_centered_norm,
+                      attn_res=args.attn_res)
     model.initialize()
     model.to(device)
     model.eval()
@@ -109,6 +112,7 @@ def main():
     print(f"FP8:            {'ON' if args.use_fp8 else 'OFF'}")
     print(f"Stem:           {model_config.get('stem', 'cnn3')}")
     print(f"Zero-centered:  {'ON' if args.zero_centered_norm else 'OFF'}")
+    print(f"Attn residuals: {'ON' if args.attn_res else 'OFF'}")
     print(f"Score mode:     {args.score_mode}")
     print(f"FLOPs/sample:   {forward_flops/1e9:.2f} GFLOPs")
     print(f"GPU:            {gpu_name}")
