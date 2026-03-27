@@ -31,7 +31,6 @@ from model import (
     ZeroCenteredRMSNormFP32,
     SoftPlusWithGradientFloor,
     apply_rotary_emb,
-    apply_learnable_rotary_emb,
     cross_entropy,
     precompute_freqs_cos_sin_2d,
     PolicyHead,
@@ -194,7 +193,7 @@ class TransformerBlockTEHybrid(nn.Module):
         q, k, v = qkv.unbind(dim=2)           # (B, L, H, D)
         if self.learnable_rope:
             cos, sin = self._compute_learnable_rope(L, x.device)
-            q, k = apply_learnable_rotary_emb(q, k, cos, sin)
+            q, k = apply_rotary_emb(q, k, cos, sin)
         else:
             q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
         # SDPA expects (B, H, L, D)

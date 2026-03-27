@@ -56,7 +56,10 @@ def precompute_freqs_cos_sin_2d(dim: int, pos_len: int, theta: float = 100.0):
 
 
 def apply_rotary_emb(xq, xk, cos, sin):
-    """Apply rotary position embedding (computed in FP32 for numerical stability)."""
+    """Apply rotary position embedding (computed in FP32 for numerical stability).
+    cos, sin: (L, 1, 1, D) for standard RoPE or (1, L, H, D) for learnable RoPE.
+    Both are reshaped to (1, L, ?, D) via view for broadcasting with (B, L, H, D).
+    """
     def rotate_half(x):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat([-x2, x1], dim=-1)
@@ -64,30 +67,11 @@ def apply_rotary_emb(xq, xk, cos, sin):
     orig_dtype = xq.dtype
     with torch.amp.autocast(xq.device.type, enabled=False):
         xq, xk = xq.float(), xk.float()
-        cos = cos.float().view(1, xq.shape[1], 1, xq.shape[-1])
-        sin = sin.float().view(1, xq.shape[1], 1, xq.shape[-1])
+        cos = cos.float().view(1, xq.shape[1], -1, xq.shape[-1])
+        sin = sin.float().view(1, xq.shape[1], -1, xq.shape[-1])
         xq_out = xq * cos + rotate_half(xq) * sin
         xk_out = xk * cos + rotate_half(xk) * sin
     return xq_out.to(orig_dtype), xk_out.to(orig_dtype)
-
-
-def apply_learnable_rotary_emb(xq, xk, cos, sin):
-    """Apply learnable per-head rotary embeddings (FP32 for stability).
-    xq, xk: (B, L, H, D)
-    cos, sin: (H, L, P) where P = D // 2, per-head per-pair
-    """
-    def _rotate(x, cos, sin):
-        orig_dtype = x.dtype
-        B, L, H, D = x.shape
-        with torch.amp.autocast(x.device.type, enabled=False):
-            x = x.float().view(B, L, H, D // 2, 2)
-            x0, x1 = x.unbind(dim=-1)                   # each (B, L, H, P)
-            c = cos.permute(1, 0, 2).unsqueeze(0)        # (1, L, H, P)
-            s = sin.permute(1, 0, 2).unsqueeze(0)
-            out = torch.stack([x0 * c - x1 * s, x0 * s + x1 * c], dim=-1)
-        return out.reshape(B, L, H, D).to(orig_dtype)
-
-    return _rotate(xq, cos, sin), _rotate(xk, cos, sin)
 
 
 class RMSNormFP32(nn.Module):
@@ -549,7 +533,8 @@ class TransformerBlock(nn.Module):
 
     def _compute_learnable_rope(self, L, device):
         """Compute per-head cos/sin from learnable 2D frequencies.
-        Returns cos, sin each of shape (H, L, P).
+        Returns cos, sin each of shape (1, L, H, D) in doubled format,
+        compatible with apply_rotary_emb's rotate_half pattern.
         """
         idx = torch.arange(L, device=device)
         s_x = (idx % self.pos_len).float()   # col
@@ -559,7 +544,10 @@ class TransformerBlock(nn.Module):
         # angles[h, l, p] = s_x[l] * omega_x[h, p] + s_y[l] * omega_y[h, p]
         angles = (s_x.unsqueeze(0).unsqueeze(-1) * omega_x.unsqueeze(1)
                 + s_y.unsqueeze(0).unsqueeze(-1) * omega_y.unsqueeze(1))  # (H, L, P)
-        return torch.cos(angles), torch.sin(angles)
+        # Convert to doubled format (1, L, H, D) matching standard RoPE's rotate_half layout
+        angles = angles.permute(1, 0, 2)                   # (L, H, P)
+        angles = torch.cat([angles, angles], dim=-1)        # (L, H, D)
+        return angles.unsqueeze(0).cos(), angles.unsqueeze(0).sin()  # (1, L, H, D)
 
     def _compute_gab_bias(self, x_norm, mask_flat, gab_tab_shared):
         """Compute attention bias from GAB templates and/or TAB factored K/Q.
@@ -633,7 +621,7 @@ class TransformerBlock(nn.Module):
 
         if self.learnable_rope:
             cos, sin = self._compute_learnable_rope(L, x.device)
-            q, k = apply_learnable_rotary_emb(q, k, cos, sin)
+            q, k = apply_rotary_emb(q, k, cos, sin)
         else:
             q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
 
@@ -700,7 +688,7 @@ class TransformerBlock(nn.Module):
         v = self.v_proj(h_normed).view(B, L, self.num_heads, self.head_dim)
         if self.learnable_rope:
             cos, sin = self._compute_learnable_rope(L, h.device)
-            q, k = apply_learnable_rotary_emb(q, k, cos, sin)
+            q, k = apply_rotary_emb(q, k, cos, sin)
         else:
             q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
         q = q.permute(0, 2, 1, 3)
