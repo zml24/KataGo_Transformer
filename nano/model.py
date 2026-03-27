@@ -465,25 +465,13 @@ class TransformerBlock(nn.Module):
                  gab_num_templates: int = 0, tab_num_templates: int = 0,
                  gab_d1: int = 64, gab_d2: int = 64,
                  tab_num_extra_dims: int = 0,
-                 learnable_rope: bool = False, pos_len: int = 0):
+                 ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c_main // num_heads
         self.ffn_dim = ffn_dim
         self.use_gab = use_gab
         self.use_tab = use_tab
-
-        # Learnable RoPE: per-head 2D frequency parameters
-        self.learnable_rope = learnable_rope
-        if learnable_rope:
-            assert self.head_dim % 2 == 0, f"Head dim must be even for learnable RoPE, got {self.head_dim}"
-            P = self.head_dim // 2
-            self.pos_len = pos_len
-            log_lo = math.log(1.0 / 50.0)
-            log_hi = math.log(1.0)
-            init_freqs = torch.exp(torch.empty(num_heads, P, 2).uniform_(log_lo, log_hi))
-            init_freqs = init_freqs * (torch.randint(0, 2, (num_heads, P, 2)) * 2 - 1).float()
-            self.rope_freqs = nn.Parameter(init_freqs)  # (num_heads, P, 2)
 
         self.q_proj = nn.Linear(c_main, c_main, bias=False)
         self.k_proj = nn.Linear(c_main, c_main, bias=False)
@@ -530,24 +518,6 @@ class TransformerBlock(nn.Module):
                 self.attn_res_norm = NormClass(c_main)
             self.mlp_res_proj = nn.Linear(c_main, 1, bias=False)
             self.mlp_res_norm = NormClass(c_main)
-
-    def _compute_learnable_rope(self, L, device):
-        """Compute per-head cos/sin from learnable 2D frequencies.
-        Returns cos, sin each of shape (1, L, H, D) in doubled format,
-        compatible with apply_rotary_emb's rotate_half pattern.
-        """
-        idx = torch.arange(L, device=device)
-        s_x = (idx % self.pos_len).float()   # col
-        s_y = (idx // self.pos_len).float()   # row
-        omega_x = self.rope_freqs[:, :, 0]    # (H, P)
-        omega_y = self.rope_freqs[:, :, 1]    # (H, P)
-        # angles[h, l, p] = s_x[l] * omega_x[h, p] + s_y[l] * omega_y[h, p]
-        angles = (s_x.unsqueeze(0).unsqueeze(-1) * omega_x.unsqueeze(1)
-                + s_y.unsqueeze(0).unsqueeze(-1) * omega_y.unsqueeze(1))  # (H, L, P)
-        # Convert to doubled format (1, L, H, D) matching standard RoPE's rotate_half layout
-        angles = angles.permute(1, 0, 2)                   # (L, H, P)
-        angles = torch.cat([angles, angles], dim=-1)        # (L, H, D)
-        return angles.unsqueeze(0).cos(), angles.unsqueeze(0).sin()  # (1, L, H, D)
 
     def _compute_gab_bias(self, x_norm, mask_flat, gab_tab_shared):
         """Compute attention bias from GAB templates and/or TAB factored K/Q.
@@ -607,7 +577,8 @@ class TransformerBlock(nn.Module):
                 mask_flat=None, gab_tab_shared=None):
         """
         x: (N, L, C)
-        rope_cos, rope_sin: (L, 1, 1, head_dim) precomputed RoPE embeddings
+        rope_cos, rope_sin: precomputed RoPE cos/sin, either
+            (L, 1, 1, D) for standard or (1, L, H, D) for learnable
         attn_mask: optional (N, 1, 1, L) additive mask, 0 for valid, -inf for padding
         mask_flat: optional (N, L) float for GAB masked pooling
         gab_tab_shared: optional dict with precomputed GAB/TAB data
@@ -619,11 +590,7 @@ class TransformerBlock(nn.Module):
         k = self.k_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
         v = self.v_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
 
-        if self.learnable_rope:
-            cos, sin = self._compute_learnable_rope(L, x.device)
-            q, k = apply_rotary_emb(q, k, cos, sin)
-        else:
-            q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
+        q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
 
         # SDPA: (B, H, S, D)
         q = q.permute(0, 2, 1, 3)
@@ -686,11 +653,7 @@ class TransformerBlock(nn.Module):
         q = self.q_proj(h_normed).view(B, L, self.num_heads, self.head_dim)
         k = self.k_proj(h_normed).view(B, L, self.num_heads, self.head_dim)
         v = self.v_proj(h_normed).view(B, L, self.num_heads, self.head_dim)
-        if self.learnable_rope:
-            cos, sin = self._compute_learnable_rope(L, h.device)
-            q, k = apply_rotary_emb(q, k, cos, sin)
-        else:
-            q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
+        q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
@@ -923,6 +886,21 @@ class Model(nn.Module):
         else:
             self.rope_cos = None
             self.rope_sin = None
+            # Precompute 2D grid coordinates: (L, 2) with [col, row] per position
+            L = pos_len * pos_len
+            idx = torch.arange(L)
+            pos_xy = torch.stack([(idx % pos_len).float(),
+                                  (idx // pos_len).float()], dim=-1)  # (L, 2)
+            self.register_buffer("pos_xy", pos_xy, persistent=False)
+            # Learnable per-head RoPE frequencies for all layers: (num_layers, H, P, 2)
+            num_layers = config["num_layers"]
+            P = head_dim // 2
+            assert head_dim % 2 == 0, f"Head dim must be even for learnable RoPE, got {head_dim}"
+            log_lo = math.log(1.0 / 50.0)
+            log_hi = math.log(1.0)
+            init_freqs = torch.exp(torch.empty(num_layers, num_heads, P, 2).uniform_(log_lo, log_hi))
+            init_freqs = init_freqs * (torch.randint(0, 2, (num_layers, num_heads, P, 2)) * 2 - 1).float()
+            self.all_rope_freqs = nn.Parameter(init_freqs)
 
         # GAB shared module
         if use_gab:
@@ -969,8 +947,6 @@ class Model(nn.Module):
                 gab_d1=config.get("gab_d1", 64),
                 gab_d2=config.get("gab_d2", 64),
                 tab_num_extra_dims=tab_num_extra_dims,
-                learnable_rope=learnable_rope,
-                pos_len=pos_len,
             ))
 
         # Final normalization
@@ -1056,21 +1032,48 @@ class Model(nn.Module):
                                        gab_tab_shared=gab_tab_shared if gab_tab_shared else None)
         return x, mask_flat
 
+    def _compute_all_learnable_rope(self):
+        """Batch-compute cos/sin for all layers in one fused operation.
+        Returns all_cos, all_sin each of shape (num_layers, L, H, D).
+        """
+        # pos_xy: (L, 2), all_rope_freqs: (num_layers, H, P, 2)
+        # Explicit broadcast mul-add: (1,L,1,1)*(N,1,H,P) -> (N,L,H,P)
+        sx = self.pos_xy[:, 0]                        # (L,)
+        sy = self.pos_xy[:, 1]                        # (L,)
+        omega_x = self.all_rope_freqs[:, :, :, 0]    # (N, H, P)
+        omega_y = self.all_rope_freqs[:, :, :, 1]    # (N, H, P)
+        all_angles = (sx[None, :, None, None] * omega_x[:, None, :, :]
+                    + sy[None, :, None, None] * omega_y[:, None, :, :])
+        all_angles = torch.cat([all_angles, all_angles], dim=-1)  # (num_layers, L, H, D)
+        return all_angles.cos(), all_angles.sin()
+
     def _forward_blocks_impl(self, x, attn_mask=None, mask_flat=None, gab_tab_shared=None):
         if self.attn_res:
             return self._forward_blocks_attn_res_impl(
                 x, attn_mask=attn_mask, mask_flat=mask_flat, gab_tab_shared=gab_tab_shared)
-        for block in self.blocks:
-            x = block(x, self.rope_cos, self.rope_sin, attn_mask=attn_mask,
-                      mask_flat=mask_flat, gab_tab_shared=gab_tab_shared)
+        if self.learnable_rope:
+            all_cos, all_sin = self._compute_all_learnable_rope()
+            for i, block in enumerate(self.blocks):
+                x = block(x, all_cos[i:i+1], all_sin[i:i+1], attn_mask=attn_mask,
+                          mask_flat=mask_flat, gab_tab_shared=gab_tab_shared)
+        else:
+            for block in self.blocks:
+                x = block(x, self.rope_cos, self.rope_sin, attn_mask=attn_mask,
+                          mask_flat=mask_flat, gab_tab_shared=gab_tab_shared)
         return self.norm_final(x)
 
     def _forward_blocks_attn_res_impl(self, x, attn_mask=None, mask_flat=None,
                                        gab_tab_shared=None):
+        if self.learnable_rope:
+            all_cos, all_sin = self._compute_all_learnable_rope()
         states = [x]  # stem output as first state
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
+            if self.learnable_rope:
+                rope_cos, rope_sin = all_cos[i:i+1], all_sin[i:i+1]
+            else:
+                rope_cos, rope_sin = self.rope_cos, self.rope_sin
             block.forward_attn_res(
-                states, self.rope_cos, self.rope_sin,
+                states, rope_cos, rope_sin,
                 attn_mask=attn_mask, mask_flat=mask_flat, gab_tab_shared=gab_tab_shared,
             )
         # Final depth attention to aggregate all sub-layer outputs

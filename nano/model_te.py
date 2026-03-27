@@ -137,22 +137,10 @@ class TransformerBlockTEHybrid(nn.Module):
 
     def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
                  zero_centered_gamma: bool = False,
-                 learnable_rope: bool = False, pos_len: int = 0):
+                 ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c_main // num_heads
-
-        # Learnable RoPE: per-head 2D frequency parameters
-        self.learnable_rope = learnable_rope
-        if learnable_rope:
-            assert self.head_dim % 2 == 0, f"Head dim must be even for learnable RoPE, got {self.head_dim}"
-            P = self.head_dim // 2
-            self.pos_len = pos_len
-            log_lo = math.log(1.0 / 50.0)
-            log_hi = math.log(1.0)
-            init_freqs = torch.exp(torch.empty(num_heads, P, 2).uniform_(log_lo, log_hi))
-            init_freqs = init_freqs * (torch.randint(0, 2, (num_heads, P, 2)) * 2 - 1).float()
-            self.rope_freqs = nn.Parameter(init_freqs)  # (num_heads, P, 2)
 
         self.ln_qkv = te.LayerNormLinear(
             c_main,
@@ -173,29 +161,12 @@ class TransformerBlockTEHybrid(nn.Module):
             zero_centered_gamma=zero_centered_gamma,
         )
 
-    def _compute_learnable_rope(self, L, device):
-        """Compute per-head cos/sin from learnable 2D frequencies.
-        Returns cos, sin each of shape (H, L, P).
-        """
-        idx = torch.arange(L, device=device)
-        s_x = (idx % self.pos_len).float()
-        s_y = (idx // self.pos_len).float()
-        omega_x = self.rope_freqs[:, :, 0]    # (H, P)
-        omega_y = self.rope_freqs[:, :, 1]    # (H, P)
-        angles = (s_x.unsqueeze(0).unsqueeze(-1) * omega_x.unsqueeze(1)
-                + s_y.unsqueeze(0).unsqueeze(-1) * omega_y.unsqueeze(1))  # (H, L, P)
-        return torch.cos(angles), torch.sin(angles)
-
     def forward(self, x, rope_cos, rope_sin, attn_mask=None):
         B, L, _ = x.shape
         residual = x
         qkv = self.ln_qkv(x).view(B, L, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)           # (B, L, H, D)
-        if self.learnable_rope:
-            cos, sin = self._compute_learnable_rope(L, x.device)
-            q, k = apply_rotary_emb(q, k, cos, sin)
-        else:
-            q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
+        q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
         # SDPA expects (B, H, L, D)
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
@@ -269,6 +240,20 @@ class Model(nn.Module):
             else:
                 self.rope_cos = None
                 self.rope_sin = None
+                # Precompute 2D grid coordinates
+                L = pos_len * pos_len
+                idx = torch.arange(L)
+                pos_xy = torch.stack([(idx % pos_len).float(),
+                                      (idx // pos_len).float()], dim=-1)
+                self.register_buffer("pos_xy", pos_xy, persistent=False)
+                # Learnable per-head RoPE frequencies for all layers
+                num_layers = config["num_layers"]
+                P = head_dim // 2
+                log_lo = math.log(1.0 / 50.0)
+                log_hi = math.log(1.0)
+                init_freqs = torch.exp(torch.empty(num_layers, num_heads, P, 2).uniform_(log_lo, log_hi))
+                init_freqs = init_freqs * (torch.randint(0, 2, (num_layers, num_heads, P, 2)) * 2 - 1).float()
+                self.all_rope_freqs = nn.Parameter(init_freqs)
         else:
             # Full TE mode: raw embeddings for TE's internal RoPE
             self.register_buffer("rope", emb_full, persistent=False)
@@ -282,8 +267,6 @@ class Model(nn.Module):
             ffn_dim=ffn_dim,
             zero_centered_gamma=zero_centered_norm,
         )
-        if hybrid:
-            block_kwargs.update(learnable_rope=learnable_rope, pos_len=pos_len)
         for _ in range(config["num_layers"]):
             self.blocks.append(BlockClass(**block_kwargs))
 
@@ -303,10 +286,26 @@ class Model(nn.Module):
         self.moving_unowned_proportion_sum = 0.0
         self.moving_unowned_proportion_weight = 0.0
 
+    def _compute_all_learnable_rope(self):
+        """Batch-compute cos/sin for all layers in one fused operation."""
+        sx = self.pos_xy[:, 0]                        # (L,)
+        sy = self.pos_xy[:, 1]                        # (L,)
+        omega_x = self.all_rope_freqs[:, :, :, 0]    # (N, H, P)
+        omega_y = self.all_rope_freqs[:, :, :, 1]    # (N, H, P)
+        all_angles = (sx[None, :, None, None] * omega_x[:, None, :, :]
+                    + sy[None, :, None, None] * omega_y[:, None, :, :])
+        all_angles = torch.cat([all_angles, all_angles], dim=-1)
+        return all_angles.cos(), all_angles.sin()
+
     def _run_trunk_impl(self, x, attn_mask=None):
         if self.hybrid:
-            for block in self.blocks:
-                x = block(x, self.rope_cos, self.rope_sin, attn_mask=attn_mask)
+            if self.learnable_rope:
+                all_cos, all_sin = self._compute_all_learnable_rope()
+                for i, block in enumerate(self.blocks):
+                    x = block(x, all_cos[i:i+1], all_sin[i:i+1], attn_mask=attn_mask)
+            else:
+                for block in self.blocks:
+                    x = block(x, self.rope_cos, self.rope_sin, attn_mask=attn_mask)
         else:
             for block in self.blocks:
                 x = block(x, rope=self.rope, attn_mask=attn_mask)
