@@ -40,7 +40,7 @@ def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebelie
         ffn_dim: SwiGLU FFN intermediate dimension. Default: hidden_size * 8 // 3.
         num_scorebeliefs: Number of score belief mixtures. Default: 8.
         version: Data format version. Default: 15.
-        stem: Stem convolution kernel size. "cnn1" (1x1), "cnn3" (3x3), "cnn5" (5x5).
+        stem: Stem convolution kernel size. "cnn1" (1x1), "cnn3" (3x3), "cnn5" (5x5), "cnn19" (19x19).
     """
     if ffn_dim is None:
         ffn_dim = hidden_size * 8 // 3

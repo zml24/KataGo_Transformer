@@ -870,7 +870,7 @@ class Model(nn.Module):
                                      kernel_size=dw_kernels[self.stem], padding="same",
                                      groups=self.c_trunk, bias=False)
         else:
-            kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5}[self.stem]
+            kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5, "cnn19": 19}[self.stem]
             self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
                                           kernel_size=kernel_size, padding="same", bias=False)
             self.conv_dw = None
