@@ -168,7 +168,8 @@ def main(rank, world_size, args, gpu_id):
             convert_checkpoint_te_to_model, convert_checkpoint_te_decomposed_to_model,
         )
         model_extra_kwargs = {"use_fp8": args.use_fp8, "varlen": args.varlen, "head_bias": args.head_bias,
-                              "zero_centered_norm": args.zero_centered_norm, "hybrid": (args.use_te == 'hybrid')}
+                              "zero_centered_norm": args.zero_centered_norm, "hybrid": (args.use_te == 'hybrid'),
+                              "learnable_rope": args.learnable_rope}
     else:
         from model import Model
         model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res, "gated_attn": args.gated_attn, "head_bias": args.head_bias, "norm_fp32": not args.no_norm_fp32, "zero_centered_norm": args.zero_centered_norm, "use_gab": args.use_gab, "use_tab": args.use_tab, "learnable_rope": args.learnable_rope}

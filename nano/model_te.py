@@ -31,6 +31,7 @@ from model import (
     ZeroCenteredRMSNormFP32,
     SoftPlusWithGradientFloor,
     apply_rotary_emb,
+    apply_learnable_rotary_emb,
     cross_entropy,
     precompute_freqs_cos_sin_2d,
     PolicyHead,
@@ -136,10 +137,24 @@ class TransformerBlockTEHybrid(nn.Module):
     """
 
     def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
-                 zero_centered_gamma: bool = False):
+                 zero_centered_gamma: bool = False,
+                 learnable_rope: bool = False, pos_len: int = 0):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c_main // num_heads
+
+        # Learnable RoPE: per-head 2D frequency parameters
+        self.learnable_rope = learnable_rope
+        if learnable_rope:
+            assert self.head_dim % 2 == 0, f"Head dim must be even for learnable RoPE, got {self.head_dim}"
+            P = self.head_dim // 2
+            self.pos_len = pos_len
+            log_lo = math.log(1.0 / 50.0)
+            log_hi = math.log(1.0)
+            init_freqs = torch.exp(torch.empty(num_heads, P, 2).uniform_(log_lo, log_hi))
+            init_freqs = init_freqs * (torch.randint(0, 2, (num_heads, P, 2)) * 2 - 1).float()
+            self.rope_freqs = nn.Parameter(init_freqs)  # (num_heads, P, 2)
+
         self.ln_qkv = te.LayerNormLinear(
             c_main,
             3 * c_main,
@@ -159,12 +174,29 @@ class TransformerBlockTEHybrid(nn.Module):
             zero_centered_gamma=zero_centered_gamma,
         )
 
+    def _compute_learnable_rope(self, L, device):
+        """Compute per-head cos/sin from learnable 2D frequencies.
+        Returns cos, sin each of shape (H, L, P).
+        """
+        idx = torch.arange(L, device=device)
+        s_x = (idx % self.pos_len).float()
+        s_y = (idx // self.pos_len).float()
+        omega_x = self.rope_freqs[:, :, 0]    # (H, P)
+        omega_y = self.rope_freqs[:, :, 1]    # (H, P)
+        angles = (s_x.unsqueeze(0).unsqueeze(-1) * omega_x.unsqueeze(1)
+                + s_y.unsqueeze(0).unsqueeze(-1) * omega_y.unsqueeze(1))  # (H, L, P)
+        return torch.cos(angles), torch.sin(angles)
+
     def forward(self, x, rope_cos, rope_sin, attn_mask=None):
         B, L, _ = x.shape
         residual = x
         qkv = self.ln_qkv(x).view(B, L, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)           # (B, L, H, D)
-        q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
+        if self.learnable_rope:
+            cos, sin = self._compute_learnable_rope(L, x.device)
+            q, k = apply_learnable_rotary_emb(q, k, cos, sin)
+        else:
+            q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
         # SDPA expects (B, H, L, D)
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
@@ -193,7 +225,8 @@ def _replace_nn_linear_with_te(module):
 class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
                  use_fp8: bool = False, varlen: bool = False, head_bias: bool = False,
-                 zero_centered_norm: bool = False, hybrid: bool = False):
+                 zero_centered_norm: bool = False, hybrid: bool = False,
+                 learnable_rope: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
@@ -226,13 +259,17 @@ class Model(nn.Module):
         Linear = nn.Linear if use_fp8 else te.Linear
         self.linear_global = Linear(num_global_features, self.c_trunk, bias=False)
 
-        # Precompute RoPE embeddings (rotate_half)
+        # RoPE: fixed precomputed or learnable per-head frequencies
+        self.learnable_rope = learnable_rope
         emb = precompute_freqs_cos_sin_2d(head_dim, pos_len)  # (L, 1, 1, dim_half)
         emb_full = torch.cat([emb, emb], dim=-1)              # (L, 1, 1, dim)
         if hybrid:
-            # Hybrid mode: precompute cos/sin for manual RoPE application
-            self.register_buffer("rope_cos", emb_full.cos(), persistent=False)
-            self.register_buffer("rope_sin", emb_full.sin(), persistent=False)
+            if not learnable_rope:
+                self.register_buffer("rope_cos", emb_full.cos(), persistent=False)
+                self.register_buffer("rope_sin", emb_full.sin(), persistent=False)
+            else:
+                self.rope_cos = None
+                self.rope_sin = None
         else:
             # Full TE mode: raw embeddings for TE's internal RoPE
             self.register_buffer("rope", emb_full, persistent=False)
@@ -240,13 +277,16 @@ class Model(nn.Module):
         # Transformer blocks
         BlockClass = TransformerBlockTEHybrid if hybrid else TransformerBlockTE
         self.blocks = nn.ModuleList()
+        block_kwargs = dict(
+            c_main=self.c_trunk,
+            num_heads=num_heads,
+            ffn_dim=ffn_dim,
+            zero_centered_gamma=zero_centered_norm,
+        )
+        if hybrid:
+            block_kwargs.update(learnable_rope=learnable_rope, pos_len=pos_len)
         for _ in range(config["num_layers"]):
-            self.blocks.append(BlockClass(
-                c_main=self.c_trunk,
-                num_heads=num_heads,
-                ffn_dim=ffn_dim,
-                zero_centered_gamma=zero_centered_norm,
-            ))
+            self.blocks.append(BlockClass(**block_kwargs))
 
         # Final normalization (TE fused kernel)
         self.norm_final = te.RMSNorm(self.c_trunk, eps=1e-6,
@@ -297,6 +337,8 @@ class Model(nn.Module):
             # doesn't accept init_method, unlike TransformerBlockTE)
             for name, p in self.named_parameters():
                 if not name.startswith("blocks."):
+                    continue
+                if "rope_freqs" in name:
                     continue
                 if p.dim() < 2:
                     # 1D params: layer_norm weights are left at default init
