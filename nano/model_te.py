@@ -361,8 +361,9 @@ class Model(nn.Module):
                 for _ in range(num_blocks)
             ])
 
-        # Stem
-        init_fn(self.conv_spatial.weight)
+        # Stem (scale conv_spatial std by 1/kernel_size to keep output variance constant)
+        k = self.conv_spatial.weight.shape[-1]
+        nn.init.normal_(self.conv_spatial.weight, mean=0.0, std=init_std / k)
         init_fn(self.linear_global.weight)
 
         # Heads (nn.Linear from model.py)

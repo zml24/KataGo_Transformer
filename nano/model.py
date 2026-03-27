@@ -996,6 +996,8 @@ class Model(nn.Module):
                     std = init_std
                     if ".out_proj." in name or ".ffn_w2." in name:
                         std = std / math.sqrt(2.0 * num_blocks)
+                    elif "conv_spatial" in name:
+                        std = std / p.shape[-1]  # scale by 1/kernel_size
                     nn.init.normal_(p, mean=0.0, std=std)
 
     def fuse_zero_centered_norm(self):

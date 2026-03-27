@@ -48,7 +48,7 @@ def main():
     parser.add_argument("--varlen", action="store_true",
                         help="Enable variable-length board input with masking")
     parser.add_argument("--stem", type=str, default=None,
-                        choices=["cnn1", "cnn3", "cnn5", "dw19", "dw37"],
+                        choices=["cnn1", "cnn3", "cnn5", "cnn19", "dw19", "dw37"],
                         help="Override stem type (default: use config preset)")
     parser.add_argument("--zero-centered-norm", action="store_true",
                         help="Use zero-centered RMSNorm")
