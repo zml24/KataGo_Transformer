@@ -47,9 +47,6 @@ def main():
                         help="Score head mode (default: simple)")
     parser.add_argument("--varlen", action="store_true",
                         help="Enable variable-length board input with masking")
-    parser.add_argument("--stem", type=str, default=None,
-                        choices=["cnn1", "cnn3", "cnn5", "cnn19", "dw19", "dw37"],
-                        help="Override stem type (default: use config preset)")
     parser.add_argument("--zero-centered-norm", action="store_true",
                         help="Use zero-centered RMSNorm")
     parser.add_argument("--attn-res", action="store_true",
@@ -68,10 +65,7 @@ def main():
     if args.use_fp8:
         assert args.use_te, "--use-fp8 requires --use-te"
 
-    # Build config, optionally overriding stem
     model_config = dict(configs.config_of_name[args.model_kind])
-    if args.stem is not None:
-        model_config["stem"] = args.stem
 
     # Model setup
     if args.use_te:
@@ -116,7 +110,7 @@ def main():
     print(f"torch.compile:  {'OFF' if args.no_compile else 'ON'}")
     print(f"TransformerEngine: {args.use_te.upper() if args.use_te else 'OFF'}")
     print(f"FP8:            {'ON' if args.use_fp8 else 'OFF'}")
-    print(f"Stem:           {model_config.get('stem', 'cnn3')}")
+    print(f"Stem:           cnn3")
     print(f"Zero-centered:  {'ON' if args.zero_centered_norm else 'OFF'}")
     print(f"Attn residuals: {'ON' if args.attn_res else 'OFF'}")
     print(f"Learnable RoPE: {'ON' if args.learnable_rope else 'OFF'}")

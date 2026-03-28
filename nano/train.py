@@ -276,12 +276,9 @@ def main(rank, world_size, args, gpu_id):
             num_layers=args.num_layers,
             hidden_size=args.hidden_size,
             num_heads=args.num_heads,
-            stem=args.stem,
         )
     else:
         model_config = configs.config_of_name[args.model_kind].copy()
-        if args.stem != "cnn3":
-            model_config["stem"] = args.stem
     # Inject GAB/TAB parameters into model config
     if args.use_gab:
         model_config["gab_num_templates"] = args.gab_num_templates
@@ -1436,8 +1433,6 @@ if __name__ == "__main__":
                         help="Enable per-stage CUDA-synced profiling (adds sync overhead)")
     parser.add_argument("--ema-decay", type=float, default=0.0,
                         help="EMA decay rate for model params (0=disabled, typical: 0.999 or 0.9999)")
-    parser.add_argument("--stem", type=str, default="cnn3", choices=["cnn1", "cnn3", "cnn5", "cnn19", "dw19", "dw37"],
-                        help="Stem conv kernel: cnn1/3/5/19 (standard conv), dw19/37 (pointwise 1x1 + depthwise)")
     parser.add_argument("--varlen", action="store_true",
                         help="Enable variable-length board input with masking")
     parser.add_argument("--attn-res", action="store_true",

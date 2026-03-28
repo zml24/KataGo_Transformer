@@ -29,8 +29,7 @@ def get_num_global_input_features(config: ModelConfig):
         assert False
 
 
-def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebeliefs=8, version=15,
-                stem="cnn3"):
+def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebeliefs=8, version=15):
     """Create a model config from minimal parameters.
 
     Args:
@@ -40,7 +39,6 @@ def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebelie
         ffn_dim: SwiGLU FFN intermediate dimension. Default: hidden_size * 8 // 3.
         num_scorebeliefs: Number of score belief mixtures. Default: 8.
         version: Data format version. Default: 15.
-        stem: Stem convolution kernel size. "cnn1" (1x1), "cnn3" (3x3), "cnn5" (5x5), "cnn19" (19x19).
     """
     if ffn_dim is None:
         ffn_dim = hidden_size * 8 // 3
@@ -51,7 +49,6 @@ def make_config(num_layers, hidden_size, num_heads, ffn_dim=None, num_scorebelie
         "num_heads": num_heads,
         "ffn_dim": ffn_dim,
         "num_scorebeliefs": num_scorebeliefs,
-        "stem": stem,
     }
 
 
@@ -61,9 +58,9 @@ def migrate_config(old: ModelConfig) -> ModelConfig:
         old = dict(old)
         # Remove legacy fields that are no longer supported
         for legacy_key in ("use_ape", "ape", "pos_enc", "rpe",
-                           "stem_d4", "stem_norm", "stem_init_aligned"):
+                           "stem_d4", "stem_norm", "stem_init_aligned",
+                           "stem"):
             old.pop(legacy_key, None)
-        old.setdefault("stem", "cnn3")
         return old
     return make_config(
         num_layers=len(old["block_kind"]),
@@ -72,7 +69,6 @@ def migrate_config(old: ModelConfig) -> ModelConfig:
         ffn_dim=old.get("transformer_ffn_channels", old["trunk_num_channels"] * 8 // 3),
         num_scorebeliefs=old.get("num_scorebeliefs", 8),
         version=old.get("version", 15),
-        stem=old.get("stem", "cnn3"),
     )
 
 

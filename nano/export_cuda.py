@@ -106,8 +106,6 @@ def _make_model(checkpoint_path, pos_len, score_mode, use_ema):
 
     if config.get("version") != 15:
         raise RuntimeError("原生 CUDA 导出当前只支持 version=15")
-    if config.get("stem", "cnn3") not in {"cnn1", "cnn3", "cnn5", "cnn19"}:
-        raise RuntimeError("原生 CUDA 导出当前只支持 stem=cnn1/cnn3/cnn5/cnn19")
     varlen = state.get("varlen", False)
     head_bias = state.get("head_bias", False)
     zero_centered_norm = state.get("zero_centered_norm", False)
@@ -334,7 +332,7 @@ def export_checkpoint(checkpoint, output, pos_len, score_mode, use_ema):
         _write_i32(out, config["ffn_dim"])
         _write_i32(out, get_num_bin_input_features(config))
         _write_i32(out, get_num_global_input_features(config))
-        _write_i32(out, {"cnn1": 1, "cnn3": 3, "cnn5": 5, "cnn19": 19}[model.stem])
+        _write_i32(out, 3)  # stem conv kernel_size
         _write_i32(out, 0)  # APE flag (always disabled)
         _write_i32(out, _score_mode_id(model.value_head.score_mode))
         _write_i32(out, model.value_head.num_scorebeliefs)

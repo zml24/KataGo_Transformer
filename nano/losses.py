@@ -442,14 +442,7 @@ def estimate_forward_flops(config, pos_len, score_mode="simple"):
     # Input layer (stem conv)
     num_bin_features = get_num_bin_input_features(config)
     num_global_features = get_num_global_input_features(config)
-    stem = config.get("stem", "cnn3")
-    dw_kernels = {"dw19": 19, "dw37": 37}
-    if stem in dw_kernels:
-        # Pointwise 1x1 + depthwise large-kernel
-        conv_flops = 2 * num_bin_features * D * S + 2 * dw_kernels[stem] ** 2 * D * S
-    else:
-        kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5, "cnn19": 19}[stem]
-        conv_flops = 2 * num_bin_features * D * kernel_size ** 2 * S
+    conv_flops = 2 * num_bin_features * D * 9 * S  # 3x3 conv
     global_flops = 2 * num_global_features * D
 
     # Output heads

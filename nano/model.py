@@ -923,19 +923,8 @@ class Model(nn.Module):
         head_dim = self.c_trunk // num_heads
 
         # Stem
-        self.stem = config.get("stem", "cnn3")
-        dw_kernels = {"dw19": 19, "dw37": 37}
-        if self.stem in dw_kernels:
-            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
-                                          kernel_size=1, bias=False)
-            self.conv_dw = nn.Conv2d(self.c_trunk, self.c_trunk,
-                                     kernel_size=dw_kernels[self.stem], padding="same",
-                                     groups=self.c_trunk, bias=False)
-        else:
-            kernel_size = {"cnn1": 1, "cnn3": 3, "cnn5": 5, "cnn19": 19}[self.stem]
-            self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
-                                          kernel_size=kernel_size, padding="same", bias=False)
-            self.conv_dw = None
+        self.conv_spatial = nn.Conv2d(num_bin_features, self.c_trunk,
+                                      kernel_size=3, padding="same", bias=False)
         self.linear_global = nn.Linear(num_global_features, self.c_trunk, bias=False)
 
         # RoPE: fixed precomputed (default) or learnable per-head frequencies
@@ -1064,8 +1053,6 @@ class Model(nn.Module):
                     std = init_std
                     if ".out_proj." in name or ".ffn_w2." in name:
                         std = std / math.sqrt(2.0 * num_blocks)
-                    elif "conv_spatial" in name:
-                        std = std / p.shape[-1]  # scale by 1/kernel_size
                     nn.init.normal_(p, mean=0.0, std=std)
 
     def fuse_zero_centered_norm(self):
@@ -1165,8 +1152,6 @@ class Model(nn.Module):
         # Stem: NCHW -> NLC
         x_global = self.linear_global(input_global)
         x_spatial = self.conv_spatial(input_spatial)
-        if self.conv_dw is not None:
-            x_spatial = self.conv_dw(x_spatial)
         stem_nchw = x_spatial + x_global.unsqueeze(-1).unsqueeze(-1)
 
         # Save NCHW output for TAB module (needs spatial structure)
