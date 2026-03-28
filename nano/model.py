@@ -465,6 +465,7 @@ class TransformerBlock(nn.Module):
                  gab_num_templates: int = 0, tab_num_templates: int = 0,
                  gab_d1: int = 64, gab_d2: int = 64,
                  tab_num_extra_dims: int = 0,
+                 postnorm: bool = False,
                  ):
         super().__init__()
         self.num_heads = num_heads
@@ -472,6 +473,7 @@ class TransformerBlock(nn.Module):
         self.ffn_dim = ffn_dim
         self.use_gab = use_gab
         self.use_tab = use_tab
+        self.postnorm = postnorm
 
         self.q_proj = nn.Linear(c_main, c_main, bias=False)
         self.k_proj = nn.Linear(c_main, c_main, bias=False)
@@ -584,6 +586,53 @@ class TransformerBlock(nn.Module):
         gab_tab_shared: optional dict with precomputed GAB/TAB data
         """
         B, L, C = x.shape
+
+        if self.postnorm:
+            # Postnorm: x = norm(x + sublayer(x))
+            q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim)
+            k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim)
+            v = self.v_proj(x).view(B, L, self.num_heads, self.head_dim)
+
+            q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
+
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+            v = v.permute(0, 2, 1, 3)
+
+            # GAB/TAB
+            template_bias = None
+            extra_kq = None
+            if (self.use_gab or self.use_tab) and gab_tab_shared is not None:
+                template_bias, extra_kq = self._compute_gab_bias(
+                    x, mask_flat, gab_tab_shared)
+
+            if template_bias is not None:
+                attn_mask = (attn_mask + template_bias) if attn_mask is not None else template_bias
+
+            scale = None
+            if extra_kq is not None:
+                extra_k, extra_q = extra_kq
+                q = q * (1.0 / math.sqrt(self.head_dim))
+                scale = 1.0
+                q = torch.cat([q, extra_q], dim=-1)
+                k = torch.cat([k, extra_k], dim=-1)
+
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=0.0, scale=scale)
+            attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, C)
+            if self.use_gated_attn:
+                attn_out = torch.sigmoid(self.attn_gate_proj(x)) * attn_out
+            x = self.norm1(x + self.out_proj(attn_out))
+
+            # SwiGLU FFN (postnorm)
+            w1_out = F.silu(self.ffn_w1(x))
+            wgate_out = self.ffn_wgate(x)
+            with torch.amp.autocast(x.device.type, enabled=False):
+                ffn_hidden = (w1_out.float() * wgate_out.float()).to(x.dtype)
+            x = self.norm2(x + self.ffn_w2(ffn_hidden))
+            return x
+
+        # Prenorm (default): x = x + sublayer(norm(x))
         x_normed = self.norm1(x)
 
         q = self.q_proj(x_normed).view(B, L, self.num_heads, self.head_dim)
@@ -649,10 +698,13 @@ class TransformerBlock(nn.Module):
 
         # 2. Self-attention
         B, L, C = h.shape
-        h_normed = self.norm1(h)
-        q = self.q_proj(h_normed).view(B, L, self.num_heads, self.head_dim)
-        k = self.k_proj(h_normed).view(B, L, self.num_heads, self.head_dim)
-        v = self.v_proj(h_normed).view(B, L, self.num_heads, self.head_dim)
+        if self.postnorm:
+            h_input = h
+        else:
+            h_input = self.norm1(h)
+        q = self.q_proj(h_input).view(B, L, self.num_heads, self.head_dim)
+        k = self.k_proj(h_input).view(B, L, self.num_heads, self.head_dim)
+        v = self.v_proj(h_input).view(B, L, self.num_heads, self.head_dim)
         q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
@@ -663,7 +715,7 @@ class TransformerBlock(nn.Module):
         extra_kq = None
         if (self.use_gab or self.use_tab) and gab_tab_shared is not None:
             template_bias, extra_kq = self._compute_gab_bias(
-                h_normed, mask_flat, gab_tab_shared)
+                h_input, mask_flat, gab_tab_shared)
 
         if template_bias is not None:
             attn_mask = (attn_mask + template_bias) if attn_mask is not None else template_bias
@@ -680,8 +732,10 @@ class TransformerBlock(nn.Module):
             q, k, v, attn_mask=attn_mask, dropout_p=0.0, scale=scale)
         attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, C)
         if self.use_gated_attn:
-            attn_out = torch.sigmoid(self.attn_gate_proj(h_normed)) * attn_out
+            attn_out = torch.sigmoid(self.attn_gate_proj(h_input)) * attn_out
         attn_out = self.out_proj(attn_out)
+        if self.postnorm:
+            attn_out = self.norm1(attn_out)
 
         # 3. Record attn output in history
         states.append(attn_out)
@@ -690,12 +744,17 @@ class TransformerBlock(nn.Module):
         h = attn_res(states, self.mlp_res_proj, self.mlp_res_norm)
 
         # 5. FFN
-        h_normed = self.norm2(h)
-        w1_out = F.silu(self.ffn_w1(h_normed))
-        wgate_out = self.ffn_wgate(h_normed)
+        if self.postnorm:
+            h_input = h
+        else:
+            h_input = self.norm2(h)
+        w1_out = F.silu(self.ffn_w1(h_input))
+        wgate_out = self.ffn_wgate(h_input)
         with torch.amp.autocast(h.device.type, enabled=False):
             ffn_hidden = (w1_out.float() * wgate_out.float()).to(h.dtype)
         mlp_out = self.ffn_w2(ffn_hidden)
+        if self.postnorm:
+            mlp_out = self.norm2(mlp_out)
 
         # 6. Record mlp output in history
         states.append(mlp_out)
@@ -842,7 +901,7 @@ class Model(nn.Module):
                  attn_res: bool = False, gated_attn: bool = False, head_bias: bool = False,
                  norm_fp32: bool = True, zero_centered_norm: bool = False,
                  use_gab: bool = False, use_tab: bool = False,
-                 learnable_rope: bool = False):
+                 learnable_rope: bool = False, postnorm: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
@@ -850,6 +909,9 @@ class Model(nn.Module):
         self.attn_res = attn_res
         self.gated_attn = gated_attn
         self.zero_centered_norm = zero_centered_norm
+        self.postnorm = postnorm
+        if postnorm and attn_res:
+            raise ValueError("postnorm=True and attn_res=True cannot be used together")
         self.use_gab = use_gab
         self.use_tab = use_tab
         self.c_trunk = config["hidden_size"]
@@ -947,16 +1009,22 @@ class Model(nn.Module):
                 gab_d1=config.get("gab_d1", 64),
                 gab_d2=config.get("gab_d2", 64),
                 tab_num_extra_dims=tab_num_extra_dims,
+                postnorm=postnorm,
             ))
 
-        # Final normalization
+        # Select NormClass for final norm and attn_res
         if zero_centered_norm:
             NormClass = ZeroCenteredRMSNormFP32
         elif norm_fp32:
             NormClass = RMSNormFP32
         else:
             NormClass = nn.RMSNorm
-        self.norm_final = NormClass(self.c_trunk, eps=1e-6)
+
+        # Final normalization (postnorm skips: each block output is already normalized)
+        if postnorm:
+            self.norm_final = nn.Identity()
+        else:
+            self.norm_final = NormClass(self.c_trunk, eps=1e-6)
 
         # Final depth attention for attn_res (aggregates all sub-layer outputs)
         if attn_res:
