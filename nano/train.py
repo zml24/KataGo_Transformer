@@ -1121,6 +1121,17 @@ def main(rank, world_size, args, gpu_id):
                         time_now = time.perf_counter()
                         print_metrics(time_now - last_print_time)
                         last_print_time = time_now
+                        if device.type == "cuda":
+                            alloc_gb = torch.cuda.memory_allocated(device) / 1e9
+                            resv_gb = torch.cuda.memory_reserved(device) / 1e9
+                            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+                            free_gb = free_bytes / 1e9
+                            total_gb = total_bytes / 1e9
+                            logging.info(
+                                f"  GPU MEM: allocated={alloc_gb:.2f}GB reserved={resv_gb:.2f}GB "
+                                f"free={free_gb:.2f}GB total={total_gb:.2f}GB "
+                                f"(external={total_gb - free_gb - resv_gb:.2f}GB)"
+                            )
                     reset_running()
 
                 # Periodic save (all ranks call save_checkpoint for ZeRO gather)
