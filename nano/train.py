@@ -166,14 +166,13 @@ def main(rank, world_size, args, gpu_id):
             Model, detect_checkpoint_format,
             convert_checkpoint_model_to_te, convert_checkpoint_model_to_te_decomposed,
             convert_checkpoint_te_to_model, convert_checkpoint_te_decomposed_to_model,
-            convert_checkpoint_model_to_te_postnorm, convert_checkpoint_te_postnorm_to_model,
         )
-        model_extra_kwargs = {"use_fp8": args.use_fp8, "varlen": args.varlen, "head_bias": args.head_bias,
+        model_extra_kwargs = {"use_fp8": args.use_fp8, "varlen": args.varlen,
                               "zero_centered_norm": args.zero_centered_norm, "hybrid": (args.use_te == 'hybrid'),
-                              "learnable_rope": args.learnable_rope, "postnorm": args.postnorm}
+                              "learnable_rope": args.learnable_rope}
     else:
         from model import Model
-        model_extra_kwargs = {"varlen": args.varlen, "attn_res": args.attn_res, "gated_attn": args.gated_attn, "head_bias": args.head_bias, "norm_fp32": not args.no_norm_fp32, "zero_centered_norm": args.zero_centered_norm, "use_gab": args.use_gab, "use_tab": args.use_tab, "learnable_rope": args.learnable_rope, "postnorm": args.postnorm}
+        model_extra_kwargs = {"varlen": args.varlen, "gated_attn": args.gated_attn, "zero_centered_norm": args.zero_centered_norm, "learnable_rope": args.learnable_rope}
 
     # Parse td_value_loss_scales
     td_value_loss_scales = [float(x) for x in args.td_value_loss_scales.split(",")]
@@ -279,21 +278,6 @@ def main(rank, world_size, args, gpu_id):
         )
     else:
         model_config = configs.config_of_name[args.model_kind].copy()
-    # Inject GAB/TAB parameters into model config
-    if args.use_gab:
-        model_config["gab_num_templates"] = args.gab_num_templates
-        model_config["gab_num_fourier_features"] = args.gab_num_fourier_features
-        model_config["gab_mlp_hidden"] = args.gab_mlp_hidden
-        model_config["gab_d1"] = args.gab_d1
-        model_config["gab_d2"] = args.gab_d2
-    if args.use_tab:
-        model_config["tab_c_z"] = args.tab_c_z
-        model_config["tab_num_templates"] = args.tab_num_templates
-        model_config["tab_num_freqs"] = args.tab_num_freqs
-        model_config["tab_num_blocks"] = args.tab_num_blocks
-        model_config["tab_dilation"] = args.tab_dilation
-        model_config["tab_use_frequency_mixing"] = args.tab_use_frequency_mixing
-
     logging.info(f"Model config: {json.dumps(model_config, indent=2, default=str)}")
 
     pos_len = args.pos_len
@@ -324,32 +308,11 @@ def main(rank, world_size, args, gpu_id):
         if ckpt_varlen != args.varlen:
             logging.warning(f"Checkpoint varlen={ckpt_varlen} differs from command-line --varlen={args.varlen}, using checkpoint value")
         apply_varlen_mode(ckpt_varlen, "Checkpoint")
-        # Verify attn_res flag matches checkpoint
-        ckpt_attn_res = state.get("attn_res", False)
-        if ckpt_attn_res != args.attn_res:
-            raise RuntimeError(
-                f"Checkpoint attn_res={ckpt_attn_res} differs from --attn-res={args.attn_res}; "
-                "rerun with a matching flag"
-            )
         # Verify gated_attn flag matches checkpoint
         ckpt_gated_attn = state.get("gated_attn", False)
         if ckpt_gated_attn != args.gated_attn:
             raise RuntimeError(
                 f"Checkpoint gated_attn={ckpt_gated_attn} differs from --gated-attn={args.gated_attn}; "
-                "rerun with a matching flag"
-            )
-        # Verify head_bias flag matches checkpoint
-        ckpt_head_bias = state.get("head_bias", False)
-        if ckpt_head_bias != args.head_bias:
-            raise RuntimeError(
-                f"Checkpoint head_bias={ckpt_head_bias} differs from --head-bias={args.head_bias}; "
-                "rerun with a matching flag"
-            )
-        # Verify norm_fp32 flag matches checkpoint
-        ckpt_norm_fp32 = state.get("norm_fp32", True)
-        if ckpt_norm_fp32 != (not args.no_norm_fp32):
-            raise RuntimeError(
-                f"Checkpoint norm_fp32={ckpt_norm_fp32} differs from current norm_fp32={not args.no_norm_fp32}; "
                 "rerun with a matching flag"
             )
         # Verify zero_centered_norm flag matches checkpoint
@@ -359,59 +322,18 @@ def main(rank, world_size, args, gpu_id):
                 f"Checkpoint zero_centered_norm={ckpt_zero_centered_norm} differs from "
                 f"--zero-centered-norm={args.zero_centered_norm}; rerun with a matching flag"
             )
-        # Verify postnorm flag matches checkpoint
-        ckpt_postnorm = state.get("postnorm", False)
-        if ckpt_postnorm != args.postnorm:
-            raise RuntimeError(
-                f"Checkpoint postnorm={ckpt_postnorm} differs from "
-                f"--postnorm={args.postnorm}; rerun with a matching flag"
-            )
-        # Verify use_gab flag matches checkpoint
-        ckpt_use_gab = state.get("use_gab", False)
-        if ckpt_use_gab != args.use_gab:
-            raise RuntimeError(
-                f"Checkpoint use_gab={ckpt_use_gab} differs from --use-gab={args.use_gab}; "
-                "rerun with a matching flag"
-            )
-        # Verify use_tab flag matches checkpoint
-        ckpt_use_tab = state.get("use_tab", False)
-        if ckpt_use_tab != args.use_tab:
-            raise RuntimeError(
-                f"Checkpoint use_tab={ckpt_use_tab} differs from --use-tab={args.use_tab}; "
-                "rerun with a matching flag"
-            )
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
             fmt = detect_checkpoint_format(model_state)
             if args.use_te == 'hybrid':
-                if args.postnorm:
-                    # Target: postnorm TE hybrid
-                    if fmt == "pt":
-                        logging.info("Converting model.py checkpoint to postnorm TE hybrid format")
-                        model_state = convert_checkpoint_model_to_te_postnorm(model_state)
-                    elif fmt == "te":
-                        logging.info("Converting full TE checkpoint to postnorm TE hybrid format")
-                        model_state = convert_checkpoint_te_to_model(model_state)
-                        model_state = convert_checkpoint_model_to_te_postnorm(model_state)
-                    elif fmt == "te_decomposed":
-                        logging.info("Converting prenorm hybrid TE checkpoint to postnorm TE hybrid format")
-                        model_state = convert_checkpoint_te_decomposed_to_model(model_state)
-                        model_state = convert_checkpoint_model_to_te_postnorm(model_state)
-                    # fmt == "te_postnorm": already correct format
-                else:
-                    # Target: prenorm TE hybrid
-                    if fmt == "pt":
-                        logging.info("Converting model.py checkpoint to hybrid TE format")
-                        model_state = convert_checkpoint_model_to_te_decomposed(model_state)
-                    elif fmt == "te":
-                        logging.info("Converting full TE checkpoint to hybrid TE format")
-                        model_state = convert_checkpoint_te_to_model(model_state)
-                        model_state = convert_checkpoint_model_to_te_decomposed(model_state)
-                    elif fmt == "te_postnorm":
-                        logging.info("Converting postnorm TE hybrid checkpoint to prenorm hybrid TE format")
-                        model_state = convert_checkpoint_te_postnorm_to_model(model_state)
-                        model_state = convert_checkpoint_model_to_te_decomposed(model_state)
+                if fmt == "pt":
+                    logging.info("Converting model.py checkpoint to hybrid TE format")
+                    model_state = convert_checkpoint_model_to_te_decomposed(model_state)
+                elif fmt == "te":
+                    logging.info("Converting full TE checkpoint to hybrid TE format")
+                    model_state = convert_checkpoint_te_to_model(model_state)
+                    model_state = convert_checkpoint_model_to_te_decomposed(model_state)
             else:  # full
                 if fmt == "pt":
                     logging.info("Converting model.py checkpoint to TE format")
@@ -420,17 +342,12 @@ def main(rank, world_size, args, gpu_id):
                     logging.info("Converting hybrid TE checkpoint to full TE format")
                     model_state = convert_checkpoint_te_decomposed_to_model(model_state)
                     model_state = convert_checkpoint_model_to_te(model_state)
-                elif fmt == "te_postnorm":
-                    logging.info("Converting postnorm TE hybrid checkpoint to full TE format")
-                    model_state = convert_checkpoint_te_postnorm_to_model(model_state)
-                    model_state = convert_checkpoint_model_to_te(model_state)
             model.load_state_dict(model_state, strict=False)
         else:
             try:
                 from model_te import detect_checkpoint_format as _detect, \
                     convert_checkpoint_te_to_model as _convert, \
-                    convert_checkpoint_te_decomposed_to_model as _convert_decomp, \
-                    convert_checkpoint_te_postnorm_to_model as _convert_postnorm
+                    convert_checkpoint_te_decomposed_to_model as _convert_decomp
                 fmt = _detect(model_state)
                 if fmt == "te":
                     logging.info("Converting TE checkpoint to model.py format")
@@ -438,9 +355,6 @@ def main(rank, world_size, args, gpu_id):
                 elif fmt == "te_decomposed":
                     logging.info("Converting hybrid TE checkpoint to model.py format")
                     model_state = _convert_decomp(model_state, zero_centered_norm=args.zero_centered_norm)
-                elif fmt == "te_postnorm":
-                    logging.info("Converting postnorm TE hybrid checkpoint to model.py format")
-                    model_state = _convert_postnorm(model_state, zero_centered_norm=args.zero_centered_norm)
             except ImportError:
                 pass
             model.load_state_dict(model_state)
@@ -469,32 +383,11 @@ def main(rank, world_size, args, gpu_id):
             )
         if ckpt_has_varlen:
             apply_varlen_mode(ckpt_varlen, "Initial checkpoint")
-        # Verify attn_res flag matches initial checkpoint
-        ckpt_attn_res = state.get("attn_res", False)
-        if ckpt_attn_res != args.attn_res:
-            raise RuntimeError(
-                f"Initial checkpoint attn_res={ckpt_attn_res} differs from --attn-res={args.attn_res}; "
-                "rerun with a matching flag"
-            )
         # Verify gated_attn flag matches initial checkpoint
         ckpt_gated_attn = state.get("gated_attn", False)
         if ckpt_gated_attn != args.gated_attn:
             raise RuntimeError(
                 f"Initial checkpoint gated_attn={ckpt_gated_attn} differs from --gated-attn={args.gated_attn}; "
-                "rerun with a matching flag"
-            )
-        # Verify head_bias flag matches initial checkpoint
-        ckpt_head_bias = state.get("head_bias", False)
-        if ckpt_head_bias != args.head_bias:
-            raise RuntimeError(
-                f"Initial checkpoint head_bias={ckpt_head_bias} differs from --head-bias={args.head_bias}; "
-                "rerun with a matching flag"
-            )
-        # Verify norm_fp32 flag matches initial checkpoint
-        ckpt_norm_fp32 = state.get("norm_fp32", True)
-        if ckpt_norm_fp32 != (not args.no_norm_fp32):
-            raise RuntimeError(
-                f"Initial checkpoint norm_fp32={ckpt_norm_fp32} differs from current norm_fp32={not args.no_norm_fp32}; "
                 "rerun with a matching flag"
             )
         # Verify zero_centered_norm flag matches initial checkpoint
@@ -504,56 +397,18 @@ def main(rank, world_size, args, gpu_id):
                 f"Initial checkpoint zero_centered_norm={ckpt_zero_centered_norm} differs from "
                 f"--zero-centered-norm={args.zero_centered_norm}; rerun with a matching flag"
             )
-        # Verify postnorm flag matches initial checkpoint
-        ckpt_postnorm = state.get("postnorm", False)
-        if ckpt_postnorm != args.postnorm:
-            raise RuntimeError(
-                f"Initial checkpoint postnorm={ckpt_postnorm} differs from "
-                f"--postnorm={args.postnorm}; rerun with a matching flag"
-            )
-        # Verify use_gab flag matches initial checkpoint
-        ckpt_use_gab = state.get("use_gab", False)
-        if ckpt_use_gab != args.use_gab:
-            raise RuntimeError(
-                f"Initial checkpoint use_gab={ckpt_use_gab} differs from --use-gab={args.use_gab}; "
-                "rerun with a matching flag"
-            )
-        # Verify use_tab flag matches initial checkpoint
-        ckpt_use_tab = state.get("use_tab", False)
-        if ckpt_use_tab != args.use_tab:
-            raise RuntimeError(
-                f"Initial checkpoint use_tab={ckpt_use_tab} differs from --use-tab={args.use_tab}; "
-                "rerun with a matching flag"
-            )
         model = Model(model_config, pos_len, score_mode=args.score_mode, **model_extra_kwargs)
         model_state = state["model"]
         if args.use_te:
             fmt = detect_checkpoint_format(model_state)
             if args.use_te == 'hybrid':
-                if args.postnorm:
-                    if fmt == "pt":
-                        logging.info("Converting model.py initial checkpoint to postnorm TE hybrid format")
-                        model_state = convert_checkpoint_model_to_te_postnorm(model_state)
-                    elif fmt == "te":
-                        logging.info("Converting full TE initial checkpoint to postnorm TE hybrid format")
-                        model_state = convert_checkpoint_te_to_model(model_state)
-                        model_state = convert_checkpoint_model_to_te_postnorm(model_state)
-                    elif fmt == "te_decomposed":
-                        logging.info("Converting prenorm hybrid TE initial checkpoint to postnorm TE hybrid format")
-                        model_state = convert_checkpoint_te_decomposed_to_model(model_state)
-                        model_state = convert_checkpoint_model_to_te_postnorm(model_state)
-                else:
-                    if fmt == "pt":
-                        logging.info("Converting model.py initial checkpoint to hybrid TE format")
-                        model_state = convert_checkpoint_model_to_te_decomposed(model_state)
-                    elif fmt == "te":
-                        logging.info("Converting full TE initial checkpoint to hybrid TE format")
-                        model_state = convert_checkpoint_te_to_model(model_state)
-                        model_state = convert_checkpoint_model_to_te_decomposed(model_state)
-                    elif fmt == "te_postnorm":
-                        logging.info("Converting postnorm TE hybrid initial checkpoint to prenorm hybrid TE format")
-                        model_state = convert_checkpoint_te_postnorm_to_model(model_state)
-                        model_state = convert_checkpoint_model_to_te_decomposed(model_state)
+                if fmt == "pt":
+                    logging.info("Converting model.py initial checkpoint to hybrid TE format")
+                    model_state = convert_checkpoint_model_to_te_decomposed(model_state)
+                elif fmt == "te":
+                    logging.info("Converting full TE initial checkpoint to hybrid TE format")
+                    model_state = convert_checkpoint_te_to_model(model_state)
+                    model_state = convert_checkpoint_model_to_te_decomposed(model_state)
             else:  # full
                 if fmt == "pt":
                     logging.info("Converting model.py initial checkpoint to TE format")
@@ -562,17 +417,12 @@ def main(rank, world_size, args, gpu_id):
                     logging.info("Converting hybrid TE initial checkpoint to full TE format")
                     model_state = convert_checkpoint_te_decomposed_to_model(model_state)
                     model_state = convert_checkpoint_model_to_te(model_state)
-                elif fmt == "te_postnorm":
-                    logging.info("Converting postnorm TE hybrid initial checkpoint to full TE format")
-                    model_state = convert_checkpoint_te_postnorm_to_model(model_state)
-                    model_state = convert_checkpoint_model_to_te(model_state)
             model.load_state_dict(model_state, strict=False)
         else:
             try:
                 from model_te import detect_checkpoint_format as _detect, \
                     convert_checkpoint_te_to_model as _convert, \
-                    convert_checkpoint_te_decomposed_to_model as _convert_decomp, \
-                    convert_checkpoint_te_postnorm_to_model as _convert_postnorm
+                    convert_checkpoint_te_decomposed_to_model as _convert_decomp
                 fmt = _detect(model_state)
                 if fmt == "te":
                     logging.info("Converting TE initial checkpoint to model.py format")
@@ -580,9 +430,6 @@ def main(rank, world_size, args, gpu_id):
                 elif fmt == "te_decomposed":
                     logging.info("Converting hybrid TE initial checkpoint to model.py format")
                     model_state = _convert_decomp(model_state, zero_centered_norm=args.zero_centered_norm)
-                elif fmt == "te_postnorm":
-                    logging.info("Converting postnorm TE hybrid initial checkpoint to model.py format")
-                    model_state = _convert_postnorm(model_state, zero_centered_norm=args.zero_centered_norm)
             except ImportError:
                 pass
             result = model.load_state_dict(model_state, strict=False)
@@ -641,8 +488,6 @@ def main(rank, world_size, args, gpu_id):
                 adam_params[name] = p
             else:
                 no_decay_params[name] = p
-        elif "attn_res_proj" in name or "mlp_res_proj" in name:
-            adam_params[name] = p
         elif "rope_freqs" in name:
             no_decay_params[name] = p
         elif args.optimizer == "muon" and "blocks." in name:
@@ -896,14 +741,10 @@ def main(rank, world_size, args, gpu_id):
                 "moving_unowned_proportion_sum": model.moving_unowned_proportion_sum,
                 "moving_unowned_proportion_weight": model.moving_unowned_proportion_weight,
                 "varlen": args.varlen,
-                "attn_res": args.attn_res,
                 "gated_attn": args.gated_attn,
-                "head_bias": args.head_bias,
-                "norm_fp32": not args.no_norm_fp32,
+                "head_bias": True,
+                "norm_fp32": True,
                 "zero_centered_norm": args.zero_centered_norm,
-                "postnorm": args.postnorm,
-                "use_gab": args.use_gab,
-                "use_tab": args.use_tab,
                 "training_mode": {
                     "zero": zero_adam is not None,
                     "has_muon": muon_opt is not None,
@@ -1355,6 +1196,8 @@ def main(rank, world_size, args, gpu_id):
                                 for k in _per_sample_keys:
                                     tb_writer.add_scalar(f"val/{k}", val_metrics[k] / weight_sum, total_samples_trained)
                         model.train()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
                     last_print_time += time.perf_counter() - t_val_start
                     last_val_samples = total_samples_trained
 
@@ -1435,38 +1278,12 @@ if __name__ == "__main__":
                         help="EMA decay rate for model params (0=disabled, typical: 0.999 or 0.9999)")
     parser.add_argument("--varlen", action="store_true",
                         help="Enable variable-length board input with masking")
-    parser.add_argument("--attn-res", action="store_true",
-                        help="Enable Attention Residuals (full depth attention replacing standard residuals)")
     parser.add_argument("--gated-attn", action="store_true",
                         help="Enable elementwise gated attention (sigmoid gate on attention output)")
-    parser.add_argument("--head-bias", action="store_true",
-                        help="Add bias (zero-init, no weight decay) to policy/value head linear layers")
-    parser.add_argument("--no-norm-fp32", action="store_true",
-                        help="Use nn.RMSNorm instead of FP32-wrapped RMSNorm (faster, may reduce numerical stability)")
     parser.add_argument("--zero-centered-norm", action="store_true",
                         help="Use zero-centered RMSNorm (weight=0 init, gamma=1+weight, WD pushes gamma toward 1)")
-    # GAB (Global Average Biasing)
-    parser.add_argument("--use-gab", action="store_true",
-                        help="Enable Global Average Biasing (input-independent positional attention templates)")
-    parser.add_argument("--gab-num-templates", type=int, default=32, help="Number of GAB templates")
-    parser.add_argument("--gab-num-fourier-features", type=int, default=12, help="Number of GAB Fourier features")
-    parser.add_argument("--gab-mlp-hidden", type=int, default=96, help="GAB MLP hidden dimension")
-    parser.add_argument("--gab-d1", type=int, default=64, help="GAB per-token projection dimension")
-    parser.add_argument("--gab-d2", type=int, default=64, help="GAB compressed global dimension")
-    # TAB (Trunk Average Biasing)
-    parser.add_argument("--use-tab", action="store_true",
-                        help="Enable Trunk Average Biasing (input-dependent factored attention bias via complex equivariant convolutions)")
-    parser.add_argument("--tab-c-z", type=int, default=8, help="TAB complex channels (also frequency count for FrequencyMixing variant)")
-    parser.add_argument("--tab-num-templates", type=int, default=16, help="Number of TAB templates")
-    parser.add_argument("--tab-num-freqs", type=int, default=8, help="TAB frequency count (only for non-FrequencyMixing TABModule)")
-    parser.add_argument("--tab-num-blocks", type=int, default=2, help="Number of TAB equivariant blocks")
-    parser.add_argument("--tab-dilation", type=int, default=2, help="TAB convolution dilation rate")
-    parser.add_argument("--tab-use-frequency-mixing", action="store_true",
-                        help="Use FrequencyMixingTABModule instead of TABModule (c_z = frequency count, depthwise + pointwise)")
     parser.add_argument("--learnable-rope", action="store_true",
                         help="Enable learnable per-head RoPE frequencies (replaces fixed precomputed RoPE)")
-    parser.add_argument("--postnorm", action="store_true",
-                        help="Use postnorm (norm after residual) instead of prenorm (norm before sublayer)")
     args = parser.parse_args()
 
     # Validation
@@ -1478,22 +1295,10 @@ if __name__ == "__main__":
         parser.error("--batch-size must be divisible by 8 when --symmetry-type is 'all'")
     if args.amp_dtype == "fp16" and not torch.cuda.is_available():
         parser.error("--amp-dtype fp16 requires CUDA")
-    if args.attn_res and args.use_te:
-        parser.error("--attn-res and --use-te cannot be used together")
     if args.gated_attn and args.use_te:
         parser.error("--gated-attn and --use-te cannot be used together")
-    if args.use_gab and args.use_te:
-        parser.error("--use-gab and --use-te cannot be used together (model_te does not support GAB)")
-    if args.use_tab and args.use_te:
-        parser.error("--use-tab and --use-te cannot be used together (model_te does not support TAB)")
     if args.varlen and args.use_te == 'full':
         parser.error("--varlen requires --use-te hybrid (--use-te full does not support varlen)")
-    if args.zero_centered_norm and args.no_norm_fp32:
-        parser.error("--zero-centered-norm conflicts with --no-norm-fp32")
-    if args.postnorm and args.use_te == 'full':
-        parser.error("--postnorm requires --use-te hybrid (--use-te full does not support postnorm)")
-    if args.postnorm and args.attn_res:
-        parser.error("--postnorm and --attn-res cannot be used together")
 
     # Detect torchrun launch (torchrun sets RANK, LOCAL_RANK, WORLD_SIZE env vars)
     torchrun_rank = os.environ.get("RANK")

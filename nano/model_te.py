@@ -136,68 +136,34 @@ class TransformerBlockTEHybrid(nn.Module):
     """
 
     def __init__(self, c_main: int, num_heads: int, ffn_dim: int,
-                 zero_centered_gamma: bool = False,
-                 postnorm: bool = False,
-                 ):
+                 zero_centered_gamma: bool = False):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c_main // num_heads
-        self.postnorm = postnorm
 
-        if postnorm:
-            # Postnorm: no fused LayerNorm+Linear; use separate linear + post norm
-            self.qkv = te.Linear(c_main, 3 * c_main, bias=False)
-            self.proj = te.Linear(c_main, c_main, bias=False)
-            self.norm1 = te.RMSNorm(c_main, eps=1e-6,
-                                     zero_centered_gamma=zero_centered_gamma)
-            self.ffn_w1 = te.Linear(c_main, ffn_dim, bias=False)
-            self.ffn_wgate = te.Linear(c_main, ffn_dim, bias=False)
-            self.ffn_w2 = te.Linear(ffn_dim, c_main, bias=False)
-            self.norm2 = te.RMSNorm(c_main, eps=1e-6,
-                                     zero_centered_gamma=zero_centered_gamma)
-        else:
-            self.ln_qkv = te.LayerNormLinear(
-                c_main,
-                3 * c_main,
-                eps=1e-6,
-                bias=False,
-                normalization="RMSNorm",
-                zero_centered_gamma=zero_centered_gamma,
-            )
-            self.proj = te.Linear(c_main, c_main, bias=False)
-            self.ln_mlp = te.LayerNormMLP(
-                c_main,
-                ffn_dim,
-                eps=1e-6,
-                bias=False,
-                normalization="RMSNorm",
-                activation="swiglu",
-                zero_centered_gamma=zero_centered_gamma,
-            )
+        self.ln_qkv = te.LayerNormLinear(
+            c_main,
+            3 * c_main,
+            eps=1e-6,
+            bias=False,
+            normalization="RMSNorm",
+            zero_centered_gamma=zero_centered_gamma,
+        )
+        self.proj = te.Linear(c_main, c_main, bias=False)
+        self.ln_mlp = te.LayerNormMLP(
+            c_main,
+            ffn_dim,
+            eps=1e-6,
+            bias=False,
+            normalization="RMSNorm",
+            activation="swiglu",
+            zero_centered_gamma=zero_centered_gamma,
+        )
 
     def forward(self, x, rope_cos, rope_sin, attn_mask=None):
         B, L, _ = x.shape
 
-        if self.postnorm:
-            # Postnorm: x = norm(x + sublayer(x))
-            qkv = self.qkv(x).view(B, L, 3, self.num_heads, self.head_dim)
-            q, k, v = qkv.unbind(dim=2)
-            q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)
-            q = q.permute(0, 2, 1, 3)
-            k = k.permute(0, 2, 1, 3)
-            v = v.permute(0, 2, 1, 3)
-            attn_out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=0.0)
-            attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, L, -1)
-            x = self.norm1(x + self.proj(attn_out))
-
-            # SwiGLU FFN (postnorm)
-            w1_out = F.silu(self.ffn_w1(x))
-            wgate_out = self.ffn_wgate(x)
-            ffn_hidden = w1_out * wgate_out
-            return self.norm2(x + self.ffn_w2(ffn_hidden))
-
-        # Prenorm (default)
+        # Prenorm
         residual = x
         qkv = self.ln_qkv(x).view(B, L, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)           # (B, L, H, D)
@@ -229,18 +195,15 @@ def _replace_nn_linear_with_te(module):
 # ---------------------------------------------------------------------------
 class Model(nn.Module):
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
-                 use_fp8: bool = False, varlen: bool = False, head_bias: bool = False,
+                 use_fp8: bool = False, varlen: bool = False,
                  zero_centered_norm: bool = False, hybrid: bool = False,
-                 learnable_rope: bool = False, postnorm: bool = False):
+                 learnable_rope: bool = False):
         super().__init__()
         self.config = config
         self.pos_len = pos_len
         self.varlen = varlen
         self.zero_centered_norm = zero_centered_norm
         self.hybrid = hybrid
-        self.postnorm = postnorm
-        if postnorm and not hybrid:
-            raise ValueError("postnorm=True requires hybrid=True (full TE mode does not support postnorm)")
         self.c_trunk = config["hidden_size"]
         num_bin_features = get_num_bin_input_features(config)
         num_global_features = get_num_global_input_features(config)
@@ -294,22 +257,16 @@ class Model(nn.Module):
             ffn_dim=ffn_dim,
             zero_centered_gamma=zero_centered_norm,
         )
-        if hybrid:
-            block_kwargs["postnorm"] = postnorm
         for _ in range(config["num_layers"]):
             self.blocks.append(BlockClass(**block_kwargs))
 
-        # Final normalization (postnorm skips: each block output is already normalized)
-        if postnorm:
-            self.norm_final = nn.Identity()
-        else:
-            self.norm_final = te.RMSNorm(self.c_trunk, eps=1e-6,
-                                          zero_centered_gamma=zero_centered_norm)
+        self.norm_final = te.RMSNorm(self.c_trunk, eps=1e-6,
+                                      zero_centered_gamma=zero_centered_norm)
 
         # Output heads: non-FP8 uses te.Linear for fused kernels; FP8 keeps nn.Linear (dims not FP8-aligned)
         num_scorebeliefs = config["num_scorebeliefs"]
-        self.policy_head = PolicyHead(self.c_trunk, pos_len, head_bias=head_bias)
-        self.value_head = ValueHead(self.c_trunk, num_scorebeliefs, pos_len, score_mode=score_mode, head_bias=head_bias)
+        self.policy_head = PolicyHead(self.c_trunk, pos_len)
+        self.value_head = ValueHead(self.c_trunk, num_scorebeliefs, pos_len, score_mode=score_mode)
         if not use_fp8:
             _replace_nn_linear_with_te(self.policy_head)
             _replace_nn_linear_with_te(self.value_head)
@@ -540,7 +497,7 @@ class ModelDecomposedExport(nn.Module):
     """Export-only TE model that keeps TE modules but applies RoPE via plain PyTorch ops."""
 
     def __init__(self, config: dict, pos_len: int, score_mode: str = "mixop",
-                 use_fp8: bool = False, varlen: bool = False, head_bias: bool = False,
+                 use_fp8: bool = False, varlen: bool = False,
                  zero_centered_norm: bool = False):
         super().__init__()
         self.config = config
@@ -579,8 +536,8 @@ class ModelDecomposedExport(nn.Module):
                                       zero_centered_gamma=zero_centered_norm)
 
         num_scorebeliefs = config["num_scorebeliefs"]
-        self.policy_head = PolicyHead(self.c_trunk, pos_len, head_bias=head_bias)
-        self.value_head = ValueHead(self.c_trunk, num_scorebeliefs, pos_len, score_mode=score_mode, head_bias=head_bias)
+        self.policy_head = PolicyHead(self.c_trunk, pos_len)
+        self.value_head = ValueHead(self.c_trunk, num_scorebeliefs, pos_len, score_mode=score_mode)
         if not use_fp8:
             _replace_nn_linear_with_te(self.policy_head)
             _replace_nn_linear_with_te(self.value_head)
@@ -655,16 +612,12 @@ class ModelDecomposedExport(nn.Module):
 # Checkpoint format detection and conversion
 # ---------------------------------------------------------------------------
 def detect_checkpoint_format(state_dict):
-    """Detect checkpoint format: 'pt' (model.py), 'te' (full TE), 'te_decomposed' (hybrid/decomposed TE),
-    or 'te_postnorm' (postnorm hybrid TE with separate qkv/ffn + te.RMSNorm)."""
+    """Detect checkpoint format: 'pt' (model.py), 'te' (full TE), or 'te_decomposed' (hybrid/decomposed TE)."""
     for key in state_dict:
         if ".layer.self_attention." in key:
             return "te"
         if ".ln_qkv." in key:
             return "te_decomposed"
-        # Postnorm TE hybrid: has fused .qkv.weight but no .ln_qkv. or .q_proj.
-        if ".qkv.weight" in key and "_extra_state" not in key:
-            return "te_postnorm"
     return "pt"
 
 
@@ -830,68 +783,6 @@ def convert_checkpoint_te_to_model(state_dict, zero_centered_norm=False):
             new_sd["norm_final" + norm_suffix] = value
         elif key.endswith(".norm_final.weight"):
             new_sd[key.replace(".norm_final.weight", ".norm_final" + norm_suffix)] = value
-        else:
-            new_sd[key] = value
-    return new_sd
-
-
-def convert_checkpoint_model_to_te_postnorm(state_dict):
-    """Convert model.py postnorm state_dict to postnorm TE hybrid format.
-
-    Fuses separate Q/K/V projections into a single qkv weight, renames out_proj → proj,
-    and converts norm weight paths. FFN weights pass through unchanged.
-    """
-    new_sd = {}
-    for key, value in state_dict.items():
-        if ".q_proj.weight" in key:
-            block_prefix = key.rsplit(".q_proj.weight", 1)[0]
-            qkv_weight = torch.cat([
-                value,
-                state_dict[block_prefix + ".k_proj.weight"],
-                state_dict[block_prefix + ".v_proj.weight"],
-            ], dim=0)
-            new_sd[block_prefix + ".qkv.weight"] = qkv_weight
-        elif ".k_proj.weight" in key or ".v_proj.weight" in key:
-            continue
-        elif ".out_proj.weight" in key:
-            new_sd[key.replace(".out_proj.weight", ".proj.weight")] = value
-        elif ".norm1.norm.weight" in key:
-            new_sd[key.replace(".norm1.norm.weight", ".norm1.weight")] = value
-        elif ".norm2.norm.weight" in key:
-            new_sd[key.replace(".norm2.norm.weight", ".norm2.weight")] = value
-        elif key == "norm_final.norm.weight" or key == "norm_final.weight":
-            # Postnorm uses Identity for norm_final; skip
-            continue
-        elif ".norm_final.norm.weight" in key or ".norm_final.weight" in key:
-            continue
-        else:
-            new_sd[key] = value
-    return new_sd
-
-
-def convert_checkpoint_te_postnorm_to_model(state_dict, zero_centered_norm=False):
-    """Convert postnorm TE hybrid state_dict back to model.py postnorm format.
-
-    Splits fused qkv weight into separate Q/K/V projections, renames proj → out_proj,
-    and converts norm weight paths.
-    """
-    norm_suffix = ".weight" if zero_centered_norm else ".norm.weight"
-    new_sd = {}
-    for key, value in state_dict.items():
-        if "_extra_state" in key:
-            continue
-        if ".qkv.weight" in key:
-            block_prefix = key.rsplit(".qkv.weight", 1)[0]
-            c = value.shape[0] // 3
-            new_sd[block_prefix + ".q_proj.weight"] = value[:c]
-            new_sd[block_prefix + ".k_proj.weight"] = value[c:2*c]
-            new_sd[block_prefix + ".v_proj.weight"] = value[2*c:]
-        elif ".proj.weight" in key:
-            new_sd[key.replace(".proj.weight", ".out_proj.weight")] = value
-        elif ".norm1.weight" in key:
-            new_sd[key.replace(".norm1.weight", ".norm1" + norm_suffix)] = value
-        elif ".norm2.weight" in key:
-            new_sd[key.replace(".norm2.weight", ".norm2" + norm_suffix)] = value
         else:
             new_sd[key] = value
     return new_sd

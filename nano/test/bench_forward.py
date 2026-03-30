@@ -49,8 +49,6 @@ def main():
                         help="Enable variable-length board input with masking")
     parser.add_argument("--zero-centered-norm", action="store_true",
                         help="Use zero-centered RMSNorm")
-    parser.add_argument("--attn-res", action="store_true",
-                        help="Enable attention residuals (full depth attention)")
     parser.add_argument("--learnable-rope", action="store_true",
                         help="Enable learnable per-head RoPE frequencies")
     parser.add_argument("--gated-attn", action="store_true",
@@ -78,7 +76,6 @@ def main():
         model = Model(model_config, args.pos_len,
                       score_mode=args.score_mode, varlen=args.varlen,
                       zero_centered_norm=args.zero_centered_norm,
-                      attn_res=args.attn_res,
                       learnable_rope=args.learnable_rope,
                       gated_attn=args.gated_attn)
     model.initialize()
@@ -112,7 +109,6 @@ def main():
     print(f"FP8:            {'ON' if args.use_fp8 else 'OFF'}")
     print(f"Stem:           cnn3")
     print(f"Zero-centered:  {'ON' if args.zero_centered_norm else 'OFF'}")
-    print(f"Attn residuals: {'ON' if args.attn_res else 'OFF'}")
     print(f"Learnable RoPE: {'ON' if args.learnable_rope else 'OFF'}")
     print(f"Gated attention:{'ON' if args.gated_attn else 'OFF'}")
     print(f"Score mode:     {args.score_mode}")

@@ -205,23 +205,19 @@ def load_model(checkpoint_path: str, pos_len: int, use_ema: bool = False,
 
     # Extract training flags
     varlen = state.get("varlen", False)
-    attn_res = state.get("attn_res", False)
     gated_attn = state.get("gated_attn", False)
-    head_bias = state.get("head_bias", False)
     zero_centered_norm = state.get("zero_centered_norm", False)
 
     logging.info(f"Config: layers={config['num_layers']}, hidden={config['hidden_size']}, "
                  f"heads={config['num_heads']}, ffn={config['ffn_dim']}")
-    logging.info(f"Flags: varlen={varlen}, attn_res={attn_res}, gated_attn={gated_attn}, "
-                 f"head_bias={head_bias}, zero_centered_norm={zero_centered_norm}")
+    logging.info(f"Flags: varlen={varlen}, gated_attn={gated_attn}, "
+                 f"zero_centered_norm={zero_centered_norm}")
 
     # Create model — only pass kwargs that this version of Model.__init__ accepts
     all_kwargs = dict(
         score_mode=score_mode,
         varlen=varlen,
-        attn_res=attn_res,
         gated_attn=gated_attn,
-        head_bias=head_bias,
         zero_centered_norm=zero_centered_norm,
     )
     model_params = set(inspect.signature(Model.__init__).parameters.keys())
